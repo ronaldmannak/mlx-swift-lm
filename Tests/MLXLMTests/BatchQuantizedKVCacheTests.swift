@@ -776,9 +776,9 @@ private func expectPackedQuantizedRow(_ actual: any KVCache, equals expected: Qu
 struct QuantizedBatchAdmissionTests {
 
     @Test(
-        "Rejected quantized admission preserves every active layer, queued prefix and sampler stream",
+        "Rejected quantized admission fails the queued row and preserves every active layer, its prefix and sampler stream",
         arguments: QuantizedAdmissionMismatch.allCases, [false, true])
-    func rejectedAdmission(mismatch: QuantizedAdmissionMismatch, keepQueued: Bool) throws {
+    func rejectedAdmission(mismatch: QuantizedAdmissionMismatch, removeActive: Bool) throws {
         try Device.withDefaultDevice(.cpu) {
             let model = QuantizedAdmissionModel()
             let activePrompt = [1, 3, 5]
@@ -794,43 +794,57 @@ struct QuantizedBatchAdmissionTests {
             let expectedQueued = try admissionTokens(
                 model, prompt: queuedPrompt, caches: prefix.map { $0.copy() },
                 seed: 18, maxTokens: 4)
+            // The active row alone, for the cache it holds after two steps.
+            var reference = BatchTokenIterator(model: model)
+            _ = reference.insert(
+                prompts: [activePrompt], maxTokens: [6],
+                caches: [mismatch.caches(incoming: false)],
+                samplers: [TopPSampler(temperature: 0.8, topP: 0.9, seed: 17)])
+            _ = try reference.next()
+            _ = try reference.next()
+            let referenceState = AdmissionCacheSnapshot(try #require(model.lastCache))
 
             var iterator = BatchTokenIterator(model: model)
             let active = iterator.insert(
                 prompts: [activePrompt], maxTokens: [6],
                 caches: [mismatch.caches(incoming: false)],
                 samplers: [TopPSampler(temperature: 0.8, topP: 0.9, seed: 17)])
-            let first = try iterator.next().map(\.token)
+            let first = eventTokens(try iterator.next())
             #expect(first == Array(expectedActive.prefix(1)))
             let activeCache = try #require(model.lastCache)
             if mismatch == .groupSize {
                 #expect(try #require(activeCache[1] as? BatchQuantizedKVCache).groupSize == 32)
                 #expect(try #require(prefix[1] as? QuantizedKVCache).groupSize == 64)
             }
-            let activeState = AdmissionCacheSnapshot(activeCache)
             let queuedSampler = TopPSampler(temperature: 0.8, topP: 0.9, seed: 18)
             let queued = iterator.insert(
                 prompts: [queuedPrompt], maxTokens: [4], caches: [prefix],
                 samplers: [queuedSampler])
 
-            for _ in 0 ..< 2 {
-                #expect(throws: KVCacheError.self) { _ = try iterator.next() }
-                #expect(iterator.uids == active + queued)
-                try activeState.expectUnchanged(activeCache)
-                try prefixState.expectUnchanged(prefix)
+            // The queued row fails; the active row decodes in the same step.
+            let events = try iterator.next()
+            let failed = (events ?? []).compactMap { event -> (id: Int, error: any Error)? in
+                if case .failed(let id, let error) = event { (id, error) } else { nil }
             }
-            if keepQueued {
+            #expect(failed.map(\.id) == queued)
+            #expect(failed.allSatisfy { $0.error is KVCacheError })
+            let second = eventTokens(events)
+            #expect(first + second == Array(expectedActive.prefix(2)))
+            #expect(iterator.ids == active)
+            try referenceState.expectUnchanged(activeCache)
+            try prefixState.expectUnchanged(prefix)
+
+            if removeActive {
                 iterator.remove(active)
-                #expect(try collectAdmission(&iterator, uids: queued) == [expectedQueued])
             } else {
-                iterator.remove(queued)
                 let remainder = try collectAdmission(&iterator, uids: active)
-                #expect(first + remainder[0] == expectedActive)
-                let retried = iterator.insert(
-                    prompts: [queuedPrompt], maxTokens: [4], caches: [prefix],
-                    samplers: [queuedSampler])
-                #expect(try collectAdmission(&iterator, uids: retried) == [expectedQueued])
+                #expect(first + second + remainder[0] == expectedActive)
             }
+            // The prefix and the queued sampler are untouched, so the prompt can be retried.
+            let retried = iterator.insert(
+                prompts: [queuedPrompt], maxTokens: [4], caches: [prefix],
+                samplers: [queuedSampler])
+            #expect(try collectAdmission(&iterator, uids: retried) == [expectedQueued])
             try prefixState.expectUnchanged(prefix)
         }
     }
@@ -854,7 +868,7 @@ struct QuantizedBatchAdmissionTests {
             let active = iterator.insert(
                 prompts: [prompts[0]], maxTokens: [6], caches: [caches()],
                 samplers: [TopPSampler(temperature: 0.8, topP: 0.9, seed: 17)])
-            let first = try iterator.next().map(\.token)
+            let first = eventTokens(try iterator.next())
             let queued = iterator.insert(
                 prompts: [prompts[1]], maxTokens: [6], caches: [caches()],
                 samplers: [TopPSampler(temperature: 0.8, topP: 0.9, seed: 18)])
@@ -970,10 +984,13 @@ private func admissionTokens(
 
 private func collectAdmission(_ iterator: inout BatchTokenIterator, uids: [Int]) throws -> [[Int]] {
     var output = [Int: [Int]]()
-    while true {
-        let responses = try iterator.next()
-        if responses.isEmpty { break }
-        for response in responses { output[response.uid, default: []].append(response.token) }
+    while let events = try iterator.next() {
+        for case .token(let id, let token) in events { output[id, default: []].append(token) }
     }
     return uids.map { output[$0] ?? [] }
+}
+
+/// The step's `.token` values, in batch order; empty for `nil`.
+private func eventTokens(_ events: [BatchEvent]?) -> [Int] {
+    (events ?? []).compactMap { if case .token(_, let token) = $0 { token } else { nil } }
 }

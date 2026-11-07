@@ -217,37 +217,63 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
             do {
                 // Cancellation is checked before next(), which pipelines more MLX work.
                 while !Task.isCancelled, !terminated {
-                    let responses = try iterator.next()
-                    if responses.isEmpty { break }
+                    guard let events = try iterator.next() else { break }
                     let responseTime = elapsed()
+                    // The rows the iterator ends this step; it drops them itself.
+                    var endedByIterator = Set<Int>()
+                    for case .finished(let id, _, _) in events { endedByIterator.insert(id) }
                     var semanticStops: [Int] = []
-                    for response in responses {
-                        let uid = response.uid
+                    // A row that cannot join fails the stream, after this step's output.
+                    var rowFailure: Error?
+                    for event in events {
+                        let uid = event.id
+                        let token: Int
+                        let iteratorStop: Bool
+                        switch event {
+                        case .prefill:
+                            continue
+                        case .failed(_, let error):
+                            rowFailure = rowFailure ?? error
+                            continue
+                        case .finished(_, let reason, nil):
+                            // A length finish follows the row's last token.
+                            finish(uid, reason: reason)
+                            continue
+                        case .finished(_, _, let stopToken?):
+                            token = stopToken
+                            iteratorStop = true
+                        case .token(_, let generated):
+                            token = generated
+                            iteratorStop = false
+                        }
                         if rows[uid].firstTokenTime == nil {
                             rows[uid].firstTokenTime = responseTime
                         }
                         var reason: GenerateStopReason?
-                        let semanticStop = handlers[uid].additionalStopTokenIDs.contains(
-                            response.token)
-                        let isStop = response.finishReason == .stop || semanticStop
+                        let semanticStop = handlers[uid].additionalStopTokenIDs.contains(token)
                         let disposition: TokenLoopDisposition
-                        if isStop {
-                            if includeStopToken { rows[uid].tokenCount += 1 }
+                        // A token is recorded as emitted exactly when it is counted, as the
+                        // single-sequence loop does.
+                        if iteratorStop || semanticStop {
+                            if includeStopToken {
+                                rows[uid].tokenCount += 1
+                                iterator.recordEmittedToken(id: uid, token: token)
+                            }
                             if includeStopToken
                                 || (handlers[uid].receivesStopTokens
-                                    && (semanticStop || handlerStopTokens.contains(response.token)))
+                                    && (semanticStop || handlerStopTokens.contains(token)))
                             {
                                 disposition = handlers[uid].onStopToken(
-                                    response.token, logProbabilities: nil, emit: { emit(uid, $0) })
+                                    token, logProbabilities: nil, emit: { emit(uid, $0) })
                             } else {
                                 disposition = .more
                             }
                             reason = .stop
                         } else {
                             rows[uid].tokenCount += 1
+                            iterator.recordEmittedToken(id: uid, token: token)
                             disposition = handlers[uid].onToken(
-                                response.token, logProbabilities: nil, emit: { emit(uid, $0) })
-                            if response.finishReason == .length { reason = .length }
+                                token, logProbabilities: nil, emit: { emit(uid, $0) })
                         }
                         switch disposition {
                         case .more: break
@@ -257,13 +283,14 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                             terminated = true
                         }
                         if let reason {
-                            if response.finishReason == nil { semanticStops.append(uid) }
+                            if !endedByIterator.contains(uid) { semanticStops.append(uid) }
                             finish(uid, reason: reason)
                         }
                         if terminated { break }
                     }
                     // Natural stops are already filtered by next(); semantic stops share one gather.
                     if !semanticStops.isEmpty { iterator.remove(semanticStops) }
+                    if let rowFailure { throw rowFailure }
                 }
                 for uid in rows.indices where !rows[uid].finished {
                     finish(uid, reason: .cancelled)
@@ -278,7 +305,9 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                     _ = handlers[uid].onGenerationEnd(emit: { emit(uid, $0) })
                 }
             }
-            iterator.remove(iterator.uids)
+            // Every row, including the ones that ended in the last step, so each processor is
+            // finalized once even when the loop stopped early.
+            iterator.remove(Array(prompts.indices))
             // Cache owners and consumers may proceed only after queued device work settles.
             executionStream.synchronize()
             continuation.finish(throwing: failure)
