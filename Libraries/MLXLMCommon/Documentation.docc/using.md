@@ -262,6 +262,8 @@ for try await event in stream {
         }
     case .info(let uid, let info):
         print("request \(uid) finished: \(info.stopReason)")
+    case .failed(let uid, let error):
+        print("request \(uid) failed: \(error)")
     }
 }
 await task.value
@@ -270,7 +272,10 @@ await task.value
 The UID is the prompt's zero-based index. A stop string or response-protocol
 boundary finishes only its matching row. Completion arrives in the outer
 `BatchGenerationEvent.info(uid:_:)` case; the output does not contain an
-embedded `Generation.info` or `TokenGeneration.info`.
+embedded `Generation.info` or `TokenGeneration.info`. A row that cannot join
+the batch, for example because its supplied cache does not match the others,
+ends with `BatchGenerationEvent.failed(uid:_:)` instead, and the other rows
+carry on. An error from a batched model step ends the whole stream.
 
 ``BatchCompletionInfo`` reports that row's prompt count, emitted token count,
 stop reason, time to its first model token and elapsed time. Time to first token
