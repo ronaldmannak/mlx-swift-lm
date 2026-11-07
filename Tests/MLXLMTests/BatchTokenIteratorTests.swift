@@ -2126,6 +2126,43 @@ struct BatchGenerationTests {
         }
     }
 
+    @Test("Cancellation during a later row's prefill decodes nothing and cancels every row")
+    func laterPrefillCancellation() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["a"], ["b"]], probe: probe, chunkedPrefill: true)
+            let prompts = fixture.prompts.map { Array(repeating: $0[0], count: 5) }
+            // The first row prefills completely; the task is cancelled after the second
+            // row's first chunk.
+            final class Starts: @unchecked Sendable { var count = 0 }
+            let starts = Starts()
+            let prefill = PrefillParameters(
+                stepSize: 1,
+                progress: { processed, _ in
+                    probe.observePrefillProgress(processed)
+                    if processed == 1 { starts.count += 1 }
+                    if starts.count == 2 { withUnsafeCurrentTask { $0?.cancel() } }
+                })
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 1,
+                prefill: prefill)
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            #expect(task.isCancelled)
+            #expect(result.tokens.isEmpty, "no row decodes after the cancellation")
+            #expect(result.failed.isEmpty)
+            #expect(Set(result.info.keys) == Set(prompts.indices))
+            #expect(result.info.values.allSatisfy { $0.stopReason == .cancelled })
+            #expect(result.info.values.allSatisfy { $0.generationTokenCount == 0 })
+            // The first row's four chunks and its completion, then the second row's first chunk.
+            #expect(probe.prefillProgress == [1, 2, 3, 4, 5, 1])
+            #expect(probe.widths == [1, 1, 1, 1, 1, 1], "no decode forward is submitted")
+        }
+    }
+
     @Test("Cancelling a stream consumer stops the blocked shared worker")
     func consumerCancellationStopsWorker() async throws {
         try await Device.withDefaultDevice(.cpu) {
