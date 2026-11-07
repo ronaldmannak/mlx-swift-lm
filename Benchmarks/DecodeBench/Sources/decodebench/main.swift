@@ -130,20 +130,18 @@ struct Run {
     let start = ContinuousClock.now
     var iterator = BatchTokenIterator(
         model: model, sampler: makeSampler(), maxTokens: decodeTokens + 1)
-    let uids = iterator.insert(prompts: prompts.map { $0.map { Int($0) } })
+    let ids = iterator.insert(prompts: prompts.map { $0.map { Int($0) } })
     var tokens = [[Int]](repeating: [], count: prompts.count)
-    func record(_ responses: [BatchTokenIterator.Response]) {
-        for response in responses {
-            tokens[uids.firstIndex(of: response.uid)!].append(response.token)
+    func record(_ events: [BatchEvent]?) {
+        for case .token(let id, let token) in events ?? [] {
+            tokens[ids.firstIndex(of: id)!].append(token)
         }
     }
     record(try iterator.next())
     let firstToken = seconds(since: start)
     let decodeStart = ContinuousClock.now
-    while true {
-        let responses = try iterator.next()
-        if responses.isEmpty { break }
-        record(responses)
+    while let events = try iterator.next() {
+        record(events)
     }
     return Run(
         tokensPerSecond: Double(decodeTokens) / seconds(since: decodeStart),
