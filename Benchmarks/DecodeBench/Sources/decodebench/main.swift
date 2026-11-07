@@ -132,16 +132,22 @@ struct Run {
         model: model, sampler: makeSampler(), maxTokens: decodeTokens + 1)
     let ids = iterator.insert(prompts: prompts.map { $0.map { Int($0) } })
     var tokens = [[Int]](repeating: [], count: prompts.count)
-    func record(_ events: [BatchEvent]?) {
-        for case .token(let id, let token) in events ?? [] {
-            tokens[ids.firstIndex(of: id)!].append(token)
+    // A row that cannot join ends the run, as an admission error did before the iterator
+    // reported it as an event: a partial batch would report a rate for rows it never ran.
+    func record(_ events: [BatchEvent]?) throws {
+        for event in events ?? [] {
+            switch event {
+            case .token(let id, let token): tokens[ids.firstIndex(of: id)!].append(token)
+            case .failed(_, let error): throw error
+            case .prefill, .finished: break
+            }
         }
     }
-    record(try iterator.next())
+    try record(try iterator.next())
     let firstToken = seconds(since: start)
     let decodeStart = ContinuousClock.now
     while let events = try iterator.next() {
-        record(events)
+        try record(events)
     }
     return Run(
         tokensPerSecond: Double(decodeTokens) / seconds(since: decodeStart),
