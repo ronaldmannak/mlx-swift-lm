@@ -532,6 +532,9 @@ public struct BatchTokenIterator {
         guard rowCache.count == layerCount else {
             throw KVCacheError(message: "Every row must share the active cache's layer count")
         }
+        // The configured capacity, strategy and compatibility policy, as TokenIterator checks
+        // them, before the prefill: a row whose cache cannot satisfy them fails alone.
+        _ = try cachePlan.validated(rowCache)
 
         // The prompt goes into its own cache first, as TokenIterator feeds it: the model's
         // prefill (chunked) and then the remainder it leaves, whose last position's logits

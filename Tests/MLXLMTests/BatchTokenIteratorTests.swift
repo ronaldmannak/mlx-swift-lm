@@ -645,6 +645,32 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("A row whose cache cannot meet the affine compatibility policy fails before prefill")
+    func generateParametersAffineCompatibility() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The typed strategy requires at least one quantizable layer by default; rotating
+            // layers cannot be quantized.
+            var iterator = try BatchTokenIterator(
+                model: model,
+                parameters: GenerateParameters(
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 4))),
+                    temperature: 0))
+            let id = iterator.insert(
+                prompt: [1, 2, 3],
+                cache: (0 ..< 2).map { _ in RotatingKVCache(maxSize: 16) })
+            let events = try iterator.next()
+            #expect(failures(events).map(\.id) == [id])
+            #expect(
+                failures(events).allSatisfy {
+                    $0.error as? KVCacheConfigurationError
+                        == .noCompatibleLayers(strategy: .affine)
+                })
+            #expect(tokens(events).isEmpty)
+            #expect(try iterator.next() == nil)
+        }
+    }
+
     @Test("A GenerateParameters token limit of nil leaves rows unlimited")
     func generateParametersWithoutTokenLimit() throws {
         try Device.withDefaultDevice(.cpu) {
