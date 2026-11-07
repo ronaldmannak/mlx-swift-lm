@@ -76,8 +76,8 @@ struct CacheEvaluationPolicyTests {
             var batch = BatchTokenIterator(model: model, maxTokens: 8)
             _ = batch.insert(prompts: [[1, 2], [3, 4, 5]])
             for _ in 0 ..< 4 {
-                let responses = try batch.next()
-                #expect(responses.count == 2)
+                let events = try batch.next()
+                #expect(events?.count == 2)
                 expectEvaluationAvailable(model.observed)
             }
         }
@@ -104,8 +104,8 @@ struct CacheEvaluationPolicyTests {
                     let prompts = kind == .custom ? [[1, 2]] : [[1, 2], [3, 4, 5]]
                     _ = batch.insert(prompts: prompts)
                     for _ in 0 ..< 4 {
-                        let responses = try batch.next()
-                        #expect(responses.count == prompts.count)
+                        let events = try batch.next()
+                        #expect(events?.count == prompts.count)
                         expectEvaluationAvailable(model.observed)
                     }
                 }
@@ -128,15 +128,15 @@ struct CacheEvaluationPolicyTests {
                     let added = iterator.insert(prompts: [[11, 12]])
                     positions[added[0]] = 2
                 }
-                let responses = try iterator.next()
-                for response in responses { positions[response.uid]! += 1 }
-                #expect(responses.count == 2)
+                let events = try iterator.next() ?? []
+                for case .token(let id, _) in events { positions[id]! += 1 }
+                #expect(events.count == 2)
                 for layer in model.lastCache {
                     let cache = try #require(layer as? BatchRotatingKVCache)
                     expectEvaluationAvailable([cache.batchOffset, cache.leftPadding])
                     #expect(
                         cache.batchOffset.asArray(Int32.self)
-                            == iterator.uids.map { Int32(positions[$0]!) })
+                            == iterator.ids.map { Int32(positions[$0]!) })
                     #expect(cache.leftPadding.asArray(Int32.self).allSatisfy { $0 >= 0 })
                     #expect(cache.innerState().allSatisfy { $0.dim(2) <= 8 })
                 }
@@ -164,11 +164,9 @@ struct CacheEvaluationPolicyTests {
                     let ids = iterator.insert(
                         prompts: [[1, 2, 3], [4, 5, 6, 7, 8]], samplers: [sampler(0), sampler(1)])
                     var tokens = [[Int]](repeating: [], count: 2)
-                    while true {
-                        let responses = try iterator.next()
-                        if responses.isEmpty { break }
-                        for response in responses {
-                            tokens[ids.firstIndex(of: response.uid)!].append(response.token)
+                    while let events = try iterator.next() {
+                        for case .token(let id, let token) in events {
+                            tokens[ids.firstIndex(of: id)!].append(token)
                         }
                     }
                     Stream.defaultStream.synchronize()
@@ -244,8 +242,9 @@ private func expectSeveredAttentionSettles(
             model: model, sampler: sampler, processor: processor, maxTokens: 3,
             cacheEvaluationPolicy: policy)
         _ = iterator.insert(prompts: [[5, 1], [6, 7, 1]])
-        let responses = try iterator.next()
-        #expect(responses.map(\.token) == [expectedToken, expectedToken])
+        let events = try iterator.next() ?? []
+        let tokens = events.compactMap { if case .token(_, let token) = $0 { token } else { nil } }
+        #expect(tokens == [expectedToken, expectedToken])
     } else {
         var iterator = try TokenIterator(
             input: LMInput(tokens: MLXArray([Int32(5), 1])), model: model,
