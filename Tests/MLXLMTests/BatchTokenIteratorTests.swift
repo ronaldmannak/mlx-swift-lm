@@ -597,6 +597,54 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test(
+        "Affine 4- and 8-bit GenerateParameters match single runs with the same parameters",
+        arguments: [4, 8])
+    func generateParametersAffineParity(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The legacy field and the typed strategy resolve to the same configuration.
+            let legacy = GenerateParameters(maxTokens: 6, kvBits: bits, temperature: 0)
+            let typed = GenerateParameters(
+                maxTokens: 6,
+                kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: bits))),
+                temperature: 0)
+            for parameters in [legacy, typed] {
+                let expected = try Self.prompts.map { prompt in
+                    let iterator = try TokenIterator(
+                        input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })),
+                        model: model, parameters: parameters)
+                    return Array(IteratorSequence(iterator))
+                }
+                var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+                let ids = iterator.insert(prompts: Self.prompts)
+                var actual = [Int: [Int]]()
+                func record(_ events: [BatchEvent]?) {
+                    for case .token(let id, let token) in events ?? [] {
+                        actual[id, default: []].append(token)
+                    }
+                }
+                record(try iterator.next())
+                // The batch is quantized at `bits`: a row whose supplied cache uses that width
+                // joins it, and one using the other width cannot.
+                func quantizedCache(_ bits: Int) -> [KVCache] {
+                    (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+                }
+                let probes = iterator.insert(
+                    prompts: [[1], [2]],
+                    caches: [quantizedCache(bits), quantizedCache(bits == 4 ? 8 : 4)])
+                let joined = try iterator.next()
+                #expect(failures(joined).map(\.id) == [probes[1]])
+                #expect(failures(joined).allSatisfy { $0.error is KVCacheError })
+                #expect(tokenIDs(joined) == ids + [probes[0]])
+                record(joined)
+                iterator.remove([probes[0]])
+                while let events = try iterator.next() { record(events) }
+                #expect(ids.map { actual[$0] ?? [] } == expected)
+            }
+        }
+    }
+
     @Test("A GenerateParameters token limit of nil leaves rows unlimited")
     func generateParametersWithoutTokenLimit() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -632,11 +680,17 @@ struct BatchTokenIteratorTests {
                         rewind: try .init(maxTokens: 8))),
                 .rewindReserve
             ),
-            (GenerateParameters(kvBits: 4), .strategy(.affine)),
+            // Affine 4 or 8 bits from the first token is supported; see
+            // generateParametersAffineParity.
+            (GenerateParameters(kvBits: 2), .affine(bits: 2, compressionStart: 0)),
+            (
+                GenerateParameters(kvBits: 4, quantizedKVStart: 16),
+                .affine(bits: 4, compressionStart: 16)
+            ),
             (
                 GenerateParameters(
-                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 8)))),
-                .strategy(.affine)
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 6)))),
+                .affine(bits: 6, compressionStart: 0)
             ),
             (GenerateParameters(kvScheme: "turbo8v3"), .strategy(.turboQuant)),
             (GenerateParameters(logProbabilities: 5), .logProbabilities),
