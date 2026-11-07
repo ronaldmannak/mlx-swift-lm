@@ -179,6 +179,8 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
     let handlerStopTokens = terminalTokens
     if let unknown = tokenizer.unknownTokenId { terminalTokens.insert(unknown) }
     let iteratorStopTokens = terminalTokens
+    // The stream this batch runs on, settled at the end, as the single-sequence loop does.
+    let executionStream = StreamOrDevice.default.stream
     let payload = SendableBox((model, caches, sampler, processor, handlers))
     let (stream, continuation) = AsyncThrowingStream<BatchGenerationEvent<Handler.Output>, Error>
         .makeStream()
@@ -290,7 +292,7 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
             }
             iterator.remove(iterator.uids)
             // Cache owners and consumers may proceed only after queued device work settles.
-            Stream.defaultStream.synchronize()
+            executionStream.synchronize()
             continuation.finish(throwing: failure)
         }
         if let ticket = wiredMemoryTicket {
