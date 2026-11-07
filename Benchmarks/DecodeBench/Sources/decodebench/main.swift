@@ -178,6 +178,15 @@ struct Run {
             steadySeconds += stepSeconds
         }
     }
+    // With resumable prefill the rows join one step apart, so a short run can end its first
+    // rows before the last one decodes.
+    guard steadySteps > 0 else {
+        print(
+            "batch(\(prompts.count)): no step decoded every row without a prefill chunk, so there "
+                + "is no steady decode rate. Ask for more decode tokens than the rows and their "
+                + "prefill chunks take to join.")
+        exit(1)
+    }
     return Run(
         tokensPerSecond: Double(steadySteps) / steadySeconds,
         firstToken: firstToken ?? seconds(since: start), tokens: tokens,
