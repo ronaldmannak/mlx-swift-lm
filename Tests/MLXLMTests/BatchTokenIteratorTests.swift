@@ -1867,8 +1867,9 @@ struct BatchGenerationTests {
                 task: Task<Void, Never>
             ) async {
                 var infos = [Int: BatchCompletionInfo]()
+                var failures = [Int: any Error]()
                 var outputCount = 0
-                var threwCancellation = false
+                var threw = false
                 do {
                     for try await event in stream {
                         switch event {
@@ -1876,17 +1877,20 @@ struct BatchGenerationTests {
                         case .info(let uid, let info):
                             #expect(infos[uid] == nil, "each unfinished row completes exactly once")
                             infos[uid] = info
+                        case .failed(let uid, let error):
+                            #expect(failures[uid] == nil, "each row fails at most once")
+                            failures[uid] = error
                         }
                     }
                 } catch {
-                    #expect(error is CancellationError)
-                    threwCancellation = true
+                    threw = true
                 }
                 await task.value
 
                 #expect(task.isCancelled == cancelTask)
-                #expect(threwCancellation == !cancelTask)
+                #expect(!threw, "a prefill error ends its row, not the stream")
                 #expect(outputCount == 0)
+                #expect(Set(infos.keys).isDisjoint(with: failures.keys))
                 if cancelTask {
                     #expect(Set(infos.keys) == Set(prompts.indices))
                     for info in infos.values {
@@ -1899,8 +1903,10 @@ struct BatchGenerationTests {
                     #expect(probe.widths == [1], "no second chunk or decode forward is submitted")
                     #expect(probe.usedCPU)
                 } else {
-                    #expect(
-                        infos.isEmpty, "an uncancelled model's CancellationError still propagates")
+                    // An uncancelled model's CancellationError is that row's failure.
+                    #expect(infos.isEmpty)
+                    #expect(Set(failures.keys) == Set(prompts.indices))
+                    #expect(failures.values.allSatisfy { $0 is CancellationError })
                     #expect(probe.prefillProgress.isEmpty)
                     #expect(probe.widths.isEmpty)
                 }
@@ -2000,6 +2006,8 @@ struct BatchGenerationTests {
                         Issue.record("completion belongs in the outer batch event")
                     case .info(let uid, let info):
                         infos[uid] = info
+                    case .failed:
+                        Issue.record("a batched step error is not a row failure")
                     }
                 }
                 Issue.record("the stream must propagate the batched model-state error")
@@ -2070,44 +2078,84 @@ struct BatchGenerationTests {
         }
     }
 
-    @Test("Preparation failures propagate through the throwing stream")
+    @Test("A preparation failure ends its row with a failed event, not the stream")
     func preparationFailuresPropagate() async throws {
         try await Device.withDefaultDevice(.cpu) {
             let fixture = BatchStreamFixture(scripts: [["a"]], failPreparation: true)
             let (stream, task) = try batchGenerateTokensTask(
                 model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
                 modelConfiguration: .init(id: "batch-stream-test"))
-            do {
-                for try await _ in stream {
-                    Issue.record("a failed preparation cannot produce output")
-                }
-                Issue.record("the stream must propagate the preparation error")
-            } catch {
-                #expect(error as? BatchStreamTestError == .preparation)
-            }
+            let result = try await collectBatchStreamTokens(stream)
             await task.value
+            #expect(result.tokens.isEmpty, "a failed preparation cannot produce output")
+            #expect(result.info.isEmpty)
+            #expect(result.failed.count == 1)
+            #expect(result.failed[0] as? BatchStreamTestError == .preparation)
+        }
+    }
+
+    @Test(
+        "A row that cannot join fails alone while the others finish", arguments: [false, true])
+    func rowFailureLeavesOtherRows(decoded: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [["a", "b"], ["c", "d"], ["e", "f"]])
+            // The middle row's supplied cache has a layer too many for the batch.
+            let caches: [[KVCache]?] = [nil, [KVCacheSimple(), KVCacheSimple()], nil]
+            var failed = [Int: any Error]()
+            var info = [Int: BatchCompletionInfo]()
+            if decoded {
+                let (stream, task) = try batchGenerateTextTask(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), caches: caches,
+                    maxTokens: 8)
+                var result = BatchStreamTextResult()
+                for try await event in stream { result.append(event) }
+                await task.value
+                #expect(result.response == [0: "ab", 2: "ef"])
+                (failed, info) = (result.failed, result.info)
+            } else {
+                let (stream, task) = try batchGenerateTokensTask(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), caches: caches,
+                    maxTokens: 8)
+                let result = try await collectBatchStreamTokens(stream)
+                await task.value
+                #expect(result.tokens == [0: fixture.scripts[0], 2: fixture.scripts[2]])
+                (failed, info) = (result.failed, result.info)
+            }
+            #expect(Set(failed.keys) == [1])
+            #expect(failed[1] is KVCacheError)
+            #expect(Set(info.keys) == [0, 2])
+            #expect(info.values.allSatisfy { $0.stopReason == .stop })
         }
     }
 }
 
 private func collectBatchStreamTokens(
     _ stream: AsyncThrowingStream<BatchGenerationEvent<TokenGeneration>, Error>
-) async throws -> (tokens: [Int: [Int]], info: [Int: BatchCompletionInfo]) {
+) async throws -> (
+    tokens: [Int: [Int]], info: [Int: BatchCompletionInfo], failed: [Int: any Error]
+) {
     var tokens = [Int: [Int]]()
     var infos = [Int: BatchCompletionInfo]()
+    var failed = [Int: any Error]()
     for try await event in stream {
         switch event {
         case .output(let uid, .token(let token)):
             #expect(infos[uid] == nil, "a row cannot emit after its completion")
+            #expect(failed[uid] == nil, "a row cannot emit after its failure")
             tokens[uid, default: []].append(token)
         case .output(_, .info):
             Issue.record("completion belongs in the outer batch event")
         case .info(let uid, let info):
-            #expect(infos[uid] == nil, "each row completes once")
+            #expect(infos[uid] == nil && failed[uid] == nil, "each row ends once")
             infos[uid] = info
+        case .failed(let uid, let error):
+            #expect(infos[uid] == nil && failed[uid] == nil, "each row ends once")
+            failed[uid] = error
         }
     }
-    return (tokens, infos)
+    return (tokens, infos, failed)
 }
 
 private struct BatchStreamTextResult {
@@ -2115,11 +2163,13 @@ private struct BatchStreamTextResult {
     var reasoning = [Int: String]()
     var calls = [Int: [ToolCall.Function]]()
     var info = [Int: BatchCompletionInfo]()
+    var failed = [Int: any Error]()
 
     mutating func append(_ event: BatchGenerationEvent<Generation>) {
         switch event {
         case .output(let uid, let output):
             #expect(info[uid] == nil, "buffered output must precede the row completion")
+            #expect(failed[uid] == nil, "a row cannot emit after its failure")
             switch output {
             case .chunk(let text): response[uid, default: ""] += text
             case .reasoning(let text): reasoning[uid, default: ""] += text
@@ -2129,8 +2179,11 @@ private struct BatchStreamTextResult {
             case .steering: Issue.record("batch streams take no steering")
             }
         case .info(let uid, let completion):
-            #expect(info[uid] == nil, "each row completes once")
+            #expect(info[uid] == nil && failed[uid] == nil, "each row ends once")
             info[uid] = completion
+        case .failed(let uid, let error):
+            #expect(info[uid] == nil && failed[uid] == nil, "each row ends once")
+            failed[uid] = error
         }
     }
 }
@@ -2473,10 +2526,10 @@ extension BatchGenerationTests {
                 model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
                 modelConfiguration: .init(id: "batch-stream-test"),
                 processor: try EmissionLogProcessor(log: log))
-            await #expect(throws: BatchStreamTestError.preparation) {
-                _ = try await collectBatchStreamTokens(stream)
-            }
+            let result = try await collectBatchStreamTokens(stream)
             await task.value
+            #expect(Set(result.failed.keys) == Set(fixture.prompts.indices))
+            #expect(result.failed.values.allSatisfy { $0 as? BatchStreamTestError == .preparation })
             try expectEmissionLifecycle(log, fixture: fixture, emitted: [:])
         }
     }

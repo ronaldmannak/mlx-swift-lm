@@ -15,17 +15,22 @@ public struct BatchCompletionInfo: Sendable {
     public let elapsedTime: TimeInterval
 }
 
-/// An output or final completion event, attributed to its zero-based prompt index.
+/// An output, final completion or failure event, attributed to its zero-based prompt index.
 ///
+/// Every row ends with exactly one `info` or `failed` event, after its last output.
 /// Completion is reported by the outer `info` case, not an embedded `Generation.info` or
 /// `TokenGeneration.info`. Batch timings do not represent isolated per-row prefill costs.
 public enum BatchGenerationEvent<Output: Sendable>: Sendable {
     case output(uid: Int, Output)
     case info(uid: Int, BatchCompletionInfo)
+    /// The row could not join the batch and produced no tokens, for example because its
+    /// supplied cache does not match the other rows or its prefill threw. The other rows
+    /// carry on.
+    case failed(uid: Int, any Error)
 
     public var uid: Int {
         switch self {
-        case .output(let uid, _), .info(let uid, _): uid
+        case .output(let uid, _), .info(let uid, _), .failed(let uid, _): uid
         }
     }
 }
@@ -69,8 +74,9 @@ public func batchGenerateTokens(
 /// Streams raw tokens and per-row completion information using one batch iterator.
 ///
 /// EOS and unknown tokens end their own row. `includeStopToken` controls whether the terminal
-/// token is emitted and counted. A cancelled task completes unfinished rows as `.cancelled`;
-/// model/cache errors terminate the stream with that error. Await `task.value` after cancelling
+/// token is emitted and counted. A cancelled task completes unfinished rows as `.cancelled`.
+/// A row that cannot join the batch ends with a `failed` event while the other rows carry on;
+/// an error from a batched model step terminates the stream. Await `task.value` after cancelling
 /// to wait for GPU work and cache cleanup. The model and supplied caches must not be used
 /// concurrently until the task completes. Admission, prefix reuse and budgets remain caller-owned.
 /// ``KVCacheEvaluationPolicy/attentionDependencies`` requires the caller's model to consume
@@ -223,6 +229,12 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                             generationTokenCount: rows[uid].tokenCount, stopReason: reason,
                             timeToFirstToken: rows[uid].firstTokenTime, elapsedTime: elapsed())))
             }
+            func fail(_ uid: Int, _ error: any Error) {
+                guard !rows[uid].finished else { return }
+                rows[uid].finished = true
+                _ = handlers[uid].onGenerationEnd(emit: { emit(uid, $0) })
+                _ = continuation.yield(.failed(uid: uid, error))
+            }
 
             var failure: Error?
             var terminated = false
@@ -235,8 +247,6 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                     var endedByIterator = Set<Int>()
                     for case .finished(let id, _, _) in events { endedByIterator.insert(id) }
                     var semanticStops: [Int] = []
-                    // A row that cannot join fails the stream, after this step's output.
-                    var rowFailure: Error?
                     for event in events {
                         let uid = event.id
                         let token: Int
@@ -245,7 +255,13 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                         case .prefill:
                             continue
                         case .failed(_, let error):
-                            rowFailure = rowFailure ?? error
+                            // A prefill stopped by this task's cancellation is a cancelled
+                            // row, not a failed one.
+                            if error is CancellationError, Task.isCancelled {
+                                finish(uid, reason: .cancelled)
+                            } else {
+                                fail(uid, error)
+                            }
                             continue
                         case .finished(_, let reason, nil):
                             // A length finish follows the row's last token.
@@ -302,7 +318,6 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                     }
                     // Natural stops are already filtered by next(); semantic stops share one gather.
                     if !semanticStops.isEmpty { iterator.remove(semanticStops) }
-                    if let rowFailure { throw rowFailure }
                 }
                 for uid in rows.indices where !rows[uid].finished {
                     finish(uid, reason: .cancelled)
