@@ -952,6 +952,60 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test(
+        "Each model family that opts in prefills resumably and matches single runs",
+        arguments: ResumablePrefillFamily.allCases)
+    func resumablePrefillFamilies(family: ResumablePrefillFamily) async throws {
+        // Fixed weights per family, so a near tie between the batched and single-row
+        // arithmetic cannot flip a greedy token on some runs and not others.
+        let seed = UInt64(ResumablePrefillFamily.allCases.firstIndex(of: family)! + 1100)
+        let model = try await withRandomState(MLXRandom.RandomState(seed: seed)) {
+            try await LLMTypeRegistry.shared.createModel(
+                configuration: Data(family.configuration.utf8), modelType: family.rawValue)
+        }
+        let resumable = try #require(model as? any ResumablePrefillModel, "\(family) opts in")
+        // On the default device: some families use Metal kernels. Both runs use the same ones.
+        do {
+            eval(model)
+            let prefill = PrefillParameters(stepSize: 4)
+            // A short row decodes while the long one is fed in chunks of 4, 4 and 2 tokens
+            // and then its final forward.
+            let prompts: [[Int]] = [[1, 2], Array(3 ..< 14)]
+            #expect(
+                resumable.prefillChunks(
+                    for: LMInput.Text(tokens: MLXArray(prompts[1].map { Int32($0) })),
+                    prefill: prefill) == [0 ..< 4, 4 ..< 8, 8 ..< 10])
+            let expected = try prompts.map { prompt in
+                let iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: model,
+                    processor: nil, sampler: ArgMaxSampler(), prefill: prefill, maxTokens: 6)
+                return Array(IteratorSequence(iterator))
+            }
+
+            var iterator = BatchTokenIterator(model: model, maxTokens: 6, prefill: prefill)
+            let ids = iterator.insert(prompts: prompts)
+            var progress: [String] = []
+            var output = [Int: [Int]]()
+            while let events = try iterator.next() {
+                for event in events {
+                    switch event {
+                    case .token(let id, let token): output[id, default: []].append(token)
+                    case .prefill(let id, let processed, let total):
+                        progress.append("\(id): \(processed)/\(total)")
+                    case .failed(_, let error): Issue.record("\(family): \(error)")
+                    case .finished: break
+                    }
+                }
+            }
+            #expect(ids.map { output[$0] ?? [] } == expected, "\(family)")
+            #expect(
+                progress == [
+                    "\(ids[0]): 2/2", "\(ids[1]): 4/11", "\(ids[1]): 8/11", "\(ids[1]): 10/11",
+                    "\(ids[1]): 11/11",
+                ], "\(family)")
+        }
+    }
+
     @Test("Cancellation between resumable prefill chunks leaves the row queued")
     func resumablePrefillCancellation() async throws {
         try await Task {
@@ -968,6 +1022,55 @@ struct BatchTokenIteratorTests {
                 iterator.remove([id])
                 let idle = try iterator.next()
                 #expect(idle == nil)
+            }
+        }.value
+    }
+
+    @Test("A model whose chunks leave cache writes lazy resumes after a cancelled step")
+    func resumablePrefillLazyChunks() async throws {
+        // Carries the iterator from the cancelled task to a fresh one; they run in turn.
+        final class Carrier: @unchecked Sendable {
+            var iterator: BatchTokenIterator?
+            var id = -1
+        }
+        let prompt = Array(1 ..< 8)
+        let carrier = Carrier()
+        try await Task {
+            try Device.withDefaultDevice(.cpu) {
+                var iterator = BatchTokenIterator(
+                    model: LazyChunkModel(tinyLlama()), maxTokens: 6,
+                    prefill: PrefillParameters(stepSize: 2))
+                let id = iterator.insert(prompt: prompt)
+                let first = try iterator.next()
+                #expect(first?.map(describe) == ["prefill(\(id), 2/7)"])
+                withUnsafeCurrentTask { $0?.cancel() }
+                #expect(throws: CancellationError.self) { _ = try iterator.next() }
+                #expect(iterator.pendingIDs == [id])
+                carrier.iterator = iterator
+                carrier.id = id
+            }
+        }.value
+        try await Task {
+            try Device.withDefaultDevice(.cpu) {
+                let expected = Array(
+                    IteratorSequence(
+                        try TokenIterator(
+                            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })),
+                            model: tinyLlama(), processor: nil, sampler: ArgMaxSampler(),
+                            prefill: PrefillParameters(stepSize: 2), maxTokens: 6)))
+                var iterator = try #require(carrier.iterator)
+                var steps: [String] = []
+                var output: [Int] = []
+                while let events = try iterator.next() {
+                    steps += events.map(describe)
+                    for case .token(_, let token) in events { output.append(token) }
+                }
+                let id = try #require(carrier.id >= 0 ? carrier.id : nil, "the first task ran")
+                #expect(output == expected)
+                #expect(
+                    Array(steps.prefix(3)) == [
+                        "prefill(\(id), 4/7)", "prefill(\(id), 6/7)", "prefill(\(id), 7/7)",
+                    ])
             }
         }.value
     }
@@ -1271,6 +1374,61 @@ struct BatchTokenIteratorTests {
     }
 }
 
+/// The model families besides Llama that opt into resumable prefill, by their `model_type`,
+/// each with a tiny configuration for random weights.
+enum ResumablePrefillFamily: String, CaseIterable, Sendable {
+    case qwen2, qwen3
+    case qwen3MoE = "qwen3_moe"
+    case phi, phi3, gemma, gemma2, starcoder2, cohere
+    case internlm2, granite, glm4, smollm3, olmo2, mixtral
+
+    var configuration: String {
+        // Keys each family does not read are ignored.
+        let common = """
+            "model_type": "\(rawValue)", "hidden_size": 32, "num_hidden_layers": 2,
+            "intermediate_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "head_dim": 8, "rms_norm_eps": 1e-5, "layer_norm_eps": 1e-5, "norm_epsilon": 1e-5,
+            "vocab_size": 64, "rope_theta": 10000.0, "max_position_embeddings": 128,
+            "tie_word_embeddings": false, "attention_bias": false, "mlp_bias": false
+            """
+        let extra: String
+        switch self {
+        case .qwen3:
+            extra = #""architectures": ["Qwen3ForCausalLM"]"#
+        case .qwen3MoE:
+            extra = """
+                "num_experts": 4, "num_experts_per_tok": 2, "decoder_sparse_step": 1,
+                "mlp_only_layers": [], "moe_intermediate_size": 32, "norm_topk_prob": true
+                """
+        case .mixtral:
+            extra = #""num_local_experts": 4, "num_experts_per_tok": 2"#
+        case .granite:
+            extra = """
+                "logits_scaling": 1.0, "attention_multiplier": 0.125, "embedding_multiplier": 1.0,
+                "residual_multiplier": 1.0
+                """
+        case .cohere:
+            extra = #""logit_scale": 0.0625, "use_qk_norm": false"#
+        case .starcoder2:
+            extra = #""use_bias": true"#
+        case .glm4, .phi:
+            extra = #""partial_rotary_factor": 0.5"#
+        case .internlm2:
+            extra = #""bias": false"#
+        case .gemma2:
+            extra = """
+                "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0,
+                "query_pre_attn_scalar": 8.0
+                """
+        case .phi3:
+            extra = #""original_max_position_embeddings": 128"#
+        case .qwen2, .gemma, .smollm3, .olmo2:
+            extra = #""rope_traditional": false"#
+        }
+        return "{\(common), \(extra)}"
+    }
+}
+
 private func boundarySampler(_ row: Int) -> TopPSampler {
     TopPSampler(temperature: 1, topP: 0.3334, seed: UInt64(41 + row))
 }
@@ -1397,6 +1555,41 @@ enum BatchPrefixCacheKind: Sendable, CaseIterable {
             _ = attention.update(keys: keys, values: keys)
             return [CacheList(arrays, CacheList(attention, mamba))]
         }
+    }
+}
+
+/// A resumable model whose chunks leave their cache writes lazy: unlike `LLMModel`'s, its
+/// `prefillChunk` neither evaluates nor submits the cache, so the iterator must.
+private final class LazyChunkModel: Module, ResumablePrefillModel {
+    let inner: LlamaModel
+
+    init(_ inner: LlamaModel) {
+        self.inner = inner
+        super.init()
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        try inner.prepare(input, cache: cache, state: state, prefill: prefill)
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        inner(input, cache: cache, state: state)
+    }
+
+    func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try inner.newCache(parameters: parameters)
+    }
+
+    func prefillChunks(for prompt: LMInput.Text, prefill: PrefillParameters) -> [Range<Int>] {
+        inner.prefillChunks(for: prompt, prefill: prefill)
+    }
+
+    func prefillChunk(_ prompt: LMInput.Text, range: Range<Int>, cache: [KVCache]) {
+        _ = inner(prompt[.newAxis, range], cache: cache, state: nil)
     }
 }
 
