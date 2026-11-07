@@ -81,6 +81,39 @@ public struct BatchTokenIterator {
         }
     }
 
+    /// A ``GenerateParameters`` setting that batched generation does not support.
+    public enum ParameterError: Error, LocalizedError, Equatable {
+        /// `maxKVSize` keeps a pinned prefix in its rotating caches.
+        case maxKVSize
+        /// A `kvCache` capacity with `preservedPrefixTokens` above zero.
+        case pinnedPrefix(Int)
+        /// A `kvCache` rewind reserve.
+        case rewindReserve
+        /// A cache strategy other than full precision or affine quantization.
+        case strategy(KVCacheStrategyIdentifier)
+        /// Affine quantization other than 4 or 8 bits from the first token.
+        case affine(bits: Int, compressionStart: Int)
+        /// `logProbabilities`.
+        case logProbabilities
+
+        public var errorDescription: String? {
+            switch self {
+            case .maxKVSize:
+                "maxKVSize pins a prefix of up to 4 tokens, which batched rotating caches do not support. Use kvCache with a capacity whose preservedPrefixTokens is 0."
+            case .pinnedPrefix(let count):
+                "Batched rotating caches do not support a pinned prefix; this capacity preserves \(count) tokens. Use preservedPrefixTokens: 0."
+            case .rewindReserve:
+                "Batched rotating caches do not support a rewind reserve."
+            case .strategy(let strategy):
+                "Batched generation does not support the \(strategy) KV-cache strategy."
+            case .affine(let bits, let compressionStart):
+                "Batched affine KV caches take 4 or 8 bits from the first token; this configuration uses \(bits) bits from token \(compressionStart)."
+            case .logProbabilities:
+                "Batched generation does not report log probabilities."
+            }
+        }
+    }
+
     private let model: any LanguageModel
     private let sampler: LogitSampler
     private let processor: LogitProcessor?
@@ -137,6 +170,10 @@ public struct BatchTokenIterator {
     private var ending: [Ended] = []
     /// The processors of the rows in `undelivered`.
     private var undeliveredEnded: [Ended] = []
+    /// What ``LanguageModel/newCache(parameters:)`` builds fresh rows' caches from.
+    private var cacheParameters: GenerateParameters?
+    /// Applied to each row's cache after its prefill: affine quantization, when configured.
+    private var cachePlan = KVCachePlan.disabled
 
     /// - Parameters:
     ///   - model: the model
@@ -159,6 +196,55 @@ public struct BatchTokenIterator {
         self.maxTokens = maxTokens
         self.prefill = prefill
         self.cacheEvaluationPolicy = cacheEvaluationPolicy
+    }
+
+    /// An iterator configured from `parameters`, as ``TokenIterator`` is for one sequence.
+    ///
+    /// The rows inserted without their own get `parameters`' sampler, a copy of its processor
+    /// and its token limit; `maxTokens == nil` means no limit, so a row runs until it samples
+    /// a stop token or is removed. Fresh rows' caches come from
+    /// ``LanguageModel/newCache(parameters:)``, so a `kvCache` capacity gives every attention
+    /// layer a rotating cache of that size. Prompts are prefilled with `parameters.prefill`.
+    /// With affine 4- or 8-bit quantization from the first token (`kvBits`, an `affine4` or
+    /// `affine8` `kvScheme`, or an affine `kvCache` strategy), each row's full-precision
+    /// attention layers are quantized after its prefill, as ``TokenIterator`` quantizes them,
+    /// and decode in a ``BatchQuantizedKVCache``; the model must support quantized attention.
+    ///
+    /// - Throws: ``ParameterError`` for a setting batched generation does not support:
+    ///   `maxKVSize`, a capacity with a pinned prefix, a rewind reserve, affine quantization
+    ///   with other bit widths or a later start, another cache strategy, or
+    ///   `logProbabilities`; `KVCacheConfigurationError` for an invalid cache configuration.
+    public init(
+        model: any LanguageModel, parameters: GenerateParameters, stopTokens: Set<Int> = []
+    ) throws {
+        guard parameters.maxKVSize == nil else { throw ParameterError.maxKVSize }
+        guard parameters.logProbabilities == nil else { throw ParameterError.logProbabilities }
+        let configuration = try parameters.resolvedKVCacheConfiguration()
+        if let configuration {
+            if let capacity = configuration.capacity, capacity.preservedPrefixTokens > 0 {
+                throw ParameterError.pinnedPrefix(capacity.preservedPrefixTokens)
+            }
+            guard configuration.rewind == nil else { throw ParameterError.rewindReserve }
+            switch configuration.strategy.storage {
+            case .fullPrecision:
+                break
+            case .affine(let affine):
+                // Converting rows later, one at a time, would break their compatibility
+                // with the rows already batched.
+                guard [4, 8].contains(affine.bits), affine.compressionStart == 0 else {
+                    throw ParameterError.affine(
+                        bits: affine.bits, compressionStart: affine.compressionStart)
+                }
+            default:
+                throw ParameterError.strategy(configuration.strategy.identifier)
+            }
+        }
+        self.init(
+            model: model, sampler: parameters.sampler(), processor: parameters.processor(),
+            stopTokens: stopTokens, maxTokens: parameters.maxTokens ?? .max,
+            prefill: parameters.prefill)
+        cacheParameters = configuration == nil ? nil : parameters
+        cachePlan = KVCachePlan(configuration: configuration)
     }
 
     /// The ids of every row decoding or queued, in insertion order.
@@ -291,8 +377,10 @@ public struct BatchTokenIterator {
     ///   decoding or queued
     /// - Throws: ``StateError/invalidatedByModelState`` when the model returns state while
     ///   decoding several rows. An error from a batched forward invalidates the batch because
-    ///   its cache writes cannot be undone; remove all rows before resuming. `.failed` events
-    ///   from the throwing call are returned by the next one.
+    ///   its cache writes cannot be undone; remove all rows before resuming.
+    ///   `CancellationError` when a prefill stops because the current task was cancelled:
+    ///   admission stops before any sampling or decoding, and the queued rows that have not
+    ///   failed stay queued. `.failed` events from a throwing call are returned by the next one.
     public mutating func next() throws -> [BatchEvent]? {
         finalizeEnded()
         // Drain admission and decode temporaries, including rejected admissions.
@@ -308,7 +396,7 @@ public struct BatchTokenIterator {
             guard !rows.isEmpty || !pending.isEmpty else { return nil }
 
             // Every queued row either fails here or joins the rows.
-            var events = pending.isEmpty ? [] : admit()
+            var events = pending.isEmpty ? [] : try admit()
             if !rows.isEmpty {
                 do {
                     events += try decode()
@@ -355,7 +443,7 @@ public struct BatchTokenIterator {
     /// Prefills the queued prompts separately, in queue order, and joins the ones that can
     /// to the rows. Returns a `.failed` event for each one that cannot; the active rows and
     /// the other queued rows are unaffected by it.
-    private mutating func admit() -> [BatchEvent] {
+    private mutating func admit() throws -> [BatchEvent] {
         let queued = pending
         pending = []
         var events: [BatchEvent] = []
@@ -367,6 +455,16 @@ public struct BatchTokenIterator {
                     item, joining: admitted, admittedState: admittedState)
                 if rowState != nil { admittedState = rowState }
                 admitted.append(row)
+            } catch is CancellationError where Task.isCancelled {
+                // The task was cancelled: stop before sampling or decoding anything. Every row
+                // that has not failed goes back to the queue; the failures are returned by the
+                // next call.
+                let failed = Set(events.map(\.id))
+                pending = queued.filter { !failed.contains($0.row.id) }
+                undelivered = events
+                undeliveredEnded = ending
+                ending = []
+                throw CancellationError()
             } catch {
                 events.append(.failed(id: item.row.id, error: error))
                 end(item.row)
@@ -438,18 +536,21 @@ public struct BatchTokenIterator {
             }
             return true
         }
-        let rowCache =
+        var rowCache =
             try item.cache?.map { original in
                 let copy = original.copy()
                 guard preservesTypes(original, copy) else {
                     throw KVCacheError(message: "A prompt cache copy must preserve its exact types")
                 }
                 return copy
-            } ?? model.newCache(parameters: nil)
+            } ?? model.newCache(parameters: cacheParameters)
         let layerCount = rows.isEmpty ? admitted.first?.cache.count ?? rowCache.count : cache.count
         guard rowCache.count == layerCount else {
             throw KVCacheError(message: "Every row must share the active cache's layer count")
         }
+        // The configured capacity, strategy and compatibility policy, as TokenIterator checks
+        // them, before the prefill: a row whose cache cannot satisfy them fails alone.
+        _ = try cachePlan.validated(rowCache)
 
         // The prompt goes into its own cache first, as TokenIterator feeds it: the model's
         // prefill (chunked) and then the remainder it leaves, whose last position's logits
@@ -479,6 +580,9 @@ public struct BatchTokenIterator {
             throw StateError.modelStateRequiresSingleRow
         }
         let logits = output.logits[0..., -1, 0...]
+        // The first logits come from the full-precision prefill; later steps read the cache
+        // the configured strategy produces, as in TokenIterator.
+        cachePlan.apply(to: &rowCache)
         eval(rowCache)
         eval(logits)
 

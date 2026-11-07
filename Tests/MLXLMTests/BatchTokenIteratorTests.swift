@@ -574,6 +574,204 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("The GenerateParameters initializer matches single runs with the same parameters")
+    func generateParametersParity() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            // A capacity smaller than prompt plus output, so every row's window rotates.
+            let parameters = GenerateParameters(
+                maxTokens: 10,
+                kvCache: KVCacheConfiguration(
+                    capacity: try .init(maxTokens: 8, preservedPrefixTokens: 0)),
+                temperature: 0, repetitionPenalty: 1.5, repetitionContextSize: 8)
+            let expected = try Self.prompts.map { prompt in
+                let iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: model,
+                    parameters: parameters)
+                return Array(IteratorSequence(iterator))
+            }
+            #expect(expected.allSatisfy { $0.count == 10 })
+
+            var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+            let ids = iterator.insert(prompts: Self.prompts)
+            #expect(try collect(&iterator, uids: ids) == expected)
+        }
+    }
+
+    @Test(
+        "Affine 4- and 8-bit GenerateParameters match single runs with the same parameters",
+        arguments: [4, 8])
+    func generateParametersAffineParity(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The legacy field and the typed strategy resolve to the same configuration.
+            let legacy = GenerateParameters(maxTokens: 6, kvBits: bits, temperature: 0)
+            let typed = GenerateParameters(
+                maxTokens: 6,
+                kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: bits))),
+                temperature: 0)
+            for parameters in [legacy, typed] {
+                let expected = try Self.prompts.map { prompt in
+                    let iterator = try TokenIterator(
+                        input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })),
+                        model: model, parameters: parameters)
+                    return Array(IteratorSequence(iterator))
+                }
+                var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+                let ids = iterator.insert(prompts: Self.prompts)
+                var actual = [Int: [Int]]()
+                func record(_ events: [BatchEvent]?) {
+                    for case .token(let id, let token) in events ?? [] {
+                        actual[id, default: []].append(token)
+                    }
+                }
+                record(try iterator.next())
+                // The batch is quantized at `bits`: a row whose supplied cache uses that width
+                // joins it, and one using the other width cannot.
+                func quantizedCache(_ bits: Int) -> [KVCache] {
+                    (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+                }
+                let probes = iterator.insert(
+                    prompts: [[1], [2]],
+                    caches: [quantizedCache(bits), quantizedCache(bits == 4 ? 8 : 4)])
+                let joined = try iterator.next()
+                #expect(failures(joined).map(\.id) == [probes[1]])
+                #expect(failures(joined).allSatisfy { $0.error is KVCacheError })
+                #expect(tokenIDs(joined) == ids + [probes[0]])
+                record(joined)
+                iterator.remove([probes[0]])
+                while let events = try iterator.next() { record(events) }
+                #expect(ids.map { actual[$0] ?? [] } == expected)
+            }
+        }
+    }
+
+    @Test("A row whose cache cannot meet the affine compatibility policy fails before prefill")
+    func generateParametersAffineCompatibility() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The typed strategy requires at least one quantizable layer by default; rotating
+            // layers cannot be quantized.
+            var iterator = try BatchTokenIterator(
+                model: model,
+                parameters: GenerateParameters(
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 4))),
+                    temperature: 0))
+            let id = iterator.insert(
+                prompt: [1, 2, 3],
+                cache: (0 ..< 2).map { _ in RotatingKVCache(maxSize: 16) })
+            let events = try iterator.next()
+            #expect(failures(events).map(\.id) == [id])
+            #expect(
+                failures(events).allSatisfy {
+                    $0.error as? KVCacheConfigurationError
+                        == .noCompatibleLayers(strategy: .affine)
+                })
+            #expect(tokens(events).isEmpty)
+            #expect(try iterator.next() == nil)
+        }
+    }
+
+    @Test("A GenerateParameters token limit of nil leaves rows unlimited")
+    func generateParametersWithoutTokenLimit() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = BatchTextOnlyModel(preparation: .tokens)
+            var iterator = try BatchTokenIterator(
+                model: model, parameters: GenerateParameters(maxTokens: nil, temperature: 0))
+            let id = iterator.insert(prompt: [1])
+            // Past the plain initializer's default limit of 128.
+            for _ in 0 ..< 200 {
+                let events = try #require(try iterator.next())
+                #expect(tokenIDs(events) == [id])
+                #expect(finishes(events).isEmpty)
+            }
+            iterator.remove([id])
+            #expect(try iterator.next() == nil)
+        }
+    }
+
+    @Test("The GenerateParameters initializer refuses settings batching does not support")
+    func generateParametersRefusals() throws {
+        let model = BatchTextOnlyModel(preparation: .tokens)
+        let refused: [(GenerateParameters, BatchTokenIterator.ParameterError)] = [
+            (GenerateParameters(maxKVSize: 64), .maxKVSize),
+            (
+                GenerateParameters(
+                    kvCache: KVCacheConfiguration(capacity: try .init(maxTokens: 64))),
+                .pinnedPrefix(4)
+            ),
+            (
+                GenerateParameters(
+                    kvCache: KVCacheConfiguration(
+                        capacity: try .init(maxTokens: 64, preservedPrefixTokens: 0),
+                        rewind: try .init(maxTokens: 8))),
+                .rewindReserve
+            ),
+            // Affine 4 or 8 bits from the first token is supported; see
+            // generateParametersAffineParity.
+            (GenerateParameters(kvBits: 2), .affine(bits: 2, compressionStart: 0)),
+            (
+                GenerateParameters(kvBits: 4, quantizedKVStart: 16),
+                .affine(bits: 4, compressionStart: 16)
+            ),
+            (
+                GenerateParameters(
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 6)))),
+                .affine(bits: 6, compressionStart: 0)
+            ),
+            (GenerateParameters(kvScheme: "turbo8v3"), .strategy(.turboQuant)),
+            (GenerateParameters(logProbabilities: 5), .logProbabilities),
+        ]
+        for (parameters, error) in refused {
+            #expect(throws: error) {
+                _ = try BatchTokenIterator(model: model, parameters: parameters)
+            }
+        }
+        #expect(throws: KVCacheConfigurationError.conflictingLegacyConfiguration) {
+            _ = try BatchTokenIterator(
+                model: model,
+                parameters: GenerateParameters(
+                    kvCache: KVCacheConfiguration(
+                        capacity: try .init(maxTokens: 64, preservedPrefixTokens: 0)),
+                    kvBits: 4))
+        }
+        _ = try BatchTokenIterator(model: model, parameters: GenerateParameters())
+    }
+
+    @Test("A prefill stopped by task cancellation stops admission before any sampling")
+    func cancelledAdmissionStopsBeforeSampling() async throws {
+        try await Task {
+            try Device.withDefaultDevice(.cpu) {
+                // The first row prefills, the second fails to join before its prefill, and the
+                // third row's prefill sees the task cancelled.
+                final class Count { var value = 0 }
+                let prepares = Count()
+                let model = BatchTextOnlyModel(
+                    preparation: .tokens,
+                    prepareObserver: { _ in
+                        prepares.value += 1
+                        guard prepares.value == 2 else { return }
+                        withUnsafeCurrentTask { $0?.cancel() }
+                        throw CancellationError()
+                    })
+                let sampler = AdmissionCountingSampler()
+                var iterator = BatchTokenIterator(model: model, sampler: sampler)
+                let ids = iterator.insert(
+                    prompts: [[1], [2], [3], [4]],
+                    caches: [nil, [KVCacheSimple(), KVCacheSimple()], nil, nil])
+                #expect(throws: CancellationError.self) { _ = try iterator.next() }
+                #expect(sampler.calls == 0, "nothing is sampled after the cancellation")
+                #expect(model.nextTokenCalls == 1, "only the first row's prefill ran a forward")
+                #expect(prepares.value == 2, "the fourth row is not prefilled")
+                #expect(iterator.pendingIDs == [ids[0], ids[2], ids[3]])
+                // The failure from the cancelled call arrives with the next one.
+                let delivered = try iterator.next()
+                #expect(failures(delivered).map(\.id) == [ids[1]])
+                #expect(delivered?.count == 1)
+            }
+        }.value
+    }
+
     @Test("Failures from a step that then throws are returned by the next call")
     func failuresSurviveAThrowingStep() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -1925,6 +2123,43 @@ struct BatchGenerationTests {
                     prefill: prefill)
                 await consume(stream, task: task)
             }
+        }
+    }
+
+    @Test("Cancellation during a later row's prefill decodes nothing and cancels every row")
+    func laterPrefillCancellation() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["a"], ["b"]], probe: probe, chunkedPrefill: true)
+            let prompts = fixture.prompts.map { Array(repeating: $0[0], count: 5) }
+            // The first row prefills completely; the task is cancelled after the second
+            // row's first chunk.
+            final class Starts: @unchecked Sendable { var count = 0 }
+            let starts = Starts()
+            let prefill = PrefillParameters(
+                stepSize: 1,
+                progress: { processed, _ in
+                    probe.observePrefillProgress(processed)
+                    if processed == 1 { starts.count += 1 }
+                    if starts.count == 2 { withUnsafeCurrentTask { $0?.cancel() } }
+                })
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 1,
+                prefill: prefill)
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            #expect(task.isCancelled)
+            #expect(result.tokens.isEmpty, "no row decodes after the cancellation")
+            #expect(result.failed.isEmpty)
+            #expect(Set(result.info.keys) == Set(prompts.indices))
+            #expect(result.info.values.allSatisfy { $0.stopReason == .cancelled })
+            #expect(result.info.values.allSatisfy { $0.generationTokenCount == 0 })
+            // The first row's four chunks and its completion, then the second row's first chunk.
+            #expect(probe.prefillProgress == [1, 2, 3, 4, 5, 1])
+            #expect(probe.widths == [1, 1, 1, 1, 1, 1], "no decode forward is submitted")
         }
     }
 
