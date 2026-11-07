@@ -3,7 +3,9 @@
 // Decode throughput and time to first token on a local model, as medians over rounds: the
 // single-sequence `TokenIterator`, and `BatchTokenIterator` at every batch size asked for.
 // Decode is timed after the prefill and the first token; the time to first token covers the
-// prefill. Every path must repeat its tokens in every round; how far each batch row agrees
+// prefill. A batch's decode rate counts only the steps in which every row decodes and no prompt
+// is prefilled; with resumable prefill the steps that also feed a prefill chunk are reported
+// apart. Every path must repeat its tokens in every round; how far each batch row agrees
 // with a single-sequence run of the same prompt is reported.
 //
 //   swift run -c release --package-path Benchmarks/DecodeBench decodebench <model directory> \
@@ -98,10 +100,13 @@ func median(_ values: [Double]) -> Double {
 struct Run {
     /// Decode tokens per second, counting one row.
     let tokensPerSecond: Double
-    /// Seconds from the start of the run to the first token of every row: the prefill.
+    /// Seconds from the start of the run to the first token: the prefill.
     let firstToken: Double
     /// Every row's tokens, the first one included.
     let tokens: [[Int]]
+    /// Batch steps that decoded while also feeding a prefill chunk, and their total seconds.
+    var overlapSteps = 0
+    var overlapSeconds = 0.0
 }
 
 /// Prefills the prompt, then times `decodeTokens` steps of `TokenIterator`.
@@ -123,8 +128,11 @@ struct Run {
 }
 
 #if !SINGLE_ONLY
-/// Queues the prompts in a `BatchTokenIterator`, takes the first step (the prefill and
-/// the first token) and times `decodeTokens` further steps.
+/// Queues the prompts in a `BatchTokenIterator` and runs it to the end. The time to first
+/// token ends at the first `.token` event. The decode rate counts the steady steps only: every
+/// row decodes, none of them its first token, and no prefill chunk runs. With resumable
+/// prefill the rows join one step apart, so the steps that also feed a prefill chunk are
+/// reported apart from it.
 @MainActor func runBatched(prompts: [[Int32]]) throws -> Run {
     defer { Stream.defaultStream.synchronize() }
     let start = ContinuousClock.now
@@ -132,26 +140,48 @@ struct Run {
         model: model, sampler: makeSampler(), maxTokens: decodeTokens + 1)
     let ids = iterator.insert(prompts: prompts.map { $0.map { Int($0) } })
     var tokens = [[Int]](repeating: [], count: prompts.count)
-    // A row that cannot join ends the run, as an admission error did before the iterator
-    // reported it as an event: a partial batch would report a rate for rows it never ran.
-    func record(_ events: [BatchEvent]?) throws {
-        for event in events ?? [] {
+    var firstToken: Double?
+    var steadySteps = 0
+    var steadySeconds = 0.0
+    var run = Run(tokensPerSecond: 0, firstToken: 0, tokens: [])
+    while true {
+        let stepStart = ContinuousClock.now
+        guard let events = try iterator.next() else { break }
+        let stepSeconds = seconds(since: stepStart)
+        var decoded = 0
+        var prefilled = false
+        var firstTokens = false
+        for event in events {
             switch event {
-            case .token(let id, let token): tokens[ids.firstIndex(of: id)!].append(token)
-            case .failed(_, let error): throw error
-            case .prefill, .finished: break
+            case .token(let id, let token):
+                let row = ids.firstIndex(of: id)!
+                firstTokens = firstTokens || tokens[row].isEmpty
+                tokens[row].append(token)
+                decoded += 1
+            case .prefill:
+                prefilled = true
+            // A row that cannot join ends the run, as an admission error did before the
+            // iterator reported it as an event: a partial batch would report a rate for rows
+            // it never ran.
+            case .failed(_, let error):
+                throw error
+            case .finished:
+                break
             }
         }
-    }
-    try record(try iterator.next())
-    let firstToken = seconds(since: start)
-    let decodeStart = ContinuousClock.now
-    while let events = try iterator.next() {
-        try record(events)
+        if decoded > 0, firstToken == nil { firstToken = seconds(since: start) }
+        if prefilled, decoded > 0 {
+            run.overlapSteps += 1
+            run.overlapSeconds += stepSeconds
+        } else if !prefilled, !firstTokens, decoded == prompts.count {
+            steadySteps += 1
+            steadySeconds += stepSeconds
+        }
     }
     return Run(
-        tokensPerSecond: Double(decodeTokens) / seconds(since: decodeStart),
-        firstToken: firstToken, tokens: tokens)
+        tokensPerSecond: Double(steadySteps) / steadySeconds,
+        firstToken: firstToken ?? seconds(since: start), tokens: tokens,
+        overlapSteps: run.overlapSteps, overlapSeconds: run.overlapSeconds)
 }
 
 /// The prompts of a batch: row 0 is the single-sequence prompt and every other row has its
@@ -206,7 +236,13 @@ var mismatchedRounds: [Int] = []
         rows == 1
         ? perRow
         : perRow + String(format: " per row, %.2f total", Double(rows) * run.tokensPerSecond)
-    return rate + String(format: " (ttft %.0f ms)", 1000 * run.firstToken)
+    let overlap =
+        run.overlapSteps == 0
+        ? ""
+        : String(
+            format: ", %d overlap steps at %.1f ms", run.overlapSteps,
+            1000 * run.overlapSeconds / Double(run.overlapSteps))
+    return rate + String(format: " (ttft %.0f ms", 1000 * run.firstToken) + overlap + ")"
 }
 
 var single: [Double] = []
