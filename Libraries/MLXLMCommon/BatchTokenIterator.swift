@@ -204,7 +204,8 @@ public struct BatchTokenIterator {
     /// and its token limit; `maxTokens == nil` means no limit, so a row runs until it samples
     /// a stop token or is removed. Fresh rows' caches come from
     /// ``LanguageModel/newCache(parameters:)``, so a `kvCache` capacity gives every attention
-    /// layer a rotating cache of that size. Prompts are prefilled with `parameters.prefill`.
+    /// layer a rotating cache of that size. Prompts are prefilled with `parameters.prefill`,
+    /// and each step's cache evaluation follows `parameters.cacheEvaluationPolicy`.
     /// With affine 4- or 8-bit quantization from the first token (`kvBits`, an `affine4` or
     /// `affine8` `kvScheme`, or an affine `kvCache` strategy), each row's full-precision
     /// attention layers are quantized after its prefill, as ``TokenIterator`` quantizes them,
@@ -242,7 +243,7 @@ public struct BatchTokenIterator {
         self.init(
             model: model, sampler: parameters.sampler(), processor: parameters.processor(),
             stopTokens: stopTokens, maxTokens: parameters.maxTokens ?? .max,
-            prefill: parameters.prefill)
+            prefill: parameters.prefill, cacheEvaluationPolicy: parameters.cacheEvaluationPolicy)
         cacheParameters = configuration == nil ? nil : parameters
         cachePlan = KVCachePlan(configuration: configuration)
     }
