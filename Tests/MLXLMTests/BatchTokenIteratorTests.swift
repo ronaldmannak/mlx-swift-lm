@@ -574,6 +574,170 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("The GenerateParameters initializer matches single runs with the same parameters")
+    func generateParametersParity() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            // A capacity smaller than prompt plus output, so every row's window rotates.
+            let parameters = GenerateParameters(
+                maxTokens: 10,
+                kvCache: KVCacheConfiguration(
+                    capacity: try .init(maxTokens: 8, preservedPrefixTokens: 0)),
+                temperature: 0, repetitionPenalty: 1.5, repetitionContextSize: 8)
+            let expected = try Self.prompts.map { prompt in
+                let iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: model,
+                    parameters: parameters)
+                return Array(IteratorSequence(iterator))
+            }
+            #expect(expected.allSatisfy { $0.count == 10 })
+
+            var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+            let ids = iterator.insert(prompts: Self.prompts)
+            #expect(try collect(&iterator, uids: ids) == expected)
+        }
+    }
+
+    @Test(
+        "Affine 4- and 8-bit GenerateParameters match single runs with the same parameters",
+        arguments: [4, 8])
+    func generateParametersAffineParity(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The legacy field and the typed strategy resolve to the same configuration.
+            let legacy = GenerateParameters(maxTokens: 6, kvBits: bits, temperature: 0)
+            let typed = GenerateParameters(
+                maxTokens: 6,
+                kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: bits))),
+                temperature: 0)
+            for parameters in [legacy, typed] {
+                let expected = try Self.prompts.map { prompt in
+                    let iterator = try TokenIterator(
+                        input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })),
+                        model: model, parameters: parameters)
+                    return Array(IteratorSequence(iterator))
+                }
+                var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+                let ids = iterator.insert(prompts: Self.prompts)
+                var actual = [Int: [Int]]()
+                func record(_ events: [BatchEvent]?) {
+                    for case .token(let id, let token) in events ?? [] {
+                        actual[id, default: []].append(token)
+                    }
+                }
+                record(try iterator.next())
+                // The batch is quantized at `bits`: a row whose supplied cache uses that width
+                // joins it, and one using the other width cannot.
+                func quantizedCache(_ bits: Int) -> [KVCache] {
+                    (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+                }
+                let probes = iterator.insert(
+                    prompts: [[1], [2]],
+                    caches: [quantizedCache(bits), quantizedCache(bits == 4 ? 8 : 4)])
+                let joined = try iterator.next()
+                #expect(failures(joined).map(\.id) == [probes[1]])
+                #expect(failures(joined).allSatisfy { $0.error is KVCacheError })
+                #expect(tokenIDs(joined) == ids + [probes[0]])
+                record(joined)
+                iterator.remove([probes[0]])
+                while let events = try iterator.next() { record(events) }
+                #expect(ids.map { actual[$0] ?? [] } == expected)
+            }
+        }
+    }
+
+    @Test("A row whose cache cannot meet the affine compatibility policy fails before prefill")
+    func generateParametersAffineCompatibility() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The typed strategy requires at least one quantizable layer by default; rotating
+            // layers cannot be quantized.
+            var iterator = try BatchTokenIterator(
+                model: model,
+                parameters: GenerateParameters(
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 4))),
+                    temperature: 0))
+            let id = iterator.insert(
+                prompt: [1, 2, 3],
+                cache: (0 ..< 2).map { _ in RotatingKVCache(maxSize: 16) })
+            let events = try iterator.next()
+            #expect(failures(events).map(\.id) == [id])
+            #expect(
+                failures(events).allSatisfy {
+                    $0.error as? KVCacheConfigurationError
+                        == .noCompatibleLayers(strategy: .affine)
+                })
+            #expect(tokens(events).isEmpty)
+            #expect(try iterator.next() == nil)
+        }
+    }
+
+    @Test("A GenerateParameters token limit of nil leaves rows unlimited")
+    func generateParametersWithoutTokenLimit() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = BatchTextOnlyModel(preparation: .tokens)
+            var iterator = try BatchTokenIterator(
+                model: model, parameters: GenerateParameters(maxTokens: nil, temperature: 0))
+            let id = iterator.insert(prompt: [1])
+            // Past the plain initializer's default limit of 128.
+            for _ in 0 ..< 200 {
+                let events = try #require(try iterator.next())
+                #expect(tokenIDs(events) == [id])
+                #expect(finishes(events).isEmpty)
+            }
+            iterator.remove([id])
+            #expect(try iterator.next() == nil)
+        }
+    }
+
+    @Test("The GenerateParameters initializer refuses settings batching does not support")
+    func generateParametersRefusals() throws {
+        let model = BatchTextOnlyModel(preparation: .tokens)
+        let refused: [(GenerateParameters, BatchTokenIterator.ParameterError)] = [
+            (GenerateParameters(maxKVSize: 64), .maxKVSize),
+            (
+                GenerateParameters(
+                    kvCache: KVCacheConfiguration(capacity: try .init(maxTokens: 64))),
+                .pinnedPrefix(4)
+            ),
+            (
+                GenerateParameters(
+                    kvCache: KVCacheConfiguration(
+                        capacity: try .init(maxTokens: 64, preservedPrefixTokens: 0),
+                        rewind: try .init(maxTokens: 8))),
+                .rewindReserve
+            ),
+            // Affine 4 or 8 bits from the first token is supported; see
+            // generateParametersAffineParity.
+            (GenerateParameters(kvBits: 2), .affine(bits: 2, compressionStart: 0)),
+            (
+                GenerateParameters(kvBits: 4, quantizedKVStart: 16),
+                .affine(bits: 4, compressionStart: 16)
+            ),
+            (
+                GenerateParameters(
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 6)))),
+                .affine(bits: 6, compressionStart: 0)
+            ),
+            (GenerateParameters(kvScheme: "turbo8v3"), .strategy(.turboQuant)),
+            (GenerateParameters(logProbabilities: 5), .logProbabilities),
+        ]
+        for (parameters, error) in refused {
+            #expect(throws: error) {
+                _ = try BatchTokenIterator(model: model, parameters: parameters)
+            }
+        }
+        #expect(throws: KVCacheConfigurationError.conflictingLegacyConfiguration) {
+            _ = try BatchTokenIterator(
+                model: model,
+                parameters: GenerateParameters(
+                    kvCache: KVCacheConfiguration(
+                        capacity: try .init(maxTokens: 64, preservedPrefixTokens: 0)),
+                    kvBits: 4))
+        }
+        _ = try BatchTokenIterator(model: model, parameters: GenerateParameters())
+    }
+
     @Test("Failures from a step that then throws are returned by the next call")
     func failuresSurviveAThrowingStep() throws {
         try Device.withDefaultDevice(.cpu) {
