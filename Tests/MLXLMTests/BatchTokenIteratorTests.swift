@@ -520,6 +520,22 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("batchGenerate finalizes every row once when the batch throws")
+    func batchGenerateFinalizesOnThrow() throws {
+        try Device.withDefaultDevice(.cpu) {
+            // Two rows decoding together make the model return state, which invalidates the
+            // batch and makes next() throw.
+            let log = RecordingProcessorLog()
+            #expect(throws: BatchTokenIterator.StateError.invalidatedByModelState) {
+                _ = try batchGenerate(
+                    model: BatchTextOnlyModel(preparation: .tokens, emitsBatchState: true),
+                    prompts: [[1, 3], [7]],
+                    processor: RecordingProcessor(name: "row", log: log))
+            }
+            #expect(log.entries == ["finalize row", "finalize row"])
+        }
+    }
+
     @Test("Recorded tokens reach a row's processor before its one finalization")
     func emissionAndFinalization() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -633,13 +649,17 @@ struct BatchTokenIteratorTests {
                 let probes = iterator.insert(
                     prompts: [[1], [2]],
                     caches: [quantizedCache(bits), quantizedCache(bits == 4 ? 8 : 4)])
-                let joined = try iterator.next()
-                #expect(failures(joined).map(\.id) == [probes[1]])
-                #expect(failures(joined).allSatisfy { $0.error is KVCacheError })
-                #expect(tokenIDs(joined) == ids + [probes[0]])
-                record(joined)
-                iterator.remove([probes[0]])
-                while let events = try iterator.next() { record(events) }
+                // Llama prefills resumably, admitting one queued row per step, so the probes
+                // join the running batch after the prompts' rows.
+                var failed: [(id: Int, error: any Error)] = []
+                while let events = try iterator.next() {
+                    record(events)
+                    failed += failures(events)
+                }
+                #expect(failed.map(\.id) == [probes[1]])
+                #expect(failed.allSatisfy { $0.error is KVCacheError })
+                #expect(
+                    !(actual[probes[0]] ?? []).isEmpty, "the same-width probe joins and decodes")
                 #expect(ids.map { actual[$0] ?? [] } == expected)
             }
         }
@@ -1006,10 +1026,92 @@ struct BatchTokenIteratorTests {
                     BatchFinish(id: third[0], reason: .length, stopToken: nil)
                 ])
             #expect((first + third).allSatisfy(endsWithFinish))
+            // Llama prefills resumably: each step decodes the joined rows and then admits one
+            // queued row, so the first row decodes from step 1 and the third joins in step 2.
+            #expect(steps[0].map(\.id) == [first[0]])
+            #expect(steps[1].map(\.id) == first)
             #expect(steps[2].map(\.id) == first + third)
-            #expect(steps[3].map(\.id) == [first[1], third[0]])
+            // The first row's stop token ends it in step 3; it is gone from step 4.
+            #expect(steps[3].map(\.id) == first + third)
+            #expect(steps[4].map(\.id) == [first[1], third[0]])
             #expect(iterator.ids.isEmpty)
         }
+    }
+
+    @Test("A resumable model prefills one chunk per step while other rows decode")
+    func resumablePrefillChunks() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            #expect(model is any ResumablePrefillModel)
+            let prefill = PrefillParameters(stepSize: 4)
+            let short: [Int] = [1, 2]
+            // A warm row: a cached 4-token prefix and an 11-token suffix to prefill in chunks.
+            let prefix: [Int] = [3, 4, 5, 6]
+            let suffix = Array(7 ..< 18)
+            func prefixCache() throws -> [KVCache] {
+                let cache = try model.newCache(parameters: nil)
+                eval(model(MLXArray(prefix.map { Int32($0) })[.newAxis], cache: cache))
+                return cache
+            }
+            func alone(_ prompt: [Int], cache: [KVCache]?) throws -> [Int] {
+                let iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: model,
+                    cache: cache, processor: nil, sampler: ArgMaxSampler(), prefill: prefill,
+                    maxTokens: 8)
+                return Array(IteratorSequence(iterator))
+            }
+            let expected = [
+                try alone(short, cache: nil), try alone(suffix, cache: try prefixCache()),
+            ]
+            let chunks = model.prefillChunks(
+                for: LMInput.Text(tokens: MLXArray(suffix.map { Int32($0) })), prefill: prefill)
+            #expect(chunks == [0 ..< 4, 4 ..< 8, 8 ..< 10])
+
+            var iterator = BatchTokenIterator(model: model, maxTokens: 8, prefill: prefill)
+            let first = iterator.insert(prompt: short)
+            let warm = iterator.insert(prompt: suffix, cache: try prefixCache())
+            var steps: [[String]] = []
+            var output = [Int: [Int]]()
+            while let events = try iterator.next() {
+                steps.append(events.map(describe))
+                for case .token(let id, let token) in events {
+                    output[id, default: []].append(token)
+                }
+            }
+            #expect([output[first] ?? [], output[warm] ?? []] == expected)
+            // The short row joins first; then every step decodes it and feeds one chunk of the
+            // warm row, whose final forward completes its prompt before it decodes too.
+            let a = expected[0]
+            #expect(
+                Array(steps.prefix(6)) == [
+                    ["prefill(\(first), 2/2)"],
+                    ["token(\(first), \(a[0]))", "prefill(\(warm), 4/11)"],
+                    ["token(\(first), \(a[1]))", "prefill(\(warm), 8/11)"],
+                    ["token(\(first), \(a[2]))", "prefill(\(warm), 10/11)"],
+                    ["token(\(first), \(a[3]))", "prefill(\(warm), 11/11)"],
+                    ["token(\(first), \(a[4]))", "token(\(warm), \(expected[1][0]))"],
+                ])
+        }
+    }
+
+    @Test("Cancellation between resumable prefill chunks leaves the row queued")
+    func resumablePrefillCancellation() async throws {
+        try await Task {
+            try Device.withDefaultDevice(.cpu) {
+                let model = tinyLlama()
+                var iterator = BatchTokenIterator(
+                    model: model, prefill: PrefillParameters(stepSize: 2))
+                let id = iterator.insert(prompt: Array(1 ..< 8))
+                let first = try iterator.next()
+                #expect(first?.map(describe) == ["prefill(\(id), 2/7)"])
+                withUnsafeCurrentTask { $0?.cancel() }
+                #expect(throws: CancellationError.self) { _ = try iterator.next() }
+                #expect(iterator.pendingIDs == [id])
+                iterator.remove([id])
+                let idle = try iterator.next()
+                #expect(idle == nil)
+            }
+        }.value
     }
 
     @Test("A removed row leaves the batch, queued or decoding")
@@ -1023,7 +1125,15 @@ struct BatchTokenIteratorTests {
             _ = try iterator.next()
             iterator.remove([uids[0]])
             #expect(iterator.ids == [uids[2]])
-            #expect(tokenIDs(try iterator.next()) == [uids[2]])
+            // Only the remaining row appears from here on, and it runs to its limit.
+            var seen = Set<Int>()
+            var generated = 0
+            while let events = try iterator.next() {
+                seen.formUnion(events.map(\.id))
+                generated += tokens(events).count
+            }
+            #expect(seen == [uids[2]])
+            #expect(generated == 4)
         }
     }
 

@@ -10,10 +10,11 @@ import MLXNN
 /// last `.token` in the same array; its id never appears again. A row dropped with
 /// ``BatchTokenIterator/remove(_:)`` gets no terminal event.
 public enum BatchEvent: Sendable {
-    /// Prefill progress for the row that was prefilled this step, in prompt tokens.
-    ///
-    /// Not emitted yet: every queued prompt is prefilled whole within one ``BatchTokenIterator/next()``,
-    /// and `PrefillParameters.progress` reports its chunks. Reserved for resumable prefill.
+    /// Prefill progress for the queued row that got a prefill chunk this step, in prompt
+    /// tokens. Emitted for a ``ResumablePrefillModel`` only, once per chunk; `processed ==
+    /// total` marks the final chunk, after which the row joins the batch and its first `.token`
+    /// comes with the next step. Other models prefill a queued prompt whole within one
+    /// ``BatchTokenIterator/next()`` and report no `.prefill`.
     case prefill(id: Int, processed: Int, total: Int)
     /// A generated token. Stop tokens are never reported here.
     case token(id: Int, token: Int)
@@ -45,6 +46,12 @@ public enum BatchEvent: Sendable {
 /// prefill, then their caches are merged into the decoding batch. Every ``next()`` decodes
 /// one token for every row; a row leaves when it samples a stop token or reaches its limit,
 /// or when it is removed.
+///
+/// For a ``ResumablePrefillModel``, each ``next()`` instead decodes first and then feeds at
+/// most one prefill chunk of the first queued prompt (first in, first out), reporting it as
+/// `.prefill`. A long prompt therefore delays the decoding rows by one chunk per step rather
+/// than by its whole prefill. A step that only prefills returns `[.prefill(…)]`, so it is
+/// never mistaken for idle. `PrefillParameters.progress` still reports each chunk.
 ///
 /// ``next()`` returns the step's ``BatchEvent``s, or `nil` when the iterator is idle: no row
 /// is decoding or queued. Unlike `IteratorProtocol`, `nil` does not mean exhausted; inserting
@@ -133,6 +140,16 @@ public struct BatchTokenIterator {
         let row: Row
         let prompt: [Int]
         let cache: [KVCache]?
+        /// The row's prefill so far, for a ``ResumablePrefillModel``.
+        var resume: Resume?
+    }
+
+    /// A queued row partway through a resumable prefill: its own cache and the chunks left.
+    private struct Resume {
+        let cache: [KVCache]
+        let prompt: LMInput.Text
+        let chunks: [Range<Int>]
+        var next = 0
     }
 
     /// A queued row prefilled into its own cache, ready to join the batch.
@@ -279,7 +296,7 @@ public struct BatchTokenIterator {
             let row = Row(
                 id: nextID, sampler: samplers?[index] ?? sampler, processor: processor,
                 maxTokens: limit)
-            pending.append(Pending(row: row, prompt: prompt, cache: caches?[index]))
+            pending.append(Pending(row: row, prompt: prompt, cache: caches?[index], resume: nil))
             ids.append(nextID)
             nextID += 1
         }
@@ -391,6 +408,9 @@ public struct BatchTokenIterator {
             guard !invalidatedByModelState else { throw StateError.invalidatedByModelState }
             guard !rows.isEmpty || !pending.isEmpty else { return nil }
 
+            if let resumable = model as? any ResumablePrefillModel {
+                return try resumableStep(resumable)
+            }
             // Every queued row either fails here or joins the rows.
             var events = pending.isEmpty ? [] : try admit()
             if !rows.isEmpty {
@@ -406,6 +426,88 @@ public struct BatchTokenIterator {
             ended = ending
             ending = []
             return events
+        }
+    }
+
+    /// One step for a ``ResumablePrefillModel``: the decode step first, then at most one chunk
+    /// of the first queued row's prefill. The final chunk is the forward whose logits give the
+    /// row's first sample; the row then joins the rows, and its first token comes with the
+    /// next step.
+    private mutating func resumableStep(_ model: any ResumablePrefillModel) throws
+        -> [BatchEvent]
+    {
+        var events: [BatchEvent] = []
+        if !rows.isEmpty {
+            do {
+                events = try decode()
+            } catch {
+                undelivered = []
+                undeliveredEnded = ending
+                ending = []
+                throw error
+            }
+        }
+        if !pending.isEmpty {
+            if Task.isCancelled {
+                // Submit no prefill work for a cancelled task; the queued rows stay queued.
+                guard !events.isEmpty else { throw CancellationError() }
+            } else {
+                events += prefillStep(model)
+            }
+        }
+        ended = ending
+        ending = []
+        return events
+    }
+
+    /// Feeds one chunk of the first queued row's prefill. Returns its `.prefill` progress, and
+    /// on the final chunk the row joins the rows; or a `.failed` event when it cannot.
+    private mutating func prefillStep(_ model: any ResumablePrefillModel) -> [BatchEvent] {
+        var item = pending[0]
+        let id = item.row.id
+        let total = item.prompt.count
+        do {
+            var resume: Resume
+            if let started = item.resume {
+                resume = started
+            } else {
+                let rowCache = try rowCache(for: item, joining: [], admittedState: nil)
+                if let prefix = prefill.prefix {
+                    prefix(KVCacheStorage(rowCache, plan: .disabled).processedTokenCount)
+                }
+                let prompt = LMInput.Text(tokens: MLXArray(item.prompt.map { Int32($0) }))
+                resume = Resume(
+                    cache: rowCache, prompt: prompt,
+                    chunks: model.prefillChunks(for: prompt, prefill: prefill))
+            }
+            if resume.next < resume.chunks.count {
+                let range = resume.chunks[resume.next]
+                autoreleasepool {
+                    model.prefillChunk(resume.prompt, range: range, cache: resume.cache)
+                    eval(resume.cache)
+                    // As PrefillParameters.forEachChunk does after each chunk.
+                    Memory.clearCache()
+                }
+                resume.next += 1
+                prefill.progress?(range.upperBound, total)
+                item.resume = resume
+                pending[0] = item
+                return [.prefill(id: id, processed: range.upperBound, total: total)]
+            }
+            // The remainder the chunks leave, as the model's `prepare` leaves it.
+            let remainder = resume.prompt[(resume.chunks.last?.upperBound ?? 0)...]
+            let output = model.nextTokenLogits(
+                remainder[text: .newAxis], cache: resume.cache, state: nil)
+            prefill.progress?(total, total)
+            let (row, rowState) = try joinable(
+                item, cache: resume.cache, output: output, joining: [])
+            pending.removeFirst()
+            return [.prefill(id: id, processed: total, total: total)]
+                + join([row], state: rowState)
+        } catch {
+            pending.removeFirst()
+            end(item.row)
+            return [.failed(id: id, error: error)]
         }
     }
 
@@ -467,7 +569,14 @@ public struct BatchTokenIterator {
             }
         }
         guard !admitted.isEmpty else { return events }
+        return events + join(admitted, state: admittedState)
+    }
 
+    /// Merges prefilled rows into the batch and samples their first tokens. Returns a
+    /// `.failed` event for each when they cannot merge, leaving the batch unchanged.
+    private mutating func join(_ admitted: [Prefilled], state admittedState: LMOutput.State?)
+        -> [BatchEvent]
+    {
         // Each row was checked against the active rows and the rows before it; one bulk merge
         // avoids copying KV buffers by extending each prefix repeatedly. No sampling or
         // active-cache changes happen until every layer merges.
@@ -484,7 +593,7 @@ public struct BatchTokenIterator {
             }
         } catch {
             for row in admitted { end(row.row) }
-            return events + admitted.map { .failed(id: $0.row.id, error: error) }
+            return admitted.map { .failed(id: $0.row.id, error: error) }
         }
 
         // The new rows sample their first tokens alone: the decoding rows' next tokens are
@@ -509,7 +618,7 @@ public struct BatchTokenIterator {
             rows += batch.rows
             nextTokens = concatenated([nextTokens!, batch.nextTokens!])
         }
-        return events
+        return []
     }
 
     /// Prefills one queued prompt into its own cache and checks that it can join the active
@@ -519,34 +628,7 @@ public struct BatchTokenIterator {
     private func prefillRow(
         _ item: Pending, joining admitted: [Prefilled], admittedState: LMOutput.State?
     ) throws -> (Prefilled, LMOutput.State?) {
-        // Model state is carried for one row only.
-        guard state?.isEmpty != false, admittedState == nil else {
-            throw StateError.modelStateRequiresSingleRow
-        }
-        // Check topology before a model can index a supplied cache during prefill.
-        func preservesTypes(_ original: KVCache, _ copy: KVCache) -> Bool {
-            guard type(of: original) == type(of: copy) else { return false }
-            if let original = original as? CacheList, let copy = copy as? CacheList {
-                return original.children.count == copy.children.count
-                    && zip(original.children, copy.children).allSatisfy(preservesTypes)
-            }
-            return true
-        }
-        var rowCache =
-            try item.cache?.map { original in
-                let copy = original.copy()
-                guard preservesTypes(original, copy) else {
-                    throw KVCacheError(message: "A prompt cache copy must preserve its exact types")
-                }
-                return copy
-            } ?? model.newCache(parameters: cacheParameters)
-        let layerCount = rows.isEmpty ? admitted.first?.cache.count ?? rowCache.count : cache.count
-        guard rowCache.count == layerCount else {
-            throw KVCacheError(message: "Every row must share the active cache's layer count")
-        }
-        // The configured capacity, strategy and compatibility policy, as TokenIterator checks
-        // them, before the prefill: a row whose cache cannot satisfy them fails alone.
-        _ = try cachePlan.validated(rowCache)
+        let rowCache = try rowCache(for: item, joining: admitted, admittedState: admittedState)
 
         // The prompt goes into its own cache first, as TokenIterator feeds it: the model's
         // prefill (chunked) and then the remainder it leaves, whose last position's logits
@@ -571,6 +653,51 @@ public struct BatchTokenIterator {
         case .logits(let prepared):
             output = prepared
         }
+        return try joinable(item, cache: rowCache, output: output, joining: admitted)
+    }
+
+    /// The cache a queued row is prefilled into: a copy of its supplied cache, or a fresh one,
+    /// checked against the active rows and `admitted`, the rows already prefilled this step.
+    private func rowCache(
+        for item: Pending, joining admitted: [Prefilled], admittedState: LMOutput.State?
+    ) throws -> [KVCache] {
+        // Model state is carried for one row only.
+        guard state?.isEmpty != false, admittedState == nil else {
+            throw StateError.modelStateRequiresSingleRow
+        }
+        // Check topology before a model can index a supplied cache during prefill.
+        func preservesTypes(_ original: KVCache, _ copy: KVCache) -> Bool {
+            guard type(of: original) == type(of: copy) else { return false }
+            if let original = original as? CacheList, let copy = copy as? CacheList {
+                return original.children.count == copy.children.count
+                    && zip(original.children, copy.children).allSatisfy(preservesTypes)
+            }
+            return true
+        }
+        let rowCache =
+            try item.cache?.map { original in
+                let copy = original.copy()
+                guard preservesTypes(original, copy) else {
+                    throw KVCacheError(message: "A prompt cache copy must preserve its exact types")
+                }
+                return copy
+            } ?? model.newCache(parameters: cacheParameters)
+        let layerCount = rows.isEmpty ? admitted.first?.cache.count ?? rowCache.count : cache.count
+        guard rowCache.count == layerCount else {
+            throw KVCacheError(message: "Every row must share the active cache's layer count")
+        }
+        // The configured capacity, strategy and compatibility policy, as TokenIterator checks
+        // them, before the prefill: a row whose cache cannot satisfy them fails alone.
+        return try cachePlan.validated(rowCache)
+    }
+
+    /// A prefilled row ready to join: `output` is its final prefill forward. Checks every
+    /// layer against the active rows and `admitted`, so a row that cannot join fails alone.
+    ///
+    /// - Returns: the row, and the model state its prefill returned, if any
+    private func joinable(
+        _ item: Pending, cache rowCache: [KVCache], output: LMOutput, joining admitted: [Prefilled]
+    ) throws -> (Prefilled, LMOutput.State?) {
         let rowState = output.state?.isEmpty == false ? output.state : nil
         if rowState != nil, !rows.isEmpty || !admitted.isEmpty {
             throw StateError.modelStateRequiresSingleRow
@@ -578,6 +705,7 @@ public struct BatchTokenIterator {
         let logits = output.logits[0..., -1, 0...]
         // The first logits come from the full-precision prefill; later steps read the cache
         // the configured strategy produces, as in TokenIterator.
+        var rowCache = rowCache
         cachePlan.apply(to: &rowCache)
         eval(rowCache)
         eval(logits)
@@ -715,6 +843,9 @@ public func batchGenerate(
         model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
         maxTokens: maxTokens, prefill: prefill)
     let ids = iterator.insert(prompts: prompts, caches: caches)
+    // On every exit, including a throw from next(): every row, including the ones that ended
+    // in the last step, so each processor is finalized once.
+    defer { iterator.remove(ids) }
     var results = [Int: [Int]](uniqueKeysWithValues: ids.map { ($0, []) })
     while let events = try iterator.next() {
         for event in events {
@@ -724,9 +855,6 @@ public func batchGenerate(
                 iterator.recordEmittedToken(id: id, token: token)
                 results[id, default: []].append(token)
             case .failed(_, let error):
-                // Every row, including the ones that ended this step, so each processor is
-                // finalized once.
-                iterator.remove(ids)
                 throw error
             case .prefill, .finished:
                 break
