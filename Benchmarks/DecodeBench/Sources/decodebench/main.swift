@@ -10,13 +10,25 @@
 //
 //   swift run -c release --package-path Benchmarks/DecodeBench decodebench <model directory> \
 //       [decode tokens: 128] [rounds: 5] [prompt tokens: 145] [sampler: greedy|topp|categorical] \
-//       [batch sizes: 1,4,8] [prompt lengths: equal|mixed]
+//       [batch sizes: 1,4,8] [prompt lengths: equal|mixed|arrival[:tokens]] \
+//       [prefill step: the model's default]
 //
 // With `mixed` prompt lengths, the rows of a batch get prompts that shrink evenly from the full
 // length to a sixth of it, so every row but the first is left-padded. With the greedy sampler,
 // a row whose positions or padding mask are wrong parts ways with its single-sequence run at
 // once, while correct rows agree until the different matmul shapes of a batch round a near tie
 // the other way.
+//
+// `arrival` measures a long prompt joining rows that are decoding. Each batch size is a number
+// of active rows with prompts of the prompt length; after 16 steps in which every row decoded,
+// a prompt of `tokens` (default 4096) arrives. It reports the active rows' gaps between tokens
+// while the newcomer is admitted (from its insertion to its first token), the newcomer's time
+// to first token, and how many tokens each active row emitted while it waited. The prefill step
+// sets the balance: smaller chunks shorten the gaps but admit the newcomer more slowly. The
+// balance depends on the GPU and the model, so measure it on the hardware that will run it.
+//
+// The prefill step is `PrefillParameters.stepSize` for both the single-sequence and the batch
+// paths.
 //
 // Built with `-Xswiftc -DSINGLE_ONLY` it times `TokenIterator` alone, so it also builds
 // against a checkout without `BatchTokenIterator`.
@@ -29,7 +41,7 @@ import MLXLMCommon
 
 let usage =
     "usage: decodebench <model directory> [decode tokens] [rounds] [prompt tokens] [sampler] "
-    + "[batch sizes] [prompt lengths]"
+    + "[batch sizes] [prompt lengths: equal|mixed|arrival[:tokens]] [prefill step]"
 let arguments = CommandLine.arguments
 guard arguments.count > 1 else {
     print(usage)
@@ -45,9 +57,21 @@ let batchSizes = Set(
         .filter { $0 > 0 }
 ).sorted()
 let lengthsName = arguments.count > 7 ? arguments[7] : "equal"
-guard !batchSizes.isEmpty, ["equal", "mixed"].contains(lengthsName) else {
+/// The arriving prompt's length in `arrival` mode, else nil.
+let arrivalLength: Int? =
+    lengthsName == "arrival"
+    ? 4096
+    : lengthsName.hasPrefix("arrival:") ? Int(lengthsName.dropFirst("arrival:".count)) : nil
+let prefillStep = arguments.count > 8 ? Int(arguments[8]) : nil
+let prefill = PrefillParameters(stepSize: prefillStep)
+guard !batchSizes.isEmpty,
+    ["equal", "mixed"].contains(lengthsName) || (arrivalLength ?? 0) > 0,
+    arguments.count <= 8 || (prefillStep ?? 0) > 0
+else {
     print(usage)
-    print("batch sizes are a comma-separated list such as 1,4,8; prompt lengths equal or mixed")
+    print(
+        "batch sizes are a comma-separated list such as 1,4,8; prompt lengths equal, mixed, "
+            + "arrival or arrival:<tokens>; the prefill step a positive number of tokens")
     exit(1)
 }
 
@@ -58,11 +82,12 @@ print("model: \(modelDirectory.lastPathComponent)")
 #if SINGLE_ONLY
 print(
     "prompt tokens: \(promptLength), decode tokens: \(decodeTokens), rounds: \(rounds), "
-        + "sampler: \(samplerName)")
+        + "sampler: \(samplerName), prefill step: \(prefillStep.map(String.init) ?? "default")")
 #else
 print(
     "prompt tokens: \(promptLength), decode tokens: \(decodeTokens), rounds: \(rounds), "
-        + "sampler: \(samplerName), batch sizes: \(batchSizes), prompt lengths: \(lengthsName)")
+        + "sampler: \(samplerName), batch sizes: \(batchSizes), prompt lengths: \(lengthsName), "
+        + "prefill step: \(prefillStep.map(String.init) ?? "default")")
 #endif
 
 /// A fresh sampler per run, seeded, so every run of a path draws the same tokens.
@@ -86,9 +111,15 @@ print(
     }
 }
 
-func seconds(since start: ContinuousClock.Instant) -> Double {
-    let elapsed = ContinuousClock.now - start
+func seconds(
+    from start: ContinuousClock.Instant, to end: ContinuousClock.Instant = ContinuousClock.now
+) -> Double {
+    let elapsed = end - start
     return Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+}
+
+func seconds(since start: ContinuousClock.Instant) -> Double {
+    seconds(from: start)
 }
 
 func median(_ values: [Double]) -> Double {
@@ -115,7 +146,7 @@ struct Run {
     let start = ContinuousClock.now
     var iterator = try TokenIterator(
         input: LMInput(tokens: MLXArray(prompt)), model: model, processor: nil,
-        sampler: makeSampler(), maxTokens: decodeTokens + 1)
+        sampler: makeSampler(), prefill: prefill, maxTokens: decodeTokens + 1)
     var tokens: [Int] = []
     // The first token comes from the prefill; the steps after it are the decode.
     if let first = iterator.next() { tokens.append(first) }
@@ -137,7 +168,7 @@ struct Run {
     defer { Stream.defaultStream.synchronize() }
     let start = ContinuousClock.now
     var iterator = BatchTokenIterator(
-        model: model, sampler: makeSampler(), maxTokens: decodeTokens + 1)
+        model: model, sampler: makeSampler(), maxTokens: decodeTokens + 1, prefill: prefill)
     let ids = iterator.insert(prompts: prompts.map { $0.map { Int($0) } })
     var tokens = [[Int]](repeating: [], count: prompts.count)
     var firstToken: Double?
@@ -202,6 +233,130 @@ struct Run {
         let length = promptLength - (promptLength - shortest) * row / (rows - 1)
         return prompt(seed: UInt64(row + 1), length: length)
     }
+}
+
+/// One `arrival` replay: what the active rows and the newcomer saw while it was admitted.
+struct Arrival {
+    /// Seconds between the active rows' consecutive tokens, from the newcomer's insertion to
+    /// its first token. Every active row decodes in every step, so one gap per step.
+    var gaps: [Double] = []
+    /// Seconds from the newcomer's insertion to its first token.
+    var firstToken: Double?
+    /// Tokens each active row emitted in that time.
+    var waitingTokens = 0
+    /// Every row's tokens, the newcomer's last.
+    var tokens: [[Int]]
+}
+
+/// Steps in which every active row decodes before the newcomer arrives.
+let arrivalAfter = 16
+
+/// `rows` rows decode prompts of the prompt length; after `arrivalAfter` steps a prompt of
+/// `length` tokens arrives, and every row runs to its limit.
+@MainActor func runArrival(rows: Int, length: Int) throws -> Arrival {
+    defer { Stream.defaultStream.synchronize() }
+    var iterator = BatchTokenIterator(
+        model: model, sampler: makeSampler(), maxTokens: decodeTokens + 1, prefill: prefill)
+    let active = iterator.insert(
+        prompts: (0 ..< rows).map { prompt(seed: UInt64($0 + 1)).map { Int($0) } })
+    var newcomer: Int?
+    var inserted: ContinuousClock.Instant?
+    var previous: ContinuousClock.Instant?
+    var steps = 0
+    var arrival = Arrival(tokens: [[Int]](repeating: [], count: rows + 1))
+    while let events = try iterator.next() {
+        let now = ContinuousClock.now
+        var activeTokens = 0
+        var newcomerToken = false
+        for event in events {
+            switch event {
+            case .token(let id, let token):
+                if id == newcomer {
+                    arrival.tokens[rows].append(token)
+                    newcomerToken = true
+                } else {
+                    arrival.tokens[active.firstIndex(of: id)!].append(token)
+                    activeTokens += 1
+                }
+            case .failed(_, let error):
+                throw error
+            case .prefill, .finished:
+                break
+            }
+        }
+        let admitting = inserted != nil && arrival.firstToken == nil
+        if admitting {
+            // A gap counts only while every active row still decodes.
+            guard activeTokens == rows, let previous else {
+                print(
+                    "arrival(\(rows)): an active row ended before the newcomer's first token. "
+                        + "Ask for more decode tokens.")
+                exit(1)
+            }
+            arrival.gaps.append(seconds(from: previous, to: now))
+            arrival.waitingTokens += 1
+            if newcomerToken { arrival.firstToken = seconds(since: inserted!) }
+        }
+        if activeTokens > 0 { previous = now }
+        if newcomer == nil, activeTokens == rows {
+            steps += 1
+            if steps == arrivalAfter {
+                newcomer = iterator.insert(
+                    prompt: prompt(seed: 100, length: length).map { Int($0) })
+                inserted = ContinuousClock.now
+            }
+        }
+    }
+    guard arrival.firstToken != nil else {
+        print("arrival(\(rows)): the newcomer never arrived. Ask for more decode tokens.")
+        exit(1)
+    }
+    return arrival
+}
+
+/// The `fraction` percentile of `values`, interpolating linearly between ranks.
+func percentile(_ values: [Double], _ fraction: Double) -> Double {
+    let sorted = values.sorted()
+    let rank = fraction * Double(sorted.count - 1)
+    let lower = Int(rank.rounded(.down))
+    let upper = min(lower + 1, sorted.count - 1)
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - Double(lower))
+}
+
+if let arrivalLength {
+    // Warm up every width once so kernel compilation is not timed.
+    for rows in batchSizes { _ = try runArrival(rows: rows, length: arrivalLength) }
+    var replays: [Int: [Arrival]] = [:]
+    var repeated = true
+    for round in 0 ..< rounds {
+        // Alternate the order so a thermal or background-load slope lands on every width.
+        for rows in round % 2 == 0 ? batchSizes : Array(batchSizes.reversed()) {
+            let replay = try runArrival(rows: rows, length: arrivalLength)
+            repeated = repeated && replay.tokens == (replays[rows]?.first?.tokens ?? replay.tokens)
+            replays[rows, default: []].append(replay)
+            print(
+                String(
+                    format: "round %d  arrival(%d): newcomer ttft %.0f ms, active p95 gap %.1f ms, "
+                        + "%d tokens per active row while it waited", round + 1, rows,
+                    1000 * replay.firstToken!, 1000 * percentile(replay.gaps, 0.95),
+                    replay.waitingTokens))
+            Memory.clearCache()
+        }
+    }
+    for rows in batchSizes {
+        let runs = replays[rows]!
+        let gaps = runs.flatMap(\.gaps)
+        print(
+            String(
+                format: "median  arrival(%d): newcomer ttft %.0f ms; active rows' gaps while it "
+                    + "is admitted p50 %.1f ms, p95 %.1f ms, max %.1f ms (%d gaps); %.0f tokens "
+                    + "per active row while it waited", rows,
+                1000 * median(runs.map { $0.firstToken! }), 1000 * percentile(gaps, 0.5),
+                1000 * percentile(gaps, 0.95), 1000 * gaps.max()!, gaps.count,
+                median(runs.map { Double($0.waitingTokens) })))
+    }
+    print("each width repeats its tokens in every round: \(repeated)")
+    exit(0)
 }
 #endif
 
