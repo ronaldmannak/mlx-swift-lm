@@ -156,8 +156,10 @@ public struct BatchTokenIterator {
         let prompt: LMInput.Text
         let chunks: [Range<Int>]
         var next = 0
-        /// The cache arrays submitted for the last chunk, waited on after the next chunk is
-        /// submitted, so at most two chunks are in flight.
+        /// Markers of the last chunk, waited on after the next chunk is submitted, so at most
+        /// two chunks are in flight: one element of each cache array the chunk wrote, reduced
+        /// to a scalar of its own. Not the cache arrays themselves: a cache that writes in
+        /// place rebinds those objects to the next chunk's result.
         var submitted: [MLXArray] = []
     }
 
@@ -496,10 +498,11 @@ public struct BatchTokenIterator {
                     // Submit this chunk, even for a model that leaves its cache writes lazy,
                     // then wait for the previous one: the CPU builds the next chunk's graph
                     // while the GPU evaluates this one, with at most two chunks in flight.
-                    let submitted = resume.cache.flatMap { $0.innerState() }
-                    asyncEval(submitted)
+                    let state = resume.cache.flatMap { $0.innerState() }
+                    let markers = state.map { $0.reshaped([-1])[..<1].sum() }
+                    asyncEval(state + markers)
                     eval(resume.submitted)
-                    resume.submitted = submitted
+                    resume.submitted = markers
                     // As PrefillParameters.forEachChunk does after each chunk.
                     Memory.clearCache()
                 }
@@ -719,9 +722,10 @@ public struct BatchTokenIterator {
         }
         let logits = output.logits[0..., -1, 0...]
         // The first logits come from the full-precision prefill; later steps read the cache
-        // the configured strategy produces, as in TokenIterator.
+        // the configured strategy produces, as in TokenIterator. The prefill has populated the
+        // cache, so its layers' shapes are known now: a row they cannot satisfy fails.
         var rowCache = rowCache
-        cachePlan.apply(to: &rowCache)
+        try cachePlan.applyAndValidate(to: &rowCache)
         eval(rowCache)
         eval(logits)
 
