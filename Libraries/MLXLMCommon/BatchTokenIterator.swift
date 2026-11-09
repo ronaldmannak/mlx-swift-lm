@@ -120,6 +120,7 @@ public struct BatchTokenIterator {
     }
 
     private let model: any LanguageModel
+    private let resumableModel: (any ResumablePrefillModel)?
     private let sampler: LogitSampler
     private let processor: LogitProcessor?
     private let stopTokens: Set<Int>
@@ -204,6 +205,7 @@ public struct BatchTokenIterator {
         prefill: PrefillParameters = .init()
     ) {
         self.model = model
+        self.resumableModel = model as? any ResumablePrefillModel
         self.sampler = sampler
         self.processor = processor
         self.stopTokens = stopTokens
@@ -393,8 +395,8 @@ public struct BatchTokenIterator {
             guard !invalidatedByModelState else { throw StateError.invalidatedByModelState }
             guard !rows.isEmpty || !pending.isEmpty else { return nil }
 
-            if let resumable = model as? any ResumablePrefillModel {
-                return try resumableStep(resumable)
+            if let resumableModel {
+                return try resumableStep(resumableModel)
             }
             // Every queued row either fails here or joins the rows.
             var events = pending.isEmpty ? [] : try admit()
