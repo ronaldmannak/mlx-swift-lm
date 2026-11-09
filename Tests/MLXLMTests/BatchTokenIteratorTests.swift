@@ -721,6 +721,44 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test(
+        "Each compatibility policy decides a prefilled row whose cache cannot be quantized",
+        arguments: [
+            KVCacheConfiguration.CompatibilityPolicy.allowPartial, .requireAtLeastOneLayer,
+            .requireAllLayers,
+        ])
+    func generateParametersAffinePolicyAfterPrefill(
+        policy: KVCacheConfiguration.CompatibilityPolicy
+    ) throws {
+        try Device.withDefaultDevice(.cpu) {
+            // Head dimension 8 cannot be quantized in any supported group size.
+            let model = tinyLlama()
+            var parameters = GenerateParameters(
+                maxTokens: 4,
+                kvCache: KVCacheConfiguration(
+                    strategy: .affine(try .init(bits: 4)), compatibility: policy),
+                temperature: 0)
+            parameters.prefill.stepSize = 2
+            var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+            let id = iterator.insert(prompt: Array(1 ..< 8))
+            var events: [BatchEvent] = []
+            while let step = try iterator.next() { events += step }
+            if policy == .allowPartial {
+                // The row joins at full precision and runs to its limit.
+                #expect(failures(events).isEmpty)
+                #expect(tokens(events).count == 4)
+            } else {
+                #expect(failures(events).map(\.id) == [id])
+                #expect(
+                    failures(events).allSatisfy {
+                        $0.error as? KVCacheConfigurationError
+                            == .noCompatibleLayers(strategy: .affine)
+                    })
+                #expect(tokens(events).isEmpty)
+            }
+        }
+    }
+
     @Test("A GenerateParameters token limit of nil leaves rows unlimited")
     func generateParametersWithoutTokenLimit() throws {
         try Device.withDefaultDevice(.cpu) {
