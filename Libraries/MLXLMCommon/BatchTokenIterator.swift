@@ -722,9 +722,10 @@ public struct BatchTokenIterator {
         }
         let logits = output.logits[0..., -1, 0...]
         // The first logits come from the full-precision prefill; later steps read the cache
-        // the configured strategy produces, as in TokenIterator.
+        // the configured strategy produces, as in TokenIterator. The prefill has populated the
+        // cache, so its layers' shapes are known now: a row they cannot satisfy fails.
         var rowCache = rowCache
-        cachePlan.apply(to: &rowCache)
+        try cachePlan.applyAndValidate(to: &rowCache)
         eval(rowCache)
         eval(logits)
 
