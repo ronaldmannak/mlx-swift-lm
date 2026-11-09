@@ -1479,9 +1479,11 @@ public enum Qwen35Language {
             let cacheAnchorIndex = model.faIdx ?? model.ssmIdx
             var cacheOffset = 0
             var hasCacheAnchor = false
+            var anchorCache: KVCache?
             if let cache, let cacheAnchorIndex, cache.indices.contains(cacheAnchorIndex),
                 let cacheAnchor = cache[cacheAnchorIndex]
             {
+                anchorCache = cacheAnchor
                 cacheOffset = cacheAnchor.offset
                 hasCacheAnchor = true
             }
@@ -1517,28 +1519,10 @@ public enum Qwen35Language {
                         state[ropeDeltasKey] = deltas
                     }
                 } else {
-                    let batchSize = inputs.dim(0)
-                    let seqLength = inputs.dim(1)
-
-                    var delta = MLXArray(cacheOffset).asType(.int32)
-                    if let ropeDeltas {
-                        delta = delta + ropeDeltas.asType(.int32)
-                    }
-
-                    var base = MLXArray(0 ..< seqLength).asType(.int32)
-                    base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
-
-                    if delta.ndim == 0 {
-                        delta = broadcast(delta, to: [batchSize])
-                    } else if delta.dim(0) < batchSize {
-                        delta = repeated(delta, count: batchSize, axis: 0)
-                    } else if delta.dim(0) > batchSize {
-                        delta = delta[0 ..< batchSize]
-                    }
-
-                    base = base + delta[0..., .newAxis]
-                    positionIds = broadcast(
-                        base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+                    // Each row continues from its own offset in the anchor cache.
+                    positionIds = QwenVL.decodePositionIds(
+                        cache: anchorCache, ropeDeltas: ropeDeltas ?? MLXArray(Int32(0)),
+                        batch: inputs.dim(0), length: inputs.dim(1))
                 }
             }
 
@@ -2104,4 +2088,24 @@ extension Qwen35 {
 extension Qwen35 {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+// `Qwen35MoE` inherits this conformance. Merging keeps the rope deltas only: the precomputed
+// prefill positions are not used once the cache holds the prompt.
+extension Qwen35: BatchedGenerationStateProviding {
+    public func mergeGenerationStates(_ states: [LMOutput.State], rowCounts: [Int])
+        -> LMOutput.State
+    {
+        QwenVL.mergeGenerationStates(states, rowCounts: rowCounts, key: ropeDeltasKey)
+    }
+
+    public func selectGenerationState(_ state: LMOutput.State, batchIndices: MLXArray)
+        -> LMOutput.State
+    {
+        QwenVL.selectGenerationState(state, batchIndices: batchIndices, key: ropeDeltasKey)
+    }
+
+    public func generationStateArrays(_ state: LMOutput.State) -> [MLXArray] {
+        [state[ropeDeltasKey]].compactMap { $0 }
+    }
 }

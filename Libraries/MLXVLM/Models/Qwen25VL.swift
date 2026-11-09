@@ -144,8 +144,9 @@ private enum Language {
                 // MROPE path: compute 3D-aware cos/sin from position IDs
                 let (cosValues, sinValues) = mropeCosSin(positionIds: positionIds, dtype: x.dtype)
                 // Apply rotary embedding: expand dims for head broadcasting
-                let cos = cosValues[.newAxis, 0..., 0..., 0...]  // [1, batch, seq, dim]
-                let sin = sinValues[.newAxis, 0..., 0..., 0...]
+                // [batch, 1, seq, dim], broadcast over the heads of [batch, heads, seq, dim].
+                let cos = cosValues[0..., .newAxis, 0..., 0...]
+                let sin = sinValues[0..., .newAxis, 0..., 0...]
                 let qEmbed = (queries * cos) + (QwenVL.rotateHalf(queries) * sin)
                 let kEmbed = (keys * cos) + (QwenVL.rotateHalf(keys) * sin)
                 queries = qEmbed
@@ -291,24 +292,9 @@ private enum Language {
             if effectivePositionIds == nil, let ropeDeltas = state[ropeDeltasKey],
                 let cache, let input = inputs ?? inputEmbedding
             {
-                let batch = input.dim(0)
-                let seqLength = input.dim(1)
-                let lastCacheOffset = cache.last?.offset ?? 0
-
-                var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
-
-                var base = MLXArray(0 ..< seqLength).asType(.int32)
-                base = base[.newAxis, 0...]
-                base = broadcast(base, to: [batch, seqLength])
-
-                if delta.dim(0) == 1 && batch > 1 {
-                    delta = repeated(delta, count: batch, axis: 0)
-                }
-
-                base = base + delta
-
-                effectivePositionIds = base[.newAxis, 0..., 0...]
-                effectivePositionIds = broadcast(effectivePositionIds!, to: [3, batch, seqLength])
+                effectivePositionIds = QwenVL.decodePositionIds(
+                    cache: cache.last, ropeDeltas: ropeDeltas, batch: input.dim(0),
+                    length: input.dim(1))
             }
 
             var out = model(
@@ -1276,6 +1262,24 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
                         return (key, value)
                     })
         )
+    }
+}
+
+extension Qwen25VL: BatchedGenerationStateProviding {
+    public func mergeGenerationStates(_ states: [LMOutput.State], rowCounts: [Int])
+        -> LMOutput.State
+    {
+        QwenVL.mergeGenerationStates(states, rowCounts: rowCounts, key: ropeDeltasKey)
+    }
+
+    public func selectGenerationState(_ state: LMOutput.State, batchIndices: MLXArray)
+        -> LMOutput.State
+    {
+        QwenVL.selectGenerationState(state, batchIndices: batchIndices, key: ropeDeltasKey)
+    }
+
+    public func generationStateArrays(_ state: LMOutput.State) -> [MLXArray] {
+        [state[ropeDeltasKey]].compactMap { $0 }
     }
 }
 

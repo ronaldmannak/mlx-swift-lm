@@ -72,8 +72,10 @@ public enum BatchEvent: Sendable {
 /// is sampled on its own, so a row with a seeded sampler draws the tokens it would draw
 /// alone. Logit processors run per row.
 ///
-/// Model-owned state is carried for a single row. Multiple rows require nil or empty state:
-/// arbitrary per-request state cannot be merged or filtered without a model-specific contract.
+/// Model-owned state is carried for a single row, unless the model conforms to
+/// ``BatchedGenerationStateProviding``, which merges and selects it row by row. Otherwise
+/// multiple rows require nil or empty state: arbitrary per-request state cannot be merged or
+/// filtered without a model-specific contract.
 public struct BatchTokenIterator {
 
     public enum StateError: Error, LocalizedError, Equatable {
@@ -140,6 +142,8 @@ public struct BatchTokenIterator {
         let cache: [KVCache]?
         /// The row's prefill so far, for a ``ResumablePrefillModel``.
         var resume: Resume?
+        /// The full model input, such as a prompt with images, when the row was queued with one.
+        var input: LMInput? = nil
     }
 
     /// A queued row partway through a resumable prefill: its own cache and the chunks left.
@@ -162,6 +166,8 @@ public struct BatchTokenIterator {
         /// The row's cache, layer by layer, as a batch of one.
         let batches: [any BatchableKVCache]
         let logits: MLXArray
+        /// The model state its prefill returned, if any.
+        let state: LMOutput.State?
     }
 
     private var pending: [Pending] = []
@@ -287,6 +293,47 @@ public struct BatchTokenIterator {
             nextID += 1
         }
         return ids
+    }
+
+    /// Queues full model inputs, such as prompts with images; each is prefilled whole on the
+    /// next ``next()``, through the model's `prepare`, into a fresh cache.
+    ///
+    /// The rows of a ``BatchedGenerationStateProviding`` model decode together with the state
+    /// their prefill leaves, such as Qwen VL's image positions. For other models a row whose
+    /// prefill returns state decodes alone (``StateError/modelStateRequiresSingleRow``).
+    ///
+    /// - Parameters:
+    ///   - inputs: the inputs, each with at least one token
+    ///   - maxTokens: a token limit per input, or the iterator's for all
+    ///   - samplers: a sampler per input, or the iterator's
+    ///   - processors: a processor per input, or a copy of the iterator's
+    /// - Returns: one id per input, in order
+    public mutating func insert(
+        inputs: [LMInput], maxTokens: [Int]? = nil, samplers: [LogitSampler?]? = nil,
+        processors: [LogitProcessor?]? = nil
+    ) -> [Int] {
+        let prompts = inputs.map { $0.text.tokens.reshaped([-1]).asArray(Int32.self).map(Int.init) }
+        let ids = insert(
+            prompts: prompts, maxTokens: maxTokens, samplers: samplers, processors: processors)
+        let first = pending.count - inputs.count
+        for (index, input) in inputs.enumerated() {
+            pending[first + index].input = input
+        }
+        return ids
+    }
+
+    /// Queues one full model input. The single-row form of
+    /// ``insert(inputs:maxTokens:samplers:processors:)``.
+    ///
+    /// - Returns: the row's id
+    @discardableResult
+    public mutating func insert(
+        input: LMInput, maxTokens: Int? = nil, sampler: LogitSampler? = nil,
+        processor: LogitProcessor? = nil
+    ) -> Int {
+        insert(
+            inputs: [input], maxTokens: maxTokens.map { [$0] }, samplers: [sampler],
+            processors: [processor])[0]
     }
 
     /// Queues one prompt; it is prefilled on the next ``next()``. The single-row form of
@@ -589,6 +636,22 @@ public struct BatchTokenIterator {
             return admitted.map { .failed(id: $0.row.id, error: error) }
         }
 
+        // The batch's state after the join: the active rows' and each new row's, in order,
+        // for a model that batches it; otherwise the single row's.
+        let joinedState: LMOutput.State?
+        if let stateModel {
+            var parts = admitted.map { $0.state ?? LMOutput.State() }
+            var counts = [Int](repeating: 1, count: admitted.count)
+            if !rows.isEmpty {
+                parts.insert(state ?? LMOutput.State(), at: 0)
+                counts.insert(rows.count, at: 0)
+            }
+            let merged = stateModel.mergeGenerationStates(parts, rowCounts: counts)
+            joinedState = merged.isEmpty ? nil : merged
+        } else {
+            joinedState = rows.isEmpty ? admittedState : state
+        }
+
         // The new rows sample their first tokens alone: the decoding rows' next tokens are
         // sampled already.
         var batch = BatchTokenIterator(
@@ -596,14 +659,13 @@ public struct BatchTokenIterator {
             maxTokens: maxTokens, prefill: prefill)
         batch.rows = admitted.map(\.row)
         batch.cache = merged
-        batch.state = admittedState
         batch.nextTokens = batch.sampleNext(concatenated(admitted.map(\.logits)))
 
+        state = joinedState
         if rows.isEmpty {
             rows = batch.rows
             cache = batch.cache
             nextTokens = batch.nextTokens
-            state = batch.state
         } else {
             for (layer, added) in zip(cache, batch.cache) {
                 layer.extend(other: added)
@@ -631,7 +693,7 @@ public struct BatchTokenIterator {
         // one-token prompt joins a longer one on any cache type. Rows are not prefilled
         // together right-padded: the recurrent models' scans do not honour the prepared
         // lengths yet.
-        let input = LMInput(tokens: MLXArray(item.prompt.map { Int32($0) }))
+        let input = item.input ?? LMInput(tokens: MLXArray(item.prompt.map { Int32($0) }))
         let output: LMOutput
         if let prefix = prefill.prefix {
             prefix(KVCacheStorage(rowCache, plan: .disabled).processedTokenCount)
@@ -654,8 +716,8 @@ public struct BatchTokenIterator {
     private func rowCache(
         for item: Pending, joining admitted: [Prefilled], admittedState: LMOutput.State?
     ) throws -> [KVCache] {
-        // Model state is carried for one row only.
-        guard state?.isEmpty != false, admittedState == nil else {
+        // Model state is carried for one row only, unless the model batches it.
+        guard stateModel != nil || (state?.isEmpty != false && admittedState == nil) else {
             throw StateError.modelStateRequiresSingleRow
         }
         // Check topology before a model can index a supplied cache during prefill.
@@ -690,12 +752,15 @@ public struct BatchTokenIterator {
         _ item: Pending, cache rowCache: [KVCache], output: LMOutput, joining admitted: [Prefilled]
     ) throws -> (Prefilled, LMOutput.State?) {
         let rowState = output.state?.isEmpty == false ? output.state : nil
-        if rowState != nil, !rows.isEmpty || !admitted.isEmpty {
+        if rowState != nil, stateModel == nil, !rows.isEmpty || !admitted.isEmpty {
             throw StateError.modelStateRequiresSingleRow
         }
         let logits = output.logits[0..., -1, 0...]
         eval(rowCache)
         eval(logits)
+        if let stateModel, let rowState {
+            eval(stateModel.generationStateArrays(rowState))
+        }
 
         // Check every layer against the active rows and the rows admitted before it, so a
         // row that cannot join fails alone.
@@ -709,7 +774,9 @@ public struct BatchTokenIterator {
             }
         }
         return (
-            Prefilled(row: item.row, cache: rowCache, batches: batches, logits: logits), rowState
+            Prefilled(
+                row: item.row, cache: rowCache, batches: batches, logits: logits, state: rowState),
+            rowState
         )
     }
 
@@ -718,7 +785,7 @@ public struct BatchTokenIterator {
         let current = nextTokens!
         let output = model.nextTokenLogits(
             .init(tokens: current[0..., .newAxis]), cache: cache, state: state)
-        if output.state?.isEmpty == false, rows.count > 1 {
+        if output.state?.isEmpty == false, rows.count > 1, stateModel == nil {
             invalidatedByModelState = true
             throw StateError.invalidatedByModelState
         }
@@ -744,7 +811,8 @@ public struct BatchTokenIterator {
         }
         // The cache state settles with the token, as TokenIterator does, so an unevaluated
         // chain of updates never keeps earlier steps alive.
-        asyncEval([sampled] + cache.flatMap { $0.state })
+        let stateArrays = state.flatMap { state in stateModel?.generationStateArrays(state) } ?? []
+        asyncEval([sampled] + cache.flatMap { $0.state } + stateArrays)
         return sampled
     }
 
@@ -785,6 +853,14 @@ public struct BatchTokenIterator {
             layer.filter(batchIndices: indices)
         }
         nextTokens = nextTokens?[indices]
+        if let stateModel, let current = state, !current.isEmpty {
+            state = stateModel.selectGenerationState(current, batchIndices: indices)
+        }
+    }
+
+    /// The model, when it batches its decoder state.
+    private var stateModel: (any BatchedGenerationStateProviding)? {
+        model as? any BatchedGenerationStateProviding
     }
 }
 
