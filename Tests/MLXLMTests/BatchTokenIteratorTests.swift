@@ -4,6 +4,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXNN
+import MLXScriptedLM
 import MLXVLM
 import Testing
 
@@ -2228,4 +2229,1097 @@ extension QwenVLBatchedPositionTests {
             #expect(actual == expected)
         }
     }
+}
+
+@Suite(.serialized)
+struct BatchGenerationTests {
+
+    @Test("Raw streams preserve row identity and EOS policy", arguments: [false, true])
+    func rawTokensRespectEOS(includeStopToken: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [["a", "b"], ["c", "d", "e", "f"]])
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                includeStopToken: includeStopToken)
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            for uid in fixture.prompts.indices {
+                let expected = fixture.scripts[uid] + (includeStopToken ? [1] : [])
+                #expect(result.tokens[uid] == expected)
+                let info = try #require(result.info[uid])
+                #expect(info.promptTokenCount == 1)
+                #expect(info.generationTokenCount == expected.count)
+                #expect(info.stopReason == .stop)
+                #expect(info.timeToFirstToken != nil)
+                #expect(info.elapsedTime >= 0)
+            }
+            #expect(result.info.count == 2)
+        }
+    }
+
+    @Test("Raw streaming matches the existing batch collector", arguments: [false, true])
+    func rawSamplingParity(seeded: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            let prompts = [[1, 2, 3], [4]]
+            func sampler() -> any LogitSampler {
+                if seeded { return TopPSampler(temperature: 0.8, topP: 0.9, seed: 31) }
+                return ArgMaxSampler()
+            }
+            let expected = try batchGenerate(
+                model: model, prompts: prompts, maxTokens: 6, sampler: sampler())
+            let stream = try batchGenerateTokens(
+                model: model, prompts: prompts, tokenizer: PseudoWordTokenizer(vocabularySize: 64),
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 6,
+                sampler: sampler())
+            let result = try await collectBatchStreamTokens(stream)
+            #expect(prompts.indices.map { result.tokens[$0] ?? [] } == expected)
+            #expect(result.info.count == 2)
+            #expect(result.info.values.allSatisfy { $0.stopReason == .length })
+        }
+    }
+
+    @Test("Unknown tokens end only their own row in raw and decoded streams")
+    func unknownTokensEndTheirOwnRow() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [
+                ["before", "<unk>", "hidden"], ["steady", "tail"],
+            ])
+            for includeStopToken in [false, true] {
+                let (stream, task) = try batchGenerateTokensTask(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                    includeStopToken: includeStopToken)
+                let result = try await collectBatchStreamTokens(stream)
+                await task.value
+                #expect(
+                    result.tokens[0] == Array(fixture.scripts[0].prefix(includeStopToken ? 2 : 1)))
+                #expect(result.tokens[1] == fixture.scripts[1] + (includeStopToken ? [1] : []))
+                #expect(result.info[0]?.stopReason == .stop)
+            }
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8)
+            var result = BatchStreamTextResult()
+            for try await event in stream { result.append(event) }
+            await task.value
+            #expect(result.response == [0: "before", 1: "steadytail"])
+        }
+    }
+
+    @Test("A split stop string ends only its own decoded row")
+    func decodedRowsStopIndependently() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [
+                    ["alpha<st", "op>hidden", "unreachable"],
+                    ["beta", " continues", " safely", "."],
+                ],
+                probe: probe)
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test", stopStrings: ["<stop>"]),
+                maxTokens: 8)
+            var result = BatchStreamTextResult()
+            for try await event in stream { result.append(event) }
+            await task.value
+
+            #expect(result.response[0] == "alpha")
+            #expect(result.response[1] == "beta continues safely.")
+            #expect(result.info[0]?.stopReason == .stop)
+            #expect(result.info[1]?.stopReason == .stop)
+            #expect(result.info.count == 2)
+            let widths = probe.widths
+            let firstBatch = try #require(widths.firstIndex(of: 2))
+            #expect(
+                widths.dropFirst(firstBatch + 1).contains(1), "the surviving row keeps decoding")
+        }
+    }
+
+    @Test("Reasoning and tool parsers keep separate state for each row")
+    func decodedToolsAndReasoningAreRowLocal() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [
+                [
+                    "<think>", "private", "</think>", "<tool_call>",
+                    #"{"name":"weather","arguments":{"city":"Paris"}}"#, "</tool_call>", "answer",
+                ],
+                ["ordinary", " response"],
+            ])
+            let stream = try batchGenerateText(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(
+                    id: "batch-stream-test", toolCallFormat: .json,
+                    reasoningConfig: .init(
+                        startDelimiter: "<think>", endDelimiter: "</think>", promptStrategy: .none)),
+                maxTokens: 12)
+            var result = BatchStreamTextResult()
+            for try await event in stream { result.append(event) }
+
+            #expect(result.reasoning[0] == "private")
+            #expect(result.response[0] == "answer")
+            #expect(
+                result.calls[0] == [.init(name: "weather", arguments: ["city": .string("Paris")])])
+            #expect(result.response[1] == "ordinary response")
+            #expect(result.reasoning[1, default: ""].isEmpty)
+            #expect(result.calls[1, default: []].isEmpty)
+            #expect(result.info.count == 2)
+        }
+    }
+
+    @Test(
+        "Framed protocol stops finish only their row without configured EOS tokens",
+        arguments: [ToolCallFormat.gptOSS, .atem])
+    func decodedProtocolStopsAreRowLocal(format: ToolCallFormat) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let terminal = format == .gptOSS ? "<|call|>" : "<|eot|>"
+            let suffix: [String]
+            let sharedPieces: [String]
+            let prefix: [String]
+            if format == .gptOSS {
+                suffix = [
+                    "<|channel|>", "commentary to=functions.weather", "<|message|>",
+                    #"{"city":"Paris"}"#, terminal, "unreachable",
+                ]
+                sharedPieces = [
+                    "<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|call|>",
+                    "<|return|>", "<|constrain|>", "commentary to=functions.weather",
+                    #"{"city":"Paris"}"#, "unreachable",
+                ]
+                prefix = ["<|start|>", "assistant", " ", " ", " "]
+            } else {
+                suffix = ["<|message|>", "visible\u{fffd}", terminal, "unreachable"]
+                sharedPieces = [
+                    "<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "visible\u{fffd}",
+                    "unreachable",
+                ]
+                prefix = [" to=user", " ", " ", " "]
+            }
+            let fixture = BatchStreamFixture(
+                scripts: [suffix, prefix + suffix], sharedPieces: sharedPieces, probe: probe)
+            let configuration = ModelConfiguration(
+                id: "batch-protocol-test", toolCallFormat: format)
+            let terminalID = try #require(fixture.tokenizer.convertTokenToId(terminal))
+            #expect(
+                !buildStopTokenIds(modelConfiguration: configuration, tokenizer: fixture.tokenizer)
+                    .contains(terminalID))
+
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: configuration, maxTokens: 24,
+                tools: [["function": ["name": "weather"]]])
+            var result = BatchStreamTextResult()
+            var survivingRowEmittedAfterFirstCompletion = false
+            for try await event in stream {
+                if case .output(let uid, _) = event, uid == 1, result.info[0] != nil {
+                    survivingRowEmittedAfterFirstCompletion = true
+                }
+                result.append(event)
+            }
+            await task.value
+
+            if format == .gptOSS {
+                #expect(result.response.isEmpty)
+                #expect(
+                    result.calls == [
+                        0: [.init(name: "weather", arguments: ["city": .string("Paris")])],
+                        1: [.init(name: "weather", arguments: ["city": .string("Paris")])],
+                    ])
+            } else {
+                // The replacement character holds the full payload until the frame closes.
+                #expect(result.response == [0: "visible\u{fffd}", 1: "visible\u{fffd}"])
+                #expect(result.calls.isEmpty)
+            }
+            #expect(result.reasoning.isEmpty)
+            #expect(result.info.count == 2)
+            for uid in fixture.prompts.indices {
+                let info = try #require(result.info[uid])
+                #expect(info.promptTokenCount == 1)
+                #expect(info.generationTokenCount == fixture.scripts[uid].count - 2)
+                #expect(info.stopReason == .stop)
+            }
+            #expect(survivingRowEmittedAfterFirstCompletion)
+            let widths = probe.widths
+            let firstBatch = try #require(widths.firstIndex(of: 2))
+            #expect(widths.dropFirst(firstBatch + 1).contains(1))
+        }
+    }
+
+    @Test("Buffered decoded text flushes before its row completion")
+    func decodedFinalFlushPrecedesInfo() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [["visible\u{fffd}"], ["other\u{fffd}"]])
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 1)
+            var result = BatchStreamTextResult()
+            for try await event in stream { result.append(event) }
+            await task.value
+            #expect(result.response == [0: "visible\u{fffd}", 1: "other\u{fffd}"])
+            #expect(result.info.count == 2)
+            #expect(result.info.values.allSatisfy { $0.stopReason == .length })
+        }
+    }
+
+    @Test("Cancelling the task stops the shared worker and completes its active rows")
+    func cancellationStopsWorker() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe(blockFirstBatch: true)
+            let fixture = BatchStreamFixture(
+                scripts: [Array(repeating: "a", count: 32), Array(repeating: "b", count: 32)],
+                probe: probe)
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 32)
+            let entered = await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    continuation.resume(
+                        returning: probe.entered.wait(timeout: .now() + 5) == .success)
+                }
+            }
+            task.cancel()
+            probe.resume.signal()
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            #expect(entered, "the shared decode reached the cancellation barrier")
+            #expect(
+                probe.widths.filter { $0 == 2 }.count == 1, "no later batched step was submitted")
+            #expect(result.info.count == 2)
+            #expect(result.info.values.allSatisfy { $0.stopReason == .cancelled })
+            #expect(!probe.ranOnMainThread)
+            #expect(probe.usedCPU)
+        }
+    }
+
+    @Test(
+        "Cancellation between prefill chunks completes raw and decoded rows without a model error",
+        arguments: [false, true], [false, true])
+    func prefillCancellation(decoded: Bool, cancelTask: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["a"], ["b"]], probe: probe, chunkedPrefill: true,
+                failPreparationWithCancellation: !cancelTask)
+            let prompts = fixture.prompts.map { Array(repeating: $0[0], count: 5) }
+            let prefill = PrefillParameters(
+                stepSize: 1,
+                progress: { processed, _ in
+                    probe.observePrefillProgress(processed)
+                    withUnsafeCurrentTask { $0?.cancel() }
+                })
+
+            func consume<Output: Sendable>(
+                _ stream: AsyncThrowingStream<BatchGenerationEvent<Output>, Error>,
+                task: Task<Void, Never>
+            ) async {
+                var infos = [Int: BatchCompletionInfo]()
+                var failures = [Int: any Error]()
+                var outputCount = 0
+                var threw = false
+                do {
+                    for try await event in stream {
+                        switch event {
+                        case .output: outputCount += 1
+                        case .info(let uid, let info):
+                            #expect(infos[uid] == nil, "each unfinished row completes exactly once")
+                            infos[uid] = info
+                        case .failed(let uid, let error):
+                            #expect(failures[uid] == nil, "each row fails at most once")
+                            failures[uid] = error
+                        }
+                    }
+                } catch {
+                    threw = true
+                }
+                await task.value
+
+                #expect(task.isCancelled == cancelTask)
+                #expect(!threw, "a prefill error ends its row, not the stream")
+                #expect(outputCount == 0)
+                #expect(Set(infos.keys).isDisjoint(with: failures.keys))
+                if cancelTask {
+                    #expect(Set(infos.keys) == Set(prompts.indices))
+                    for info in infos.values {
+                        #expect(info.stopReason == .cancelled)
+                        #expect(info.promptTokenCount == 5)
+                        #expect(info.generationTokenCount == 0)
+                        #expect(info.timeToFirstToken == nil)
+                    }
+                    #expect(probe.prefillProgress == [1])
+                    #expect(probe.widths == [1], "no second chunk or decode forward is submitted")
+                    #expect(probe.usedCPU)
+                } else {
+                    // An uncancelled model's CancellationError is that row's failure.
+                    #expect(infos.isEmpty)
+                    #expect(Set(failures.keys) == Set(prompts.indices))
+                    #expect(failures.values.allSatisfy { $0 is CancellationError })
+                    #expect(probe.prefillProgress.isEmpty)
+                    #expect(probe.widths.isEmpty)
+                }
+            }
+
+            if decoded {
+                let (stream, task) = try batchGenerateTextTask(
+                    model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                    prefill: prefill)
+                await consume(stream, task: task)
+            } else {
+                let (stream, task) = try batchGenerateTokensTask(
+                    model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                    prefill: prefill)
+                await consume(stream, task: task)
+            }
+        }
+    }
+
+    @Test("Cancellation during a later row's prefill decodes nothing and cancels every row")
+    func laterPrefillCancellation() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["a"], ["b"]], probe: probe, chunkedPrefill: true)
+            let prompts = fixture.prompts.map { Array(repeating: $0[0], count: 5) }
+            // The first row prefills completely; the task is cancelled after the second
+            // row's first chunk.
+            final class Starts: @unchecked Sendable { var count = 0 }
+            let starts = Starts()
+            let prefill = PrefillParameters(
+                stepSize: 1,
+                progress: { processed, _ in
+                    probe.observePrefillProgress(processed)
+                    if processed == 1 { starts.count += 1 }
+                    if starts.count == 2 { withUnsafeCurrentTask { $0?.cancel() } }
+                })
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 1,
+                prefill: prefill)
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            #expect(task.isCancelled)
+            #expect(result.tokens.isEmpty, "no row decodes after the cancellation")
+            #expect(result.failed.isEmpty)
+            #expect(Set(result.info.keys) == Set(prompts.indices))
+            #expect(result.info.values.allSatisfy { $0.stopReason == .cancelled })
+            #expect(result.info.values.allSatisfy { $0.generationTokenCount == 0 })
+            // The first row's four chunks and its completion, then the second row's first chunk.
+            #expect(probe.prefillProgress == [1, 2, 3, 4, 5, 1])
+            #expect(probe.widths == [1, 1, 1, 1, 1, 1], "no decode forward is submitted")
+        }
+    }
+
+    @Test("Cancelling a stream consumer stops the blocked shared worker")
+    func consumerCancellationStopsWorker() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe(blockFirstBatch: true)
+            let fixture = BatchStreamFixture(
+                scripts: [Array(repeating: "a", count: 32), Array(repeating: "b", count: 32)],
+                probe: probe)
+            let (stream, producer) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 32)
+            let consumerStarted = DispatchSemaphore(value: 0)
+            let consumerFinished = DispatchSemaphore(value: 0)
+            let consumer = Task {
+                var eventCount = 0
+                defer { consumerFinished.signal() }
+                do {
+                    var iterator = stream.makeAsyncIterator()
+                    consumerStarted.signal()
+                    while (try await iterator.next()) != nil { eventCount += 1 }
+                } catch {
+                    #expect(error is CancellationError)
+                }
+                return eventCount
+            }
+
+            let entered = await waitForBatchStreamSignal(probe.entered)
+            let started = await waitForBatchStreamSignal(consumerStarted)
+            guard entered && started else {
+                Issue.record("the producer and consumer must reach their cancellation barriers")
+                consumer.cancel()
+                probe.resume.signal()
+                await producer.value
+                _ = await consumer.value
+                return
+            }
+            #expect(!producer.isCancelled)
+            let forwardsBeforeRelease = probe.widths
+
+            consumer.cancel()
+            let consumerStopped = await waitForBatchStreamSignal(consumerFinished)
+            #expect(consumerStopped, "cancellation must end the suspended consumer")
+            // The blocked model cannot produce an event before this check.
+            #expect(producer.isCancelled, "stream onTermination must cancel the producer")
+            probe.resume.signal()
+            await producer.value
+            let consumedEvents = await consumer.value
+
+            #expect(consumedEvents == 0)
+            #expect(
+                probe.widths == forwardsBeforeRelease, "no model forward may follow cancellation")
+            #expect(probe.cancelledAtResume)
+            #expect(!probe.barrierTimedOut)
+            #expect(!probe.ranOnMainThread)
+            #expect(probe.usedCPU)
+        }
+    }
+
+    @Test("A model failure preserves raw output without completing failed rows")
+    func rawModelFailurePreservesPriorOutput() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["first", "unreachable"], ["other", "unreachable"]],
+                probe: probe, invalidatingBatchStep: 2)
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8)
+            var tokens = [Int: [Int]]()
+            var infos = [Int: BatchCompletionInfo]()
+            do {
+                for try await event in stream {
+                    switch event {
+                    case .output(let uid, .token(let token)):
+                        tokens[uid, default: []].append(token)
+                    case .output(_, .info):
+                        Issue.record("completion belongs in the outer batch event")
+                    case .info(let uid, let info):
+                        infos[uid] = info
+                    case .failed:
+                        Issue.record("a batched step error is not a row failure")
+                    }
+                }
+                Issue.record("the stream must propagate the batched model-state error")
+            } catch {
+                #expect(error as? BatchTokenIterator.StateError == .invalidatedByModelState)
+                #expect(tokens == [0: [fixture.scripts[0][0]], 1: [fixture.scripts[1][0]]])
+                #expect(infos.isEmpty, "a model error cannot report successful row completion")
+            }
+            await task.value
+            #expect(
+                probe.widths == [1, 1, 2, 2], "the worker stops forwarding after the model error")
+        }
+    }
+
+    @Test("A model failure flushes buffered decoded output before throwing")
+    func decodedModelFailureFlushesPriorOutput() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["first\u{fffd}", "unreachable"], ["other\u{fffd}", "unreachable"]],
+                probe: probe, invalidatingBatchStep: 2)
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8)
+            var result = BatchStreamTextResult()
+            do {
+                for try await event in stream { result.append(event) }
+                Issue.record("the stream must propagate the batched model-state error")
+            } catch {
+                #expect(error as? BatchTokenIterator.StateError == .invalidatedByModelState)
+                #expect(result.response == [0: "first\u{fffd}", 1: "other\u{fffd}"])
+                #expect(
+                    result.info.isEmpty, "a model error cannot report successful row completion")
+            }
+            await task.value
+            #expect(
+                probe.widths == [1, 1, 2, 2], "the worker stops forwarding after the model error")
+        }
+    }
+
+    @Test("Empty batches finish immediately and invalid arguments throw before starting")
+    func emptyAndInvalidBatches() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [["a"], ["b"]])
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: [], tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"))
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+            #expect(result.tokens.isEmpty)
+            #expect(result.info.isEmpty)
+
+            #expect(throws: (any Error).self) {
+                _ = try batchGenerateTokens(
+                    model: fixture.model, prompts: [[]], tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"))
+            }
+            #expect(throws: (any Error).self) {
+                _ = try batchGenerateText(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), caches: [nil])
+            }
+            #expect(throws: (any Error).self) {
+                _ = try batchGenerateTokens(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 0)
+            }
+        }
+    }
+
+    @Test("A preparation failure ends its row with a failed event, not the stream")
+    func preparationFailuresPropagate() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [["a"]], failPreparation: true)
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"))
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+            #expect(result.tokens.isEmpty, "a failed preparation cannot produce output")
+            #expect(result.info.isEmpty)
+            #expect(result.failed.count == 1)
+            #expect(result.failed[0] as? BatchStreamTestError == .preparation)
+        }
+    }
+
+    @Test(
+        "A row that cannot join fails alone while the others finish", arguments: [false, true])
+    func rowFailureLeavesOtherRows(decoded: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let fixture = BatchStreamFixture(scripts: [["a", "b"], ["c", "d"], ["e", "f"]])
+            // The middle row's supplied cache has a layer too many for the batch.
+            let caches: [[KVCache]?] = [nil, [KVCacheSimple(), KVCacheSimple()], nil]
+            var failed = [Int: any Error]()
+            var info = [Int: BatchCompletionInfo]()
+            if decoded {
+                let (stream, task) = try batchGenerateTextTask(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), caches: caches,
+                    maxTokens: 8)
+                var result = BatchStreamTextResult()
+                for try await event in stream { result.append(event) }
+                await task.value
+                #expect(result.response == [0: "ab", 2: "ef"])
+                (failed, info) = (result.failed, result.info)
+            } else {
+                let (stream, task) = try batchGenerateTokensTask(
+                    model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), caches: caches,
+                    maxTokens: 8)
+                let result = try await collectBatchStreamTokens(stream)
+                await task.value
+                #expect(result.tokens == [0: fixture.scripts[0], 2: fixture.scripts[2]])
+                (failed, info) = (result.failed, result.info)
+            }
+            #expect(Set(failed.keys) == [1])
+            #expect(failed[1] is KVCacheError)
+            #expect(Set(info.keys) == [0, 2])
+            #expect(info.values.allSatisfy { $0.stopReason == .stop })
+        }
+    }
+}
+
+private func collectBatchStreamTokens(
+    _ stream: AsyncThrowingStream<BatchGenerationEvent<TokenGeneration>, Error>
+) async throws -> (
+    tokens: [Int: [Int]], info: [Int: BatchCompletionInfo], failed: [Int: any Error]
+) {
+    var tokens = [Int: [Int]]()
+    var infos = [Int: BatchCompletionInfo]()
+    var failed = [Int: any Error]()
+    for try await event in stream {
+        switch event {
+        case .output(let uid, .token(let token)):
+            #expect(infos[uid] == nil, "a row cannot emit after its completion")
+            #expect(failed[uid] == nil, "a row cannot emit after its failure")
+            tokens[uid, default: []].append(token)
+        case .output(_, .info):
+            Issue.record("completion belongs in the outer batch event")
+        case .info(let uid, let info):
+            #expect(infos[uid] == nil && failed[uid] == nil, "each row ends once")
+            infos[uid] = info
+        case .failed(let uid, let error):
+            #expect(infos[uid] == nil && failed[uid] == nil, "each row ends once")
+            failed[uid] = error
+        }
+    }
+    return (tokens, infos, failed)
+}
+
+private struct BatchStreamTextResult {
+    var response = [Int: String]()
+    var reasoning = [Int: String]()
+    var calls = [Int: [ToolCall.Function]]()
+    var info = [Int: BatchCompletionInfo]()
+    var failed = [Int: any Error]()
+
+    mutating func append(_ event: BatchGenerationEvent<Generation>) {
+        switch event {
+        case .output(let uid, let output):
+            #expect(info[uid] == nil, "buffered output must precede the row completion")
+            #expect(failed[uid] == nil, "a row cannot emit after its failure")
+            switch output {
+            case .chunk(let text): response[uid, default: ""] += text
+            case .reasoning(let text): reasoning[uid, default: ""] += text
+            case .toolCall(let call): calls[uid, default: []].append(call.function)
+            case .rejectedToolCall: Issue.record("a valid tool call was rejected")
+            case .info: Issue.record("completion belongs in the outer batch event")
+            case .steering: Issue.record("batch streams take no steering")
+            }
+        case .info(let uid, let completion):
+            #expect(info[uid] == nil && failed[uid] == nil, "each row ends once")
+            info[uid] = completion
+        case .failed(let uid, let error):
+            #expect(info[uid] == nil && failed[uid] == nil, "each row ends once")
+            failed[uid] = error
+        }
+    }
+}
+
+private enum BatchStreamTestError: Error, Equatable { case preparation }
+
+private struct BatchStreamFixture {
+    let model: BatchStreamModel
+    let tokenizer: BatchStreamTokenizer
+    let prompts: [[Int]]
+    let scripts: [[Int]]
+
+    init(
+        scripts: [[String]], sharedPieces: [String] = [], probe: BatchStreamProbe? = nil,
+        failPreparation: Bool = false, invalidatingBatchStep: Int? = nil,
+        chunkedPrefill: Bool = false, failPreparationWithCancellation: Bool = false
+    ) {
+        var pieces = ["", "<eos>"] + sharedPieces
+        var transitions = [0, 1] + Array(repeating: 1, count: sharedPieces.count)
+        let sharedIDs = Dictionary(
+            uniqueKeysWithValues: sharedPieces.enumerated().map { ($0.element, $0.offset + 2) })
+        var prompts = [[Int]]()
+        var tokenScripts = [[Int]]()
+        for script in scripts {
+            let prompt = pieces.count
+            prompts.append([prompt])
+            pieces.append("")
+            transitions.append(1)
+            var previous = prompt
+            var tokens = [Int]()
+            for piece in script {
+                let token: Int
+                if let sharedID = sharedIDs[piece] {
+                    token = sharedID
+                } else {
+                    token = pieces.count
+                    pieces.append(piece)
+                    transitions.append(1)
+                }
+                transitions[previous] = token
+                previous = token
+                tokens.append(token)
+            }
+            tokenScripts.append(tokens)
+        }
+        self.prompts = prompts
+        self.scripts = tokenScripts
+        tokenizer = BatchStreamTokenizer(pieces: pieces)
+        model = BatchStreamModel(
+            transitions: transitions, probe: probe, failPreparation: failPreparation,
+            invalidatingBatchStep: invalidatingBatchStep, chunkedPrefill: chunkedPrefill,
+            failPreparationWithCancellation: failPreparationWithCancellation)
+    }
+}
+
+private struct BatchStreamTokenizer: Tokenizer {
+    let pieces: [String]
+    var bosToken: String? { nil }
+    var eosToken: String? { "<eos>" }
+    var unknownToken: String? { pieces.contains("<unk>") ? "<unk>" : nil }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.filter { !skipSpecialTokens || $0 != 1 }.map { pieces[$0] }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { pieces.firstIndex(of: token) }
+    func convertIdToToken(_ id: Int) -> String? { pieces.indices.contains(id) ? pieces[id] : nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+private final class BatchStreamModel: Module, LanguageModel {
+    private static let batchStepKey = LMOutput.Key<Int>("batch-stream-test.step")
+    private let invalidatingBatchStep: Int?
+    private var batchSteps = 0
+    let transitions: [Int]
+    let probe: BatchStreamProbe?
+    let failPreparation: Bool
+    private let chunkedPrefill: Bool
+    private let failPreparationWithCancellation: Bool
+
+    init(
+        transitions: [Int], probe: BatchStreamProbe?, failPreparation: Bool,
+        invalidatingBatchStep: Int?, chunkedPrefill: Bool,
+        failPreparationWithCancellation: Bool
+    ) {
+        self.invalidatingBatchStep = invalidatingBatchStep
+        self.transitions = transitions
+        self.probe = probe
+        self.failPreparation = failPreparation
+        self.chunkedPrefill = chunkedPrefill
+        self.failPreparationWithCancellation = failPreparationWithCancellation
+        super.init()
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [KVCacheSimple()] }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        if failPreparation { throw BatchStreamTestError.preparation }
+        if failPreparationWithCancellation { throw CancellationError() }
+        guard chunkedPrefill else { return .tokens(input.text) }
+        let processed = try prefill.forEachChunk(total: input.text.tokens.size) { range in
+            let logits = callAsFunction(input.text.tokens[range][.newAxis], cache: cache)
+            eval([logits] + cache.flatMap { $0.state })
+        }
+        return .tokens(.init(tokens: input.text.tokens[processed...]))
+    }
+
+    func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let logits = callAsFunction(input.tokens, cache: cache)
+        guard input.tokens.dim(0) > 1 else { return LMOutput(logits: logits) }
+        batchSteps += 1
+        guard let invalidatingBatchStep, batchSteps == invalidatingBatchStep else {
+            return LMOutput(logits: logits)
+        }
+        var outputState = LMOutput.State()
+        outputState[Self.batchStepKey] = batchSteps
+        return LMOutput(logits: logits, state: outputState)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        probe?.observe(batchWidth: inputs.dim(0))
+        let keys = inputs.asType(.float32).reshaped([inputs.dim(0), 1, inputs.dim(1), 1])
+        _ = cache?.first?.update(keys: keys, values: keys)
+        let targets = MLXArray(transitions.map(Int32.init))[inputs]
+        let ids = MLXArray(Int32(0) ..< Int32(transitions.count))[.newAxis, .newAxis]
+        return MLX.where(
+            ids .== targets[0..., 0..., .newAxis], MLXArray(Float(100)), MLXArray(Float(-100)))
+    }
+}
+
+private final class BatchStreamProbe: @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let resume = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private let blockFirstBatch: Bool
+    private var didBlock = false
+    private var observedWidths = [Int]()
+    private var observedMainThread = false
+    private var observedOnlyCPU = true
+    private var observedCancelledAtResume = false
+    private var observedBarrierTimedOut = false
+    private var observedPrefillProgress = [Int]()
+
+    init(blockFirstBatch: Bool = false) { self.blockFirstBatch = blockFirstBatch }
+
+    var widths: [Int] { lock.withLock { observedWidths } }
+    var ranOnMainThread: Bool { lock.withLock { observedMainThread } }
+    var usedCPU: Bool { lock.withLock { observedOnlyCPU } }
+    var cancelledAtResume: Bool { lock.withLock { observedCancelledAtResume } }
+    var barrierTimedOut: Bool { lock.withLock { observedBarrierTimedOut } }
+    var prefillProgress: [Int] { lock.withLock { observedPrefillProgress } }
+
+    func observePrefillProgress(_ processed: Int) {
+        lock.withLock { observedPrefillProgress.append(processed) }
+    }
+
+    func observe(batchWidth: Int) {
+        let shouldBlock = lock.withLock {
+            observedWidths.append(batchWidth)
+            observedMainThread = observedMainThread || Thread.isMainThread
+            observedOnlyCPU = observedOnlyCPU && Device.defaultDevice().deviceType == .cpu
+            if blockFirstBatch && batchWidth > 1 && !didBlock {
+                didBlock = true
+                return true
+            }
+            return false
+        }
+        if shouldBlock {
+            entered.signal()
+            let resumed = resume.wait(timeout: .now() + 5) == .success
+            lock.withLock {
+                observedCancelledAtResume = Task.isCancelled
+                observedBarrierTimedOut = !resumed
+            }
+        }
+    }
+}
+
+private func waitForBatchStreamSignal(_ semaphore: DispatchSemaphore) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + 5) == .success)
+        }
+    }
+}
+
+/// Every way a streamed row can end records exactly the tokens the driver delivers, before the
+/// row's processor is finalized once, as the single-sequence loop does.
+extension BatchGenerationTests {
+
+    @Test(
+        "Raw rows record their delivered tokens and finalize once at EOS or their limit",
+        arguments: [false, true])
+    func emissionAtStopAndLength(includeStopToken: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let log = EmissionLog()
+            let fixture = BatchStreamFixture(scripts: [["a", "b"], ["c", "d", "e", "f"]])
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 3,
+                processor: try EmissionLogProcessor(log: log), includeStopToken: includeStopToken)
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            #expect(result.info[0]?.stopReason == .stop)
+            #expect(result.info[1]?.stopReason == .length)
+            #expect(result.tokens[0] == fixture.scripts[0] + (includeStopToken ? [1] : []))
+            #expect(result.tokens[1] == Array(fixture.scripts[1].prefix(3)))
+            // The stop token is recorded exactly when it is delivered.
+            try expectEmissionLifecycle(log, fixture: fixture, emitted: result.tokens)
+        }
+    }
+
+    @Test("A stop string records the token that completes it, then finalizes the row once")
+    func emissionAtStopString() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let log = EmissionLog()
+            let fixture = BatchStreamFixture(scripts: [
+                ["alpha<st", "op>hidden", "unreachable"],
+                ["beta", " continues", " safely", "."],
+            ])
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test", stopStrings: ["<stop>"]),
+                maxTokens: 8, processor: try EmissionLogProcessor(log: log))
+            var result = BatchStreamTextResult()
+            for try await event in stream { result.append(event) }
+            await task.value
+
+            #expect(result.response == [0: "alpha", 1: "beta continues safely."])
+            try expectEmissionLifecycle(
+                log, fixture: fixture,
+                emitted: [0: Array(fixture.scripts[0].prefix(2)), 1: fixture.scripts[1]])
+        }
+    }
+
+    @Test("A protocol stop token ends its row without being recorded")
+    func emissionAtProtocolStop() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let log = EmissionLog()
+            let suffix = ["<|message|>", "visible\u{fffd}", "<|eot|>", "unreachable"]
+            let fixture = BatchStreamFixture(
+                scripts: [suffix, [" to=user", " ", " ", " "] + suffix],
+                sharedPieces: [
+                    "<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "visible\u{fffd}",
+                    "unreachable",
+                ])
+            let terminal = try #require(fixture.tokenizer.convertTokenToId("<|eot|>"))
+            let (stream, task) = try batchGenerateTextTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-protocol-test", toolCallFormat: .atem),
+                maxTokens: 24, processor: try EmissionLogProcessor(log: log),
+                tools: [["function": ["name": "weather"]]])
+            var result = BatchStreamTextResult()
+            for try await event in stream { result.append(event) }
+            await task.value
+
+            #expect(result.response == [0: "visible\u{fffd}", 1: "visible\u{fffd}"])
+            try expectEmissionLifecycle(
+                log, fixture: fixture,
+                emitted: fixture.scripts.indices.reduce(into: [:]) { emitted, uid in
+                    emitted[uid] = Array(fixture.scripts[uid].prefix { $0 != terminal })
+                })
+        }
+    }
+
+    @Test("A consumer that stops partway through a step leaves the rest unrecorded")
+    func emissionAtConsumerTermination() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let log = EmissionLog()
+            let probe = BatchStreamProbe(blockFirstBatch: true)
+            let fixture = BatchStreamFixture(
+                scripts: [Array(repeating: "a", count: 8), Array(repeating: "b", count: 8)],
+                probe: probe)
+            let (stream, producer) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                processor: try EmissionLogProcessor(log: log))
+            let consumerStarted = DispatchSemaphore(value: 0)
+            let consumer = Task {
+                var iterator = stream.makeAsyncIterator()
+                consumerStarted.signal()
+                var events = 0
+                while (try? await iterator.next()) != nil { events += 1 }
+                return events
+            }
+            let entered = await waitForBatchStreamSignal(probe.entered)
+            let started = await waitForBatchStreamSignal(consumerStarted)
+            consumer.cancel()
+            _ = await consumer.value
+            probe.resume.signal()
+            await producer.value
+            try #require(entered && started)
+
+            // The step held a token for each row. The first was handed to its handler, which
+            // found the stream terminated; the driver stopped before the second.
+            try expectEmissionLifecycle(
+                log, fixture: fixture, emitted: [0: [fixture.scripts[0][0]], 1: []])
+        }
+    }
+
+    @Test("Task cancellation records the delivered tokens and finalizes every row once")
+    func emissionAtTaskCancellation() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let log = EmissionLog()
+            let probe = BatchStreamProbe(blockFirstBatch: true)
+            let fixture = BatchStreamFixture(
+                scripts: [Array(repeating: "a", count: 8), Array(repeating: "b", count: 8)],
+                probe: probe)
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                processor: try EmissionLogProcessor(log: log))
+            let entered = await waitForBatchStreamSignal(probe.entered)
+            task.cancel()
+            probe.resume.signal()
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+
+            #expect(entered)
+            #expect(result.info.values.allSatisfy { $0.stopReason == .cancelled })
+            #expect(result.tokens == [0: [fixture.scripts[0][0]], 1: [fixture.scripts[1][0]]])
+            try expectEmissionLifecycle(log, fixture: fixture, emitted: result.tokens)
+        }
+    }
+
+    @Test("Rows that fail to join finalize once and record nothing")
+    func emissionAtFailure() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let log = EmissionLog()
+            let fixture = BatchStreamFixture(scripts: [["a"], ["b"]], failPreparation: true)
+            let (stream, task) = try batchGenerateTokensTask(
+                model: fixture.model, prompts: fixture.prompts, tokenizer: fixture.tokenizer,
+                modelConfiguration: .init(id: "batch-stream-test"),
+                processor: try EmissionLogProcessor(log: log))
+            let result = try await collectBatchStreamTokens(stream)
+            await task.value
+            #expect(Set(result.failed.keys) == Set(fixture.prompts.indices))
+            #expect(result.failed.values.allSatisfy { $0 as? BatchStreamTestError == .preparation })
+            try expectEmissionLifecycle(log, fixture: fixture, emitted: [:])
+        }
+    }
+}
+
+/// Each row's emission hooks, keyed by the row's one-token prompt.
+private final class EmissionLog: @unchecked Sendable {
+    enum Entry: Equatable {
+        case emit(Int)
+        case finalize(reasoningTokens: Int?)
+    }
+
+    private let lock = NSLock()
+    private var rows = [Int: [Entry]]()
+
+    func append(_ entry: Entry, row: Int) {
+        lock.withLock { rows[row, default: []].append(entry) }
+    }
+
+    func entries(row: Int) -> [Entry] { lock.withLock { rows[row] ?? [] } }
+}
+
+/// Logs one row's emission hooks around a `ThinkingBudgetProcessor` that treats the whole
+/// generation as reasoning, so its finalized count reflects exactly the recorded tokens.
+/// Logits and samples pass through untouched.
+private struct EmissionLogProcessor: LogitProcessor {
+    let log: EmissionLog
+    var row = -1
+    var budget: ThinkingBudgetProcessor
+
+    init(log: EmissionLog) throws {
+        self.log = log
+        budget = try Self.makeBudget()
+    }
+
+    static func makeBudget() throws -> ThinkingBudgetProcessor {
+        var budget = try ThinkingBudgetProcessor(
+            configuration: ThinkingBudgetConfiguration(maximumTokenCount: 64),
+            reasoning: QwenReasoningProtocol.qwen3, tokenizer: EmissionByteTokenizer())
+        budget.prompt(MLXArray("assistant\n<think>\n".utf8.map { Int32($0) }))
+        return budget
+    }
+
+    /// The count a single-sequence generation reports after emitting `tokens`.
+    static func reasoningTokenCount(emitting tokens: [Int]) throws -> Int? {
+        var budget = try makeBudget()
+        for token in tokens { budget.didEmit(token: token) }
+        budget.finalizeGeneration()
+        return budget.generationReasoningTokenCount
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {
+        row = prompt.asArray(Int.self)[0]
+        budget = (try? Self.makeBudget()) ?? budget
+    }
+
+    func process(logits: MLXArray) -> MLXArray { logits }
+    mutating func didSample(token: MLXArray) {}
+
+    mutating func didEmit(token: Int) {
+        budget.didEmit(token: token)
+        log.append(.emit(token), row: row)
+    }
+
+    mutating func finalizeGeneration() {
+        budget.finalizeGeneration()
+        log.append(.finalize(reasoningTokens: budget.generationReasoningTokenCount), row: row)
+    }
+}
+
+/// Every row's log is its emitted tokens in order, then one finalization whose reasoning count
+/// matches a single-sequence `ThinkingBudgetProcessor` that emitted the same tokens.
+private func expectEmissionLifecycle(
+    _ log: EmissionLog, fixture: BatchStreamFixture, emitted: [Int: [Int]],
+    sourceLocation: SourceLocation = #_sourceLocation
+) throws {
+    for uid in fixture.prompts.indices {
+        let tokens = emitted[uid] ?? []
+        let count = try EmissionLogProcessor.reasoningTokenCount(emitting: tokens)
+        let expected = tokens.map(EmissionLog.Entry.emit) + [.finalize(reasoningTokens: count)]
+        #expect(
+            log.entries(row: fixture.prompts[uid][0]) == expected, "row \(uid)",
+            sourceLocation: sourceLocation)
+    }
+}
+
+private struct EmissionByteTokenizer: Tokenizer {
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { text.utf8.map(Int.init) }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        String(decoding: tokenIds.map { UInt8(truncatingIfNeeded: $0) }, as: UTF8.self)
+    }
+    func convertTokenToId(_ token: String) -> Int? {
+        token.utf8.count == 1 ? token.utf8.first.map(Int.init) : nil
+    }
+    func convertIdToToken(_ id: Int) -> String? {
+        (0 ... 255).contains(id) ? String(decoding: [UInt8(id)], as: UTF8.self) : nil
+    }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
 }
