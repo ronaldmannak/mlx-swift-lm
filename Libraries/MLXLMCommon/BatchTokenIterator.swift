@@ -13,7 +13,9 @@ public enum BatchEvent: Sendable {
     /// Prefill progress for the queued row that got a prefill chunk this step, in prompt
     /// tokens. Emitted for a ``ResumablePrefillModel`` only, once per chunk; `processed ==
     /// total` marks the final chunk, after which the row joins the batch and its first `.token`
-    /// comes with the next step. Other models prefill a queued prompt whole within one
+    /// comes with the next step. An earlier `.prefill` means the chunk was submitted to the
+    /// GPU, not that it finished; the final one means the row's cache is ready. Other models
+    /// prefill a queued prompt whole within one
     /// ``BatchTokenIterator/next()`` and report no `.prefill`.
     case prefill(id: Int, processed: Int, total: Int)
     /// A generated token. Stop tokens are never reported here.
@@ -52,6 +54,10 @@ public enum BatchEvent: Sendable {
 /// `.prefill`. A long prompt therefore delays the decoding rows by one chunk per step rather
 /// than by its whole prefill. A step that only prefills returns `[.prefill(…)]`, so it is
 /// never mistaken for idle. `PrefillParameters.progress` still reports each chunk.
+///
+/// The iterator clears MLX's buffer cache after each prefill chunk, as single-row prefill
+/// does, but never while decoding: the cache is process-wide, so memory policy belongs to the
+/// process owner, which can set `Memory.cacheLimit` or clear it on its own schedule.
 ///
 /// ``next()`` returns the step's ``BatchEvent``s, or `nil` when the iterator is idle: no row
 /// is decoding or queued. Unlike `IteratorProtocol`, `nil` does not mean exhausted; inserting
@@ -151,6 +157,11 @@ public struct BatchTokenIterator {
         let prompt: LMInput.Text
         let chunks: [Range<Int>]
         var next = 0
+        /// Markers of the last chunk, waited on after the next chunk is submitted, so at most
+        /// two chunks are in flight: one element of each cache array the chunk wrote, reduced
+        /// to a scalar of its own. Not the cache arrays themselves: a cache that writes in
+        /// place rebinds those objects to the next chunk's result.
+        var submitted: [MLXArray] = []
     }
 
     /// A queued row prefilled into its own cache, ready to join the batch.
@@ -489,7 +500,14 @@ public struct BatchTokenIterator {
                 let range = resume.chunks[resume.next]
                 autoreleasepool {
                     model.prefillChunk(resume.prompt, range: range, cache: resume.cache)
-                    eval(resume.cache)
+                    // Submit this chunk, even for a model that leaves its cache writes lazy,
+                    // then wait for the previous one: the CPU builds the next chunk's graph
+                    // while the GPU evaluates this one, with at most two chunks in flight.
+                    let state = resume.cache.flatMap { $0.innerState() }
+                    let markers = state.map { $0.reshaped([-1])[..<1].sum() }
+                    asyncEval(state + markers)
+                    eval(resume.submitted)
+                    resume.submitted = markers
                     // As PrefillParameters.forEachChunk does after each chunk.
                     Memory.clearCache()
                 }
@@ -709,9 +727,10 @@ public struct BatchTokenIterator {
         }
         let logits = output.logits[0..., -1, 0...]
         // The first logits come from the full-precision prefill; later steps read the cache
-        // the configured strategy produces, as in TokenIterator.
+        // the configured strategy produces, as in TokenIterator. The prefill has populated the
+        // cache, so its layers' shapes are known now: a row they cannot satisfy fails.
         var rowCache = rowCache
-        cachePlan.apply(to: &rowCache)
+        try cachePlan.applyAndValidate(to: &rowCache)
         eval(rowCache)
         eval(logits)
 
