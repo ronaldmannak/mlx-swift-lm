@@ -125,6 +125,7 @@ public struct BatchTokenIterator {
     private let stopTokens: Set<Int>
     private let maxTokens: Int
     private let prefill: PrefillParameters
+    private let cacheEvaluationPolicy: KVCacheEvaluationPolicy
     private let clearCacheAfterBatchResize: Bool
 
     private struct Row {
@@ -201,6 +202,7 @@ public struct BatchTokenIterator {
     ///   - stopTokens: tokens that end a row
     ///   - maxTokens: the token limit for rows inserted without one
     ///   - prefill: how prompts are prefilled
+    ///   - cacheEvaluationPolicy: cache evaluation roots; see ``KVCacheEvaluationPolicy``
     ///   - clearCacheAfterBatchResize: evaluate replacement KV buffers and clear MLX's
     ///     process-wide buffer pool when rows join an active batch or some active rows leave.
     ///     Defaults to `false`.
@@ -208,6 +210,7 @@ public struct BatchTokenIterator {
         model: any LanguageModel, sampler: LogitSampler = ArgMaxSampler(),
         processor: LogitProcessor? = nil, stopTokens: Set<Int> = [], maxTokens: Int = 128,
         prefill: PrefillParameters = .init(),
+        cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState,
         clearCacheAfterBatchResize: Bool = false
     ) {
         self.model = model
@@ -216,6 +219,7 @@ public struct BatchTokenIterator {
         self.stopTokens = stopTokens
         self.maxTokens = maxTokens
         self.prefill = prefill
+        self.cacheEvaluationPolicy = cacheEvaluationPolicy
         self.clearCacheAfterBatchResize = clearCacheAfterBatchResize
     }
 
@@ -225,7 +229,8 @@ public struct BatchTokenIterator {
     /// and its token limit; `maxTokens == nil` means no limit, so a row runs until it samples
     /// a stop token or is removed. Fresh rows' caches come from
     /// ``LanguageModel/newCache(parameters:)``, so a `kvCache` capacity gives every attention
-    /// layer a rotating cache of that size. Prompts are prefilled with `parameters.prefill`.
+    /// layer a rotating cache of that size. Prompts are prefilled with `parameters.prefill`,
+    /// and each step's cache evaluation follows `parameters.cacheEvaluationPolicy`.
     ///
     /// - Throws: ``ParameterError`` for a setting batched generation does not support:
     ///   `maxKVSize`, a capacity with a pinned prefix, a rewind reserve, a cache strategy other
@@ -250,7 +255,7 @@ public struct BatchTokenIterator {
         self.init(
             model: model, sampler: parameters.sampler(), processor: parameters.processor(),
             stopTokens: stopTokens, maxTokens: parameters.maxTokens ?? .max,
-            prefill: parameters.prefill,
+            prefill: parameters.prefill, cacheEvaluationPolicy: parameters.cacheEvaluationPolicy,
             clearCacheAfterBatchResize: clearCacheAfterBatchResize)
         cacheParameters = configuration == nil ? nil : parameters
     }
@@ -628,7 +633,7 @@ public struct BatchTokenIterator {
         // sampled already.
         var batch = BatchTokenIterator(
             model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
-            maxTokens: maxTokens, prefill: prefill)
+            maxTokens: maxTokens, prefill: prefill, cacheEvaluationPolicy: cacheEvaluationPolicy)
         batch.rows = admitted.map(\.row)
         batch.cache = merged
         batch.state = admittedState
@@ -772,6 +777,8 @@ public struct BatchTokenIterator {
 
     /// Every row's next token from its `[B, V]` logits, through the rows' processors.
     private mutating func sampleNext(_ logits: MLXArray) -> MLXArray {
+        // Preserve the raw graph even when a processor or sampler replaces its input.
+        let rawLogits = cacheEvaluationPolicy == .attentionDependencies ? logits[.ellipsis] : nil
         var logits = logits
         if rows.contains(where: { $0.processor != nil }) {
             logits = concatenated(
@@ -785,9 +792,10 @@ public struct BatchTokenIterator {
         for index in rows.indices {
             rows[index].processor?.didSample(token: sampled[index ..< index + 1])
         }
-        // The cache state settles with the token, as TokenIterator does, so an unevaluated
-        // chain of updates never keeps earlier steps alive.
-        asyncEval([sampled] + cache.flatMap { $0.state })
+        // Independent cache state stays among the evaluation roots under either policy.
+        var evaluationState = [sampled] + cacheEvaluationPolicy.evaluationState(for: cache)
+        if let rawLogits { evaluationState.append(rawLogits) }
+        asyncEval(evaluationState)
         return sampled
     }
 
@@ -872,6 +880,7 @@ extension LogitSampler {
 ///   - sampler: the sampler for every prompt
 ///   - processor: the processor every prompt gets a copy of
 ///   - prefill: how prompts are prefilled
+///   - cacheEvaluationPolicy: cache evaluation roots; see ``KVCacheEvaluationPolicy``
 ///   - clearCacheAfterBatchResize: evaluate replacement KV buffers and clear MLX's
 ///     process-wide buffer pool when rows join an active batch or some active rows leave
 /// - Returns: the generated tokens per prompt, in order
@@ -881,11 +890,12 @@ public func batchGenerate(
     model: any LanguageModel, prompts: [[Int]], caches: [[KVCache]?]? = nil,
     maxTokens: Int = 128, stopTokens: Set<Int> = [], sampler: LogitSampler = ArgMaxSampler(),
     processor: LogitProcessor? = nil, prefill: PrefillParameters = .init(),
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState,
     clearCacheAfterBatchResize: Bool = false
 ) throws -> [[Int]] {
     var iterator = BatchTokenIterator(
         model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
-        maxTokens: maxTokens, prefill: prefill,
+        maxTokens: maxTokens, prefill: prefill, cacheEvaluationPolicy: cacheEvaluationPolicy,
         clearCacheAfterBatchResize: clearCacheAfterBatchResize)
     let ids = iterator.insert(prompts: prompts, caches: caches)
     // On every exit, including a throw from next(): every row, including the ones that ended
