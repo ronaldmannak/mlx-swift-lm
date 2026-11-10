@@ -637,6 +637,152 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test(
+        "Affine 4- and 8-bit GenerateParameters match single runs with the same parameters",
+        arguments: [4, 8])
+    func generateParametersAffineParity(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The legacy field and the typed strategy resolve to the same configuration.
+            let legacy = GenerateParameters(maxTokens: 6, kvBits: bits, temperature: 0)
+            let typed = GenerateParameters(
+                maxTokens: 6,
+                kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: bits))),
+                temperature: 0)
+            for parameters in [legacy, typed] {
+                let expected = try Self.prompts.map { prompt in
+                    let iterator = try TokenIterator(
+                        input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })),
+                        model: model, parameters: parameters)
+                    return Array(IteratorSequence(iterator))
+                }
+                var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+                let ids = iterator.insert(prompts: Self.prompts)
+                var actual = [Int: [Int]]()
+                func record(_ events: [BatchEvent]?) {
+                    for case .token(let id, let token) in events ?? [] {
+                        actual[id, default: []].append(token)
+                    }
+                }
+                record(try iterator.next())
+                // The batch is quantized at `bits`: a row whose supplied cache uses that width
+                // joins it, and one using the other width cannot.
+                func quantizedCache(_ bits: Int) -> [KVCache] {
+                    (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+                }
+                let probes = iterator.insert(
+                    prompts: [[1], [2]],
+                    caches: [quantizedCache(bits), quantizedCache(bits == 4 ? 8 : 4)])
+                // Llama prefills resumably, admitting one queued row per step, so the probes
+                // join the running batch after the prompts' rows.
+                var failed: [(id: Int, error: any Error)] = []
+                while let events = try iterator.next() {
+                    record(events)
+                    failed += failures(events)
+                }
+                #expect(failed.map(\.id) == [probes[1]])
+                #expect(failed.allSatisfy { $0.error is KVCacheError })
+                #expect(
+                    !(actual[probes[0]] ?? []).isEmpty, "the same-width probe joins and decodes")
+                #expect(ids.map { actual[$0] ?? [] } == expected)
+            }
+        }
+    }
+
+    @Test("A row whose cache cannot meet the affine compatibility policy fails before prefill")
+    func generateParametersAffineCompatibility() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            // The typed strategy requires at least one quantizable layer by default; rotating
+            // layers cannot be quantized.
+            var iterator = try BatchTokenIterator(
+                model: model,
+                parameters: GenerateParameters(
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 4))),
+                    temperature: 0))
+            let id = iterator.insert(
+                prompt: [1, 2, 3],
+                cache: (0 ..< 2).map { _ in RotatingKVCache(maxSize: 16) })
+            let events = try iterator.next()
+            #expect(failures(events).map(\.id) == [id])
+            #expect(
+                failures(events).allSatisfy {
+                    $0.error as? KVCacheConfigurationError
+                        == .noCompatibleLayers(strategy: .affine)
+                })
+            #expect(tokens(events).isEmpty)
+            #expect(try iterator.next() == nil)
+        }
+    }
+
+    @Test("A fresh row whose prefilled cache cannot meet the affine policy fails")
+    func generateParametersAffineAfterPrefill() throws {
+        try Device.withDefaultDevice(.cpu) {
+            // Head dimension 8: an empty cache passes the check before prefill, but its
+            // populated layers cannot be quantized in any supported group size, so the row
+            // fails closed, as a populated cache does in applyKVCacheConfiguration.
+            let model = tinyLlama()
+            var parameters = GenerateParameters(
+                kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 4))),
+                temperature: 0)
+            parameters.prefill.stepSize = 2
+            let prompt = Array(1 ..< 8)
+            let expected = KVCacheConfigurationError.noCompatibleLayers(strategy: .affine)
+            #expect(model.kvHeads.count == 2, "two layers, both with head dimension 8")
+
+            var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+            let id = iterator.insert(prompt: prompt)
+            // The row is prefilled a chunk per step, then fails at its final forward.
+            var events: [BatchEvent] = []
+            while iterator.pendingIDs == [id], let step = try iterator.next() { events += step }
+            #expect(failures(events).map(\.id) == [id])
+            #expect(
+                failures(events).allSatisfy {
+                    $0.error as? KVCacheConfigurationError == expected
+                })
+            #expect(tokens(events).isEmpty)
+            #expect(try iterator.next() == nil)
+        }
+    }
+
+    @Test(
+        "Each compatibility policy decides a prefilled row whose cache cannot be quantized",
+        arguments: [
+            KVCacheConfiguration.CompatibilityPolicy.allowPartial, .requireAtLeastOneLayer,
+            .requireAllLayers,
+        ])
+    func generateParametersAffinePolicyAfterPrefill(
+        policy: KVCacheConfiguration.CompatibilityPolicy
+    ) throws {
+        try Device.withDefaultDevice(.cpu) {
+            // Head dimension 8 cannot be quantized in any supported group size.
+            let model = tinyLlama()
+            var parameters = GenerateParameters(
+                maxTokens: 4,
+                kvCache: KVCacheConfiguration(
+                    strategy: .affine(try .init(bits: 4)), compatibility: policy),
+                temperature: 0)
+            parameters.prefill.stepSize = 2
+            var iterator = try BatchTokenIterator(model: model, parameters: parameters)
+            let id = iterator.insert(prompt: Array(1 ..< 8))
+            var events: [BatchEvent] = []
+            while let step = try iterator.next() { events += step }
+            if policy == .allowPartial {
+                // The row joins at full precision and runs to its limit.
+                #expect(failures(events).isEmpty)
+                #expect(tokens(events).count == 4)
+            } else {
+                #expect(failures(events).map(\.id) == [id])
+                #expect(
+                    failures(events).allSatisfy {
+                        $0.error as? KVCacheConfigurationError
+                            == .noCompatibleLayers(strategy: .affine)
+                    })
+                #expect(tokens(events).isEmpty)
+            }
+        }
+    }
+
     @Test("A GenerateParameters token limit of nil leaves rows unlimited")
     func generateParametersWithoutTokenLimit() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -672,11 +818,17 @@ struct BatchTokenIteratorTests {
                         rewind: try .init(maxTokens: 8))),
                 .rewindReserve
             ),
-            (GenerateParameters(kvBits: 4), .strategy(.affine)),
+            // Affine 4 or 8 bits from the first token is supported; see
+            // generateParametersAffineParity.
+            (GenerateParameters(kvBits: 2), .affine(bits: 2, compressionStart: 0)),
+            (
+                GenerateParameters(kvBits: 4, quantizedKVStart: 16),
+                .affine(bits: 4, compressionStart: 16)
+            ),
             (
                 GenerateParameters(
-                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 8)))),
-                .strategy(.affine)
+                    kvCache: KVCacheConfiguration(strategy: .affine(try .init(bits: 6)))),
+                .affine(bits: 6, compressionStart: 0)
             ),
             (GenerateParameters(kvScheme: "turbo8v3"), .strategy(.turboQuant)),
             (GenerateParameters(logProbabilities: 5), .logProbabilities),
@@ -784,6 +936,64 @@ struct BatchTokenIteratorTests {
                 prompts: Self.prompts, samplers: Self.prompts.indices.map { sampler($0) })
             let actual = try collect(&iterator, uids: uids)
             #expect(actual == expected)
+        }
+    }
+
+    @Test("Supplied quantized prompt caches preserve greedy token streams", arguments: [4, 8])
+    func quantizedGreedy(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            func caches() -> [any KVCache] {
+                (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+            }
+            let expected = try Self.prompts.map { prompt in
+                try generateAlone(
+                    model, prompt: prompt, cache: caches(), sampler: ArgMaxSampler(), maxTokens: 6)
+            }
+            let actual = try batchGenerate(
+                model: model, prompts: Self.prompts, caches: Self.prompts.map { _ in caches() },
+                maxTokens: 6)
+            #expect(actual == expected)
+        }
+    }
+
+    @Test(
+        "Quantized rows keep their seeded sampler streams when another row joins",
+        arguments: [4, 8])
+    func quantizedSeededAdmission(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            let limits = [6, 5, 4]
+            func caches() -> [any KVCache] {
+                (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+            }
+            func sampler(_ index: Int) -> TopPSampler {
+                TopPSampler(temperature: 0.8, topP: 0.9, seed: UInt64(17 + index))
+            }
+            let expected = try Self.prompts.indices.map { index in
+                try generateAlone(
+                    model, prompt: Self.prompts[index], cache: caches(), sampler: sampler(index),
+                    maxTokens: limits[index])
+            }
+            var iterator = BatchTokenIterator(model: model)
+            var uids = iterator.insert(
+                prompts: Array(Self.prompts.prefix(2)), maxTokens: Array(limits.prefix(2)),
+                caches: [caches(), caches()], samplers: [sampler(0), sampler(1)])
+            var output = [Int: [Int]]()
+            for _ in 0 ..< 2 {
+                for case .token(let id, let token) in try iterator.next() ?? [] {
+                    output[id, default: []].append(token)
+                }
+            }
+            uids += iterator.insert(
+                prompts: [Self.prompts[2]], maxTokens: [limits[2]], caches: [caches()],
+                samplers: [sampler(2)])
+            while let events = try iterator.next() {
+                for case .token(let id, let token) in events {
+                    output[id, default: []].append(token)
+                }
+            }
+            #expect(uids.map { output[$0] ?? [] } == expected)
         }
     }
 
@@ -1462,6 +1672,17 @@ struct BatchTokenIteratorTests {
         #expect(
             sampler.sample(logProbabilities: logSoftmax(batch, axis: -1)).asArray(Int.self)
                 == [1, 0])
+    }
+}
+
+private func tinyQuantizedIteratorLlama() -> LlamaModel {
+    withRandomState(MLXRandom.RandomState(seed: 907)) {
+        let model = LlamaModel(
+            LlamaConfiguration(
+                hiddenSize: 128, hiddenLayers: 2, intermediateSize: 128, attentionHeads: 2,
+                rmsNormEps: 1e-5, vocabularySize: 32, kvHeads: 1))
+        eval(model)
+        return model
     }
 }
 

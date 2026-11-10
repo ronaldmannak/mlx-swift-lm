@@ -72,6 +72,10 @@ public enum BatchEvent: Sendable {
 /// is sampled on its own, so a row with a seeded sampler draws the tokens it would draw
 /// alone. Logit processors run per row.
 ///
+/// Supply ``QuantizedKVCache`` rows through `caches` to opt into affine 4-bit or 8-bit
+/// batching. Each layer's rows must share their quantization configuration, and the model
+/// must support quantized attention. Fresh caches use the model's default layout.
+///
 /// Model-owned state is carried for a single row. Multiple rows require nil or empty state:
 /// arbitrary per-request state cannot be merged or filtered without a model-specific contract.
 public struct BatchTokenIterator {
@@ -98,8 +102,10 @@ public struct BatchTokenIterator {
         case pinnedPrefix(Int)
         /// A `kvCache` rewind reserve.
         case rewindReserve
-        /// A cache strategy other than full precision.
+        /// A cache strategy other than full precision or affine quantization.
         case strategy(KVCacheStrategyIdentifier)
+        /// Affine quantization other than 4 or 8 bits from the first token.
+        case affine(bits: Int, compressionStart: Int)
         /// `logProbabilities`.
         case logProbabilities
 
@@ -113,6 +119,8 @@ public struct BatchTokenIterator {
                 "Batched rotating caches do not support a rewind reserve."
             case .strategy(let strategy):
                 "Batched generation does not support the \(strategy) KV-cache strategy."
+            case .affine(let bits, let compressionStart):
+                "Batched affine KV caches take 4 or 8 bits from the first token; this configuration uses \(bits) bits from token \(compressionStart)."
             case .logProbabilities:
                 "Batched generation does not report log probabilities."
             }
@@ -193,6 +201,8 @@ public struct BatchTokenIterator {
     private var undeliveredEnded: [Ended] = []
     /// What ``LanguageModel/newCache(parameters:)`` builds fresh rows' caches from.
     private var cacheParameters: GenerateParameters?
+    /// Applied to each row's cache after its prefill: affine quantization, when configured.
+    private var cachePlan = KVCachePlan.disabled
 
     /// - Parameters:
     ///   - model: the model
@@ -226,11 +236,15 @@ public struct BatchTokenIterator {
     /// a stop token or is removed. Fresh rows' caches come from
     /// ``LanguageModel/newCache(parameters:)``, so a `kvCache` capacity gives every attention
     /// layer a rotating cache of that size. Prompts are prefilled with `parameters.prefill`.
+    /// With affine 4- or 8-bit quantization from the first token (`kvBits`, an `affine4` or
+    /// `affine8` `kvScheme`, or an affine `kvCache` strategy), each row's full-precision
+    /// attention layers are quantized after its prefill, as ``TokenIterator`` quantizes them,
+    /// and decode in a ``BatchQuantizedKVCache``; the model must support quantized attention.
     ///
     /// - Throws: ``ParameterError`` for a setting batched generation does not support:
-    ///   `maxKVSize`, a capacity with a pinned prefix, a rewind reserve, a cache strategy other
-    ///   than full precision, or `logProbabilities`; `KVCacheConfigurationError` for an
-    ///   invalid cache configuration.
+    ///   `maxKVSize`, a capacity with a pinned prefix, a rewind reserve, affine quantization
+    ///   with other bit widths or a later start, another cache strategy, or
+    ///   `logProbabilities`; `KVCacheConfigurationError` for an invalid cache configuration.
     public init(
         model: any LanguageModel, parameters: GenerateParameters, stopTokens: Set<Int> = [],
         clearCacheAfterBatchResize: Bool = false
@@ -243,7 +257,17 @@ public struct BatchTokenIterator {
                 throw ParameterError.pinnedPrefix(capacity.preservedPrefixTokens)
             }
             guard configuration.rewind == nil else { throw ParameterError.rewindReserve }
-            guard configuration.strategy == .fullPrecision else {
+            switch configuration.strategy.storage {
+            case .fullPrecision:
+                break
+            case .affine(let affine):
+                // Converting rows later, one at a time, would break their compatibility
+                // with the rows already batched.
+                guard [4, 8].contains(affine.bits), affine.compressionStart == 0 else {
+                    throw ParameterError.affine(
+                        bits: affine.bits, compressionStart: affine.compressionStart)
+                }
+            default:
                 throw ParameterError.strategy(configuration.strategy.identifier)
             }
         }
@@ -253,6 +277,7 @@ public struct BatchTokenIterator {
             prefill: parameters.prefill,
             clearCacheAfterBatchResize: clearCacheAfterBatchResize)
         cacheParameters = configuration == nil ? nil : parameters
+        cachePlan = KVCachePlan(configuration: configuration)
     }
 
     /// The ids of every row decoding or queued, in insertion order.
@@ -722,7 +747,9 @@ public struct BatchTokenIterator {
         guard rowCache.count == layerCount else {
             throw KVCacheError(message: "Every row must share the active cache's layer count")
         }
-        return rowCache
+        // The configured capacity, strategy and compatibility policy, as TokenIterator checks
+        // them, before the prefill: a row whose cache cannot satisfy them fails alone.
+        return try cachePlan.validated(rowCache)
     }
 
     /// A prefilled row ready to join: `output` is its final prefill forward. Checks every
@@ -737,6 +764,11 @@ public struct BatchTokenIterator {
             throw StateError.modelStateRequiresSingleRow
         }
         let logits = output.logits[0..., -1, 0...]
+        // The first logits come from the full-precision prefill; later steps read the cache
+        // the configured strategy produces, as in TokenIterator. The prefill has populated the
+        // cache, so its layers' shapes are known now: a row they cannot satisfy fails.
+        var rowCache = rowCache
+        try cachePlan.applyAndValidate(to: &rowCache)
         eval(rowCache)
         eval(logits)
 
