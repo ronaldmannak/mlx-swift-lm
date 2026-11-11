@@ -52,6 +52,50 @@ public struct QwenVL {
         return resumeState
     }
 
+    /// The 3-D MROPE positions of `length` new tokens per row, `[3, batch, length]`: each row
+    /// continues from its own cache offset (per row in a batched cache) plus its rope delta,
+    /// `[batch]` or one delta for every row.
+    static func decodePositionIds(
+        cache: KVCache?, ropeDeltas: MLXArray, batch: Int, length: Int
+    ) -> MLXArray {
+        let offsets: MLXArray
+        switch cache?.ropeOffset {
+        case .batch(let rows): offsets = rows.asType(.int32)
+        case .scalar(let offset): offsets = MLXArray(Int32(offset))
+        case nil: offsets = MLXArray(Int32(0))
+        }
+        let start = (offsets + ropeDeltas.asType(.int32)).reshaped([-1, 1])
+        let positions = broadcast(
+            MLXArray(0 ..< length).asType(.int32)[.newAxis, 0...] + start, to: [batch, length])
+        return broadcast(positions[.newAxis, 0..., 0...], to: [3, batch, length])
+    }
+
+    /// The batched decoder state of Qwen VL rows, for ``BatchedGenerationStateProviding``: each
+    /// row's rope delta under `key`, `[rows]`. A row without one, such as a text-only prefill,
+    /// takes zero, which continues its positions from its cache offset. Every other key, such
+    /// as positions used only during prefill, is dropped. Empty when no part holds a delta.
+    static func mergeGenerationStates(
+        _ states: [LMOutput.State], rowCounts: [Int], key: LMOutput.Key<MLXArray>
+    ) -> LMOutput.State {
+        var merged = LMOutput.State()
+        guard states.contains(where: { $0[key] != nil }) else { return merged }
+        merged[key] = concatenated(
+            zip(states, rowCounts).map { state, rows in
+                state[key].map { $0.asType(.int32).reshaped([-1]) }
+                    ?? MLXArray.zeros([rows], dtype: .int32)
+            })
+        return merged
+    }
+
+    /// The rope deltas of the rows at `batchIndices`, in that order.
+    static func selectGenerationState(
+        _ state: LMOutput.State, batchIndices: MLXArray, key: LMOutput.Key<MLXArray>
+    ) -> LMOutput.State {
+        var selected = LMOutput.State()
+        selected[key] = state[key]?.reshaped([-1])[batchIndices]
+        return selected
+    }
+
     /// Rotates half the hidden dims of the input
     static func rotateHalf(_ x: MLXArray) -> MLXArray {
         let index = x.dim(-1) / 2

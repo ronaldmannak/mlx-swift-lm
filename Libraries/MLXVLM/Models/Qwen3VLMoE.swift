@@ -511,21 +511,9 @@ enum Qwen3VLMoELanguage {
                         positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
                     }
                 } else if let cache, let ropeDeltas = state[qwen3VLMoERopeDeltasKey] {
-                    let batch = inputOrEmbeddings.dim(0)
-                    let seqLength = inputOrEmbeddings.dim(1)
-                    let lastCacheOffset = cache.last?.offset ?? 0
-
-                    var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
-
-                    var base = MLXArray(0 ..< seqLength).asType(.int32)
-                    base = broadcast(base[.newAxis, 0...], to: [batch, seqLength])
-
-                    if delta.dim(0) == 1 && batch > 1 {
-                        delta = repeated(delta, count: batch, axis: 0)
-                    }
-
-                    base = base + delta
-                    positionIds = broadcast(base[.newAxis, 0..., 0...], to: [3, batch, seqLength])
+                    positionIds = QwenVL.decodePositionIds(
+                        cache: cache.last, ropeDeltas: ropeDeltas,
+                        batch: inputOrEmbeddings.dim(0), length: inputOrEmbeddings.dim(1))
                 }
             }
 
@@ -829,4 +817,23 @@ extension Qwen3VLMoE {
     // Qwen3-VL shares Qwen's tags and tool-call boundary, but does not declare
     // the original Qwen3 family's model-specific hard-budget transition.
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+extension Qwen3VLMoE: BatchedGenerationStateProviding {
+    public func mergeGenerationStates(_ states: [LMOutput.State], rowCounts: [Int])
+        -> LMOutput.State
+    {
+        QwenVL.mergeGenerationStates(states, rowCounts: rowCounts, key: qwen3VLMoERopeDeltasKey)
+    }
+
+    public func selectGenerationState(_ state: LMOutput.State, batchIndices: MLXArray)
+        -> LMOutput.State
+    {
+        QwenVL.selectGenerationState(
+            state, batchIndices: batchIndices, key: qwen3VLMoERopeDeltasKey)
+    }
+
+    public func generationStateArrays(_ state: LMOutput.State) -> [MLXArray] {
+        [state[qwen3VLMoERopeDeltasKey]].compactMap { $0 }
+    }
 }
