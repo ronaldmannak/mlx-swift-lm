@@ -767,6 +767,64 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("On the GPU, 4-bit rows that join and leave a batch decode as they do alone")
+    func quantizedRowsOnGPU() throws {
+        try Device.withDefaultDevice(.gpu) {
+            let model = quantizedLlama()
+            #expect(model.namedModules().contains { $0.1 is QuantizedLinear })
+            // The 600-token prompt prefills in two chunks while other rows decode.
+            let lengths = [3, 40, 17, 600, 9, 64, 28, 5]
+            let limits = [24, 12, 24, 16, 24, 6, 24, 24]
+            let prompts = lengths.enumerated().map { row, length in
+                (0 ..< length).map { ($0 * 37 + row * 101 + 1) % 1024 }
+            }
+            let batched = prompts.map { _ in RecordingGreedySampler() }
+
+            // Four rows start; four more are queued once the first rows are decoding. One
+            // row is admitted per step, so the batch passes through every width up to 8.
+            var iterator = BatchTokenIterator(model: model)
+            var uids = iterator.insert(
+                prompts: Array(prompts[..<4]), maxTokens: Array(limits[..<4]),
+                samplers: Array(batched[..<4]))
+            var emitted = [Int: [Int]]()
+            var widths = Set<Int>()
+            var steps = 0
+            while let events = try iterator.next() {
+                steps += 1
+                if steps == 3 {
+                    uids += iterator.insert(
+                        prompts: Array(prompts[4...]), maxTokens: Array(limits[4...]),
+                        samplers: Array(batched[4...]))
+                }
+                for case .token(let id, let token) in events {
+                    emitted[id, default: []].append(token)
+                }
+                widths.insert(tokens(events).count)
+            }
+            #expect(widths.isSuperset(of: 1 ... 8))
+
+            // Each row alone, fed the tokens it emitted in the batch, so both runs see the
+            // same history at every step.
+            for (row, uid) in uids.enumerated() {
+                let tokens = try #require(emitted[uid])
+                #expect(tokens.count == limits[row])
+                let alone = RecordingGreedySampler(forced: tokens)
+                _ = try generateAlone(
+                    model, prompt: prompts[row], sampler: alone, maxTokens: tokens.count)
+                for (index, token) in tokens.enumerated() {
+                    let solo = alone.logits[index].reshaped(-1)
+                    let gap = abs(solo - batched[row].logits[index].reshaped(-1)).max()
+                        .item(Float.self)
+                    #expect(gap < quantizedLogitTolerance, "row \(row), token \(index)")
+                    // The row's own top choice, unless the two are close enough for
+                    // rounding to have reordered them.
+                    let margin = (solo.max() - solo[token]).item(Float.self)
+                    #expect(margin <= 2 * quantizedLogitTolerance, "row \(row), token \(index)")
+                }
+            }
+        }
+    }
+
     @Test("Rows with their own seeded samplers draw the tokens they draw alone")
     func seededPerRow() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -1925,6 +1983,41 @@ private final class AdmissionCountingSampler: LogitSampler {
     func sample(logits: MLXArray) -> MLXArray {
         calls += 1
         return sampler.sample(logits: logits)
+    }
+}
+
+/// How far a logit of a 4-bit float32 row may sit from the same row decoded alone. The Metal
+/// quantized kernels sum in an order that depends on the number of rows.
+private let quantizedLogitTolerance: Float = 1e-4
+
+/// A Llama wide enough for the Metal quantized kernels chosen by row count, with random
+/// float32 weights quantized to 4 bits.
+private func quantizedLlama() -> LlamaModel {
+    withRandomState(MLXRandom.RandomState(seed: 11)) {
+        let model = LlamaModel(
+            LlamaConfiguration(
+                hiddenSize: 1024, hiddenLayers: 2, intermediateSize: 2048,
+                attentionHeads: 8, rmsNormEps: 1e-5, vocabularySize: 1024, kvHeads: 2,
+                tieWordEmbeddings: false))
+        quantize(model: model, groupSize: 64, bits: 4)
+        eval(model)
+        return model
+    }
+}
+
+/// Records the logits it is given. Picks the top token, or the next of `forced`.
+private final class RecordingGreedySampler: LogitSampler {
+    private let forced: [Int]?
+    private(set) var logits: [MLXArray] = []
+
+    init(forced: [Int]? = nil) {
+        self.forced = forced
+    }
+
+    func sample(logits: MLXArray) -> MLXArray {
+        defer { self.logits.append(logits) }
+        guard let forced else { return argMax(logits, axis: -1) }
+        return MLXArray([Int32(forced[min(self.logits.count, forced.count - 1)])])
     }
 }
 
