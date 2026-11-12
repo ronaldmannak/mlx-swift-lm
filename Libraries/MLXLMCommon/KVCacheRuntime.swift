@@ -94,14 +94,10 @@ public func validateKVCacheCompatibility(
 
     if let rewind = configuration.rewind {
         let incompatibleCount = leaves.count { leaf in
-            switch leaf.kind {
-            case .rotating(let rotating):
+            if case .rotating(let rotating) = leaf.kind {
                 return rotating.rewindCapacity < rewind.maxTokens
-            case .batchedRotating:
-                return true
-            default:
-                return false
             }
+            return leaf.cache is BatchRotatingKVCache
         }
         guard incompatibleCount == 0 else {
             throw KVCacheConfigurationError.incompatibleRewindCapacity(
@@ -111,6 +107,11 @@ public func validateKVCacheCompatibility(
 
     if let capacity = configuration.capacity {
         let incompatibleCapacityCount = leaves.count { leaf in
+            if let batch = leaf.cache as? BatchRotatingKVCache {
+                guard batch.capacityOrigin == .requested else { return false }
+                // A batch keeps no prefix, so a requested prefix is not applied to it.
+                return batch.maxSize != capacity.maxTokens || capacity.preservedPrefixTokens != 0
+            }
             switch leaf.kind {
             case .recurrent:
                 return false
@@ -121,11 +122,6 @@ public func validateKVCacheCompatibility(
             case .rotating(let rotating):
                 return rotating.maxSize != capacity.maxTokens
                     || rotating.preservedPrefixTokens != capacity.preservedPrefixTokens
-            case .batchedRotating(let batch) where batch.capacityOrigin == .modelNative:
-                return false
-            case .batchedRotating(let batch):
-                // A batch keeps no prefix, so a requested prefix is not applied to it.
-                return batch.maxSize != capacity.maxTokens || capacity.preservedPrefixTokens != 0
             default:
                 return true
             }
@@ -223,10 +219,12 @@ extension KVCacheLeaf {
                 nil
             case .rotating(let rotating):
                 rotating.capacityOrigin == .requested ? .requested : .modelDefined
-            case .batchedRotating(let batch):
-                batch.capacityOrigin == .requested ? .requested : .modelDefined
             default:
-                cache.maxSize == nil ? .unbounded : .implementationDefined
+                if let batch = cache as? BatchRotatingKVCache {
+                    batch.capacityOrigin == .requested ? .requested : .modelDefined
+                } else {
+                    cache.maxSize == nil ? .unbounded : .implementationDefined
+                }
             }
 
         func status(
@@ -273,12 +271,13 @@ extension KVCacheLeaf {
                 resolvedStrategy: .affine,
                 reason: isBoundaryProtection
                     ? .boundaryProtection : (matches ? nil : .differentStrategy))
-        case .rotating, .batchedRotating:
+        case .rotating,
+            .unsupported where cache is BatchRotatingKVCache:
             return status(
                 state: requested == .fullPrecision ? .active : .skipped,
                 resolvedStrategy: .fullPrecision,
                 reason: requested == .fullPrecision ? nil : .slidingWindow)
-        case .batched:
+        case .unsupported where cache is BatchKVCache:
             return status(
                 state: requested == .fullPrecision ? .active : .skipped,
                 resolvedStrategy: .fullPrecision,
