@@ -141,7 +141,10 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXImageGeneration"
+            path: "Libraries/MLXImageGeneration",
+            exclude: [
+                "README.md"
+            ]
         ),
         .target(
             name: "BenchmarkHelpers",
