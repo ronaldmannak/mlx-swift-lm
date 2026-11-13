@@ -347,8 +347,9 @@ package final class QwenImageVAEDecoder: Module {
 
 /// Reads every safetensors file in `directory`.
 func loadSafetensors(in directory: URL) throws -> [String: MLXArray] {
+    // Listing a folder does not follow a symbolic link to it.
     let files = try FileManager.default.contentsOfDirectory(
-        at: directory, includingPropertiesForKeys: nil
+        at: directory.resolvingSymlinksInPath(), includingPropertiesForKeys: nil
     ).filter { $0.pathExtension == "safetensors" && !$0.lastPathComponent.hasPrefix("._") }
     guard !files.isEmpty else {
         throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: directory.path])

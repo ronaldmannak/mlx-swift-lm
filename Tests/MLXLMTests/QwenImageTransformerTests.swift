@@ -144,6 +144,28 @@ import Testing
         #expect(throws: (any Error).self) { try QwenImageTransformer.load(from: directory) }
     }
 
+    @Test("A checkpoint folder reached through a symbolic link loads")
+    func symbolicLink() throws {
+        let source = try makeTransformer()
+        try source.update(weights: checkpoint(for: source))
+
+        let root = FileManager.default.temporaryDirectory.appending(
+            component: "qwen-image-link-\(UUID().uuidString)")
+        let directory = root.appending(component: "transformer")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(Self.tinyConfiguration.utf8).write(
+            to: directory.appending(component: "config.json"))
+        try save(
+            arrays: Dictionary(uniqueKeysWithValues: source.parameters().flattened()),
+            url: directory.appending(component: "model.safetensors"))
+        let link = root.appending(component: "link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: directory)
+
+        let loaded = try QwenImageTransformer.load(from: link)
+        #expect(abs(velocity(loaded) - velocity(source)).max().item(Float.self) < 1e-5)
+    }
+
     @Test("The prediction is repeatable and follows the noise level")
     func noiseLevelChangesPrediction() throws {
         let transformer = try makeTransformer()
