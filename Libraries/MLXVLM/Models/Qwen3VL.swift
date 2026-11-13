@@ -1266,7 +1266,8 @@ enum Qwen3VLLanguage {
             mask: MLXArray?,
             positionIds: MLXArray?,
             visualIndices: [Int]?,
-            deepstackEmbeds: [MLXArray]?
+            deepstackEmbeds: [MLXArray]?,
+            finalNorm: Bool = true
         ) -> MLXArray {
             var hidden: MLXArray
             if let inputEmbeddings {
@@ -1307,7 +1308,7 @@ enum Qwen3VLLanguage {
                 }
             }
 
-            return norm(hidden)
+            return finalNorm ? norm(hidden) : hidden
         }
 
         private func applyDeepstack(
@@ -1975,6 +1976,30 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             videoGridTHW: nil
         )
         return result
+    }
+
+    /// The last decoder layer's output for a text-only prompt, before the final norm.
+    ///
+    /// Image models that use Qwen3-VL as their text encoder condition on this state.
+    /// `tokens` is `[batch, length]` without padding.
+    package func lastHiddenState(_ tokens: MLXArray) -> MLXArray {
+        let (positionIds, _) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: tokens,
+            imageGridTHW: nil,
+            videoGridTHW: nil,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenIndex,
+            videoTokenId: config.videoTokenIndex,
+            visionStartTokenId: config.visionStartTokenId)
+        return languageModel.model(
+            tokens,
+            cache: nil,
+            inputEmbeddings: nil,
+            mask: nil,
+            positionIds: positionIds,
+            visualIndices: nil,
+            deepstackEmbeds: nil,
+            finalNorm: false)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
