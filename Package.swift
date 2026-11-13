@@ -29,6 +29,9 @@ let package = Package(
             name: "MLXRerankers",
             targets: ["MLXRerankers"]),
         .library(
+            name: "MLXImageGeneration",
+            targets: ["MLXImageGeneration"]),
+        .library(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
         .library(
@@ -131,6 +134,16 @@ let package = Package(
             path: "Libraries/MLXRerankers"
         ),
         .target(
+            name: "MLXImageGeneration",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXImageGeneration"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -177,6 +190,7 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXRerankers",
+                "MLXImageGeneration",
                 "MLXScriptedLM",
             ],
             path: "Tests/MLXLMTests",
