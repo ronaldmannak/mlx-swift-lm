@@ -393,6 +393,37 @@ struct KVCacheConfigurationTests {
         #expect(storage.nativeAttentionOffsetsAreAligned)
     }
 
+    @Test func tokenIteratorPrefillFailsClosedOnRealizedUnsupportedShape() throws {
+        // Head dimension 8 cannot be quantized in any supported group size. The cache is
+        // empty, so compatible, until the prompt's forward populates it.
+        let parameters = GenerateParameters(
+            maxTokens: 2,
+            kvCache: KVCacheConfiguration(
+                strategy: .affine(.fourBit), compatibility: .requireAtLeastOneLayer),
+            temperature: 0)
+        #expect(throws: KVCacheConfigurationError.noCompatibleLayers(strategy: .affine)) {
+            _ = try TokenIterator(
+                input: LMInput(tokens: MLXArray([1, 2, 3])),
+                model: HeadDimensionModel(headDimension: 8), parameters: parameters)
+        }
+    }
+
+    @Test func tokenIteratorPrefillQuantizesRealizedSupportedShape() throws {
+        let parameters = GenerateParameters(
+            maxTokens: 2,
+            kvCache: KVCacheConfiguration(
+                strategy: .affine(.fourBit), compatibility: .requireAtLeastOneLayer),
+            temperature: 0)
+        let storage = KVCacheStorage(
+            HeadDimensionModel(headDimension: 64).newCache(parameters: parameters),
+            plan: try parameters.kvCachePlan())
+        _ = try TokenIterator(
+            input: LMInput(tokens: MLXArray([1, 2, 3])),
+            model: HeadDimensionModel(headDimension: 64), cacheStorage: storage,
+            parameters: parameters)
+        #expect(storage.cache[0] is QuantizedKVCache)
+    }
+
     @Test func modelCacheCopyAndTrimPreserveOneTimeline() throws {
         let attention = KVCacheSimple()
         _ = attention.update(
@@ -493,6 +524,37 @@ struct KVCacheConfigurationTests {
             MLXArray.zeros([1, 1, 1, headDimension]),
         ]
         return cache
+    }
+
+    /// One attention layer with the given head dimension, written by the forward pass.
+    private final class HeadDimensionModel: Module, LanguageModel {
+        let headDimension: Int
+
+        init(headDimension: Int) {
+            self.headDimension = headDimension
+            super.init()
+        }
+
+        func prepare(
+            _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+            prefill: PrefillParameters
+        ) throws -> PrepareResult {
+            .tokens(input.text)
+        }
+
+        func callAsFunction(
+            _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+        ) -> LMOutput {
+            let length = input.cacheSequenceLength
+            _ = cache?[0].update(
+                keys: MLXArray.zeros([1, 1, length, headDimension]),
+                values: MLXArray.zeros([1, 1, length, headDimension]))
+            return LMOutput(logits: MLXArray.zeros([1, length, 8]))
+        }
+
+        func newCache(parameters: GenerateParameters?) -> [KVCache] {
+            [KVCacheSimple()]
+        }
     }
 
     private final class HybridProgressModel: Module, LanguageModel {

@@ -1117,8 +1117,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             cacheStorage.commitProcessedTokens(inputLength - remainingLength)
             y = tokens
 
-            // evaluate the remainder of the prompt -- this primes the pump
-            let token = step(previous: y)
+            // evaluate the remainder of the prompt -- this primes the pump. The cache plan is
+            // applied below, validated, now that the prompt has populated the cache.
+            let token = step(previous: y, applyingCachePlan: false)
             y = .init(tokens: token)
             evaluateTokenAndLogProbabilities(y.tokens)
 
@@ -1175,7 +1176,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     /// Evaluate the next token and return the new token (y), updating cache state
-    mutating func step(previous: LMInput.Text) -> MLXArray {
+    mutating func step(previous: LMInput.Text, applyingCachePlan: Bool = true) -> MLXArray {
         let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
             model.nextTokenLogits(
                 previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
@@ -1184,7 +1185,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.state = result.state
 
         // Apply dynamic cache quantization after each step
-        kvCachePlan.apply(to: cacheStorage)
+        if applyingCachePlan {
+            kvCachePlan.apply(to: cacheStorage)
+        }
 
         return convertToToken(logits: result.logits)
     }
