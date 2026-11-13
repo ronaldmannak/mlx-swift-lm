@@ -152,7 +152,10 @@ public struct FlowMatchEulerScheduler: Sendable {
             grid = grid.map { shift * $0 / (1 + (shift - 1) * $0) }
         }
 
-        if let terminal = configuration.shiftTerminal, terminal != 0, let last = grid.last {
+        // A grid that ends at 1, such as a single step, has no span to stretch.
+        if let terminal = configuration.shiftTerminal, terminal != 0, let last = grid.last,
+            last < 1
+        {
             let scale = (1 - last) / (1 - Double(terminal))
             grid = grid.map { 1 - (1 - $0) / scale }
         }

@@ -72,6 +72,15 @@ import Testing
         #expect(short.sigmas.count == 5)
     }
 
+    @Test("A single step goes straight from noise to the image")
+    func singleStep() throws {
+        // The only level is 1, which leaves nothing to stretch toward the terminal level.
+        let scheduler = FlowMatchEulerScheduler(
+            try configuration(Self.qwenImage21), stepCount: 1, imageSequenceLength: 4096)
+        #expect(scheduler.sigmas == [1, 0])
+        #expect(scheduler.timesteps == [1000])
+    }
+
     @Test("A fixed grid without shifting is used as given")
     func fixedGrid() throws {
         // Qwen-Image-2.1-Turbo ships its eight sampling levels as `sample_sigmas`, and its
