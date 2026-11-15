@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 
 /// A protocol for downloading model repository snapshots to local directories.
 ///
@@ -91,6 +92,12 @@ public struct ResolvedModelConfiguration: Sendable {
     /// - ``ModelConfiguration/excludedComponents``
     public var excludedComponents: Set<ModelComponent>
 
+    /// The distributed group to split the model's weights across.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/tensorParallelGroup``
+    public var tensorParallelGroup: MLXDistributed.Group?
+
     public init(
         modelDirectory: URL,
         tokenizerDirectory: URL,
@@ -104,7 +111,8 @@ public struct ResolvedModelConfiguration: Sendable {
         messageGenerator: (any MessageGenerator)? = nil,
         generationConfig: GenerationConfigFile? = nil,
         weightFileSelection: WeightFileSelection = .automatic,
-        excludedComponents: Set<ModelComponent> = []
+        excludedComponents: Set<ModelComponent> = [],
+        tensorParallelGroup: MLXDistributed.Group? = nil
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -119,6 +127,16 @@ public struct ResolvedModelConfiguration: Sendable {
         self.generationConfig = generationConfig
         self.weightFileSelection = weightFileSelection
         self.excludedComponents = excludedComponents
+        self.tensorParallelGroup = tensorParallelGroup
+    }
+
+    /// Refuses a ``tensorParallelGroup``, for a factory whose models cannot be sharded,
+    /// rather than loading the whole model unasked.
+    package func refuseTensorParallelism() throws {
+        if tensorParallelGroup != nil {
+            throw ModelFactoryError.invalidConfiguration(
+                "\(name) cannot be split across a distributed group by this factory")
+        }
     }
 }
 

@@ -88,6 +88,7 @@ public enum LLMTypeRegistry {
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
         "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
         "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
+        "minimax_m2": create(MiniMaxConfiguration.self, MiniMaxModel.init),
         "glm4": create(GLM4Configuration.self, GLM4Model.init),
         "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
         "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
@@ -823,11 +824,22 @@ public final class LLMModelFactory: GenericModelFactory {
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents)
+        if let group = configuration.tensorParallelGroup {
+            guard let shardable = model as? any (BaseLanguageModel & TensorParallelModel) else {
+                throw ModelFactoryError.invalidConfiguration(
+                    "\(baseConfig.modelType) models cannot be split across a distributed group")
+            }
+            try await loadShardedWeights(
+                modelDirectory: modelDirectory, model: shardable, group: group,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        } else {
+            try await loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection,
+                excludedComponents: configuration.excludedComponents)
+        }
 
         let tokenizer = try await tokenizerTask
 
@@ -844,7 +856,7 @@ public final class LLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -855,6 +867,8 @@ public final class LLMModelFactory: GenericModelFactory {
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator,
             generationConfig: mutableConfiguration.generationConfig)
+        // Kept so a caller can tell the model holds a share.
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

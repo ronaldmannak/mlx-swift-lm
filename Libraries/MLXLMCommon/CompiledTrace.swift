@@ -4,6 +4,19 @@ import Foundation
 import MLX
 import MLXNN
 
+// MLX traces a compiled function once. Any MLXArray the body reads but does not
+// take as an argument becomes a constant of that trace, so weights read through
+// a captured module freeze at the values of the first call. Plain inference
+// never notices. An adapter load, fuse, or unload, or a training step, keeps
+// producing the old weights.
+//
+// MLX's stateless `compile` overloads take a `@Sendable` body. `MLXArray` and
+// `Module` are not `Sendable`, so that capture does not build. Bodies that read
+// weights use `CompiledTrace`, which declares them as compile state.
+//
+// `MLX.compile(inputs:outputs:)` takes any body: declaring captured state there
+// is correct, and it remains the way to compile a training step.
+
 /// A compiled trace of a body that reads module weights.
 ///
 /// The declared modules' weights become compile `inputs:`, so every call reads
@@ -93,6 +106,7 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
         self(owner, [argument])[0]
     }
 
+    // Not `@Sendable`: the trace captures its owner, a module.
     private func compiled(_ owner: Owner) -> ([MLXArray]) -> [MLXArray] {
         let body = self.body
 

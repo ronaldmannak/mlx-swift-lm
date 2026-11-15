@@ -67,7 +67,13 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.33.0")),
+        // PicoMLX fork only: mlx-swift main built against PicoMLX/mlx pico/integration
+        // (MLX main plus the ring's source-IP binding, argpartition, left_padding and
+        // kv_offsets), with MLXFast.scaledDotProductAttention(leftPadding:). PicoCore
+        // must name the same URL and branch.
+        .package(
+            url: "https://github.com/PicoMLX/mlx-swift",
+            branch: "pico/integration"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
@@ -181,6 +187,19 @@ let package = Package(
             ],
             path: "Libraries/MLXScriptedLM",
             exclude: ["README.md"]
+        ),
+        // PicoMLX fork only: one rank of the two-rank tensor-parallel decode check that
+        // Tests/ShardedDecodeParity/run.sh launches.
+        .executableTarget(
+            name: "ShardedDecodeParity",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/ShardedDecodeParity",
+            exclude: ["run.sh"]
         ),
         .testTarget(
             name: "MLXLMTests",

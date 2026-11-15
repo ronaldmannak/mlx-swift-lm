@@ -788,6 +788,13 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     /// Records a token included in the generated completion.
     mutating func recordEmittedToken(_ token: Int)
     mutating func discardGeneratedToken()
+
+    /// Waits for the work this iterator submitted. The generation loop calls this
+    /// before it completes.
+    ///
+    /// The default waits for the current default stream and the GPU and CPU
+    /// streams. An iterator that submits work on other streams waits for them too.
+    func synchronizeGeneration()
 }
 
 /// Internal lifecycle capability for iterators that retain generation work
@@ -804,6 +811,10 @@ extension TokenIteratorProtocol {
     public var reasoningTokenCount: Int? { nil }
     public mutating func recordEmittedToken(_ token: Int) {}
     public mutating func discardGeneratedToken() {}
+
+    public func synchronizeGeneration() {
+        GenerationStreamTracker().synchronize()
+    }
 }
 
 /// Normalized logits shared by reporting and filtered sampling.
@@ -956,6 +967,14 @@ public struct DeferredTokenLogProbabilities {
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
 public struct TokenIterator: TokenIteratorProtocol {
+    /// The streams prefill and decode ran on, which can differ from the loop's.
+    private let generationStreams = GenerationStreamTracker()
+
+    public func synchronizeGeneration() {
+        generationStreams.capture()
+        generationStreams.synchronize()
+    }
+
     let model: any LanguageModel
     let cacheEvaluationPolicy: KVCacheEvaluationPolicy
 
@@ -1232,6 +1251,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
+        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -1308,6 +1328,13 @@ extension TokenIterator: GenerationFinalizingTokenIterator {
 ///
 /// Port of `speculative_generate_step()` from https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 public struct SpeculativeTokenIterator: TokenIteratorProtocol {
+    /// The streams prefill and decode ran on, which can differ from the loop's.
+    private let generationStreams = GenerationStreamTracker()
+
+    public func synchronizeGeneration() {
+        generationStreams.capture()
+        generationStreams.synchronize()
+    }
 
     var y: LMInput.Text
     var draftY: LMInput.Text
@@ -1745,6 +1772,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
+        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -1990,9 +2018,9 @@ private func runSynchronousGenerationLoop(
 
     // TokenIterator uses `asyncEval()` to keep the pipeline full. If the caller
     // exits the program right away, those tasks will still be executing and will
-    // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
-    // to make sure it is complete.
-    Stream.defaultStream.synchronize()
+    // hit assertions as the mlx scheduler is torn down. Synchronize with the streams
+    // the iterator used to make sure it is complete.
+    iterator.synchronizeGeneration()
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
@@ -2488,7 +2516,7 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
 /// ``ModelConfiguration/reasoningConfig``, and then only its tail: a prefilled
 /// delimiter is the last thing a generation prompt writes, so copying a long prompt
 /// out of its `MLXArray` to read the final few tokens would cost more than it saves.
-func promptPrimesReasoning(
+public func promptPrimesReasoning(
     input: LMInput, modelConfiguration: ModelConfiguration, tokenizer: Tokenizer
 ) -> Bool {
     guard let config = modelConfiguration.reasoningConfig else { return false }
@@ -2961,8 +2989,9 @@ private func generateLoopTask<
             // `while let token = iterator.next()` form) allowed one extra asyncEval to be
             // submitted post-cancellation, which faults if the app has backgrounded
             // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted). The
-            // post-loop block below assigns `.cancelled`; the captured execution stream still
-            // settles any in-flight evaluation at the end of the task body.
+            // post-loop block below assigns `.cancelled`; the captured execution stream and
+            // iterator.synchronizeGeneration() still
+            // settle any in-flight evaluation at the end of the task body.
             tokenLoop: while !Task.isCancelled {
                 if let steering, handler.canEndForSteering, steering.requestsEarlyBoundary {
                     stopReason = .steered
@@ -3087,8 +3116,10 @@ private func generateLoopTask<
             )
             _ = continuation.yield(handler.infoEvent(info))
 
-            // Synchronize with the stream to ensure tasks are completed
+            // Synchronize with the stream and the iterator's streams to ensure tasks are
+            // completed
             executionStream.synchronize()
+            iterator.synchronizeGeneration()
 
             let result = tokenCollector.result(iterator: iterator)
 

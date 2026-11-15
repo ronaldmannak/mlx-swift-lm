@@ -167,7 +167,7 @@ public class Gemma2ModelInner: Module {
         var h = embedTokens(inputs)
         h = h * hiddenScale
 
-        // One materialized mask shared by every layer, as in mlx-lm gemma2.py.
+        // The cache builds the mask, so a batched cache masks each row's left padding.
         let mask = createAttentionMask(h: h, cache: cache?.first, returnArray: true)
 
         for (i, layer) in layers.enumerated() {
