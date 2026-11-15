@@ -184,12 +184,34 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        if n == 1, !hasLeftPadding, windowSize.map({ $0 >= offset + n }) ?? true {
+        let windowCoversKeys = windowSize.map({ $0 >= offset + n }) ?? true
+        if n == 1, !hasLeftPadding, windowCoversKeys {
             return .none
         }
-        return .array(
-            createCausalMask(
-                n: n, offset: offset, windowSize: windowSize, leftPadding: leftPadding))
+        let mask = createCausalMask(
+            n: n, offset: offset, windowSize: windowSize, leftPadding: leftPadding)
+        if windowCoversKeys {
+            PaddingMasks.shared.record(
+                mask, offset: offset, n: n, leftPadding: leftPaddingValues)
+        }
+        return .array(mask)
+    }
+
+    /// The left padding to pass to the attention kernel in place of `mask`, or `nil`
+    /// when `mask` must be applied as given.
+    ///
+    /// A model builds its mask once, from one layer's cache, and hands it to every
+    /// layer. When that mask came from ``makeMask(n:windowSize:returnArray:)`` with no
+    /// window cutting keys, and this cache has the same padding and offset, the
+    /// mask says nothing beyond causality and this cache's ``leftPadding``. Rows
+    /// whose padding reaches into the new queries are left to the mask: the kernel
+    /// does not accept them.
+    func leftPaddingForAttention(mask: MLXArray, n: Int) -> MLXArray? {
+        guard let maxPadding = leftPaddingValues.max(), maxPadding <= offset,
+            PaddingMasks.shared.matches(
+                mask, offset: offset, n: n, leftPadding: leftPaddingValues)
+        else { return nil }
+        return leftPadding
     }
 
     /// Prepares a right-padded prefill of rows with the given lengths.
@@ -475,4 +497,39 @@ func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArray {
     // Adding `n` keeps the index non-negative for negative shifts.
     let indices = ((positions - shifts.reshaped(shiftShape)) % size + size) % size
     return takeAlong(x, indices.asType(.int32), axis: axis)
+}
+
+/// The masks ``BatchKVCache`` built from causality and left padding alone, so that
+/// attention in any layer can tell them from masks that also apply a window.
+///
+/// Entries hold their masks weakly and drop out once a forward pass releases them.
+private final class PaddingMasks: @unchecked Sendable {
+    static let shared = PaddingMasks()
+
+    private struct Entry {
+        weak var mask: MLXArray?
+        let offset: Int
+        let n: Int
+        let leftPadding: [Int32]
+    }
+
+    private let lock = NSLock()
+    private var entries: [ObjectIdentifier: Entry] = [:]
+
+    func record(_ mask: MLXArray, offset: Int, n: Int, leftPadding: [Int32]) {
+        lock.withLock {
+            entries = entries.filter { $0.value.mask != nil }
+            entries[ObjectIdentifier(mask)] = Entry(
+                mask: mask, offset: offset, n: n, leftPadding: leftPadding)
+        }
+    }
+
+    func matches(_ mask: MLXArray, offset: Int, n: Int, leftPadding: [Int32]) -> Bool {
+        lock.withLock {
+            guard let entry = entries[ObjectIdentifier(mask)], entry.mask === mask else {
+                return false
+            }
+            return entry.offset == offset && entry.n == n && entry.leftPadding == leftPadding
+        }
+    }
 }

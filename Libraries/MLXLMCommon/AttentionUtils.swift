@@ -163,6 +163,16 @@ public func attentionWithCacheUpdate(
             bits: quantizedKVCache.bits,
             mode: quantizedKVCache.mode
         )
+    } else if let batch = cache as? BatchKVCache, case .array(let maskArray) = mask,
+        let leftPadding = batch.leftPaddingForAttention(mask: maskArray, n: queries.dim(2))
+    {
+        // The mask only encodes causality and the batch's left padding: pass the
+        // padding counts, so the kernel can skip the padded keys instead of reading
+        // a mask.
+        let (cachedKeys, cachedValues) = batch.update(keys: keys, values: values)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+            leftPadding: leftPadding, causal: queries.dim(2) > 1)
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(
