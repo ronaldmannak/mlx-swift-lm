@@ -95,8 +95,13 @@ struct PicoBatchedHybridCacheTests {
         #expect((list[0] as? BatchKVCache)?.batchSize == 2)
         #expect((list[0] as? BatchKVCache)?.offset == 0)
 
+        // A quantized child batches on its own type; a TurboQuant child cannot batch.
+        let quantized = try CacheList.merge([CacheList(KVCacheSimple(), QuantizedKVCache())])
+        #expect(quantized[1] is BatchQuantizedKVCache)
         #expect(throws: KVCacheError.self) {
-            _ = try CacheList.merge([CacheList(KVCacheSimple(), QuantizedKVCache())])
+            _ = try CacheList.merge([
+                CacheList(KVCacheSimple(), TurboQuantKVCache(bits: 4, keyBits: 0, valueBits: 4))
+            ])
         }
     }
 
