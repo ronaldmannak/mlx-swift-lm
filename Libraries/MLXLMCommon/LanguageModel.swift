@@ -475,6 +475,26 @@ public protocol ResumablePrefillModel: LanguageModel {
     func prefillChunk(_ prompt: LMInput.Text, range: Range<Int>, cache: [KVCache])
 }
 
+/// A ``LanguageModel`` whose decoder state can follow rows through batched decoding.
+///
+/// ``BatchTokenIterator`` carries model state for a single row unless the model conforms:
+/// arbitrary per-request state cannot be merged or filtered without a model-specific contract.
+/// A conforming model's state holds one entry per row in batch order, such as Qwen VL's rope
+/// deltas. Each request is prefilled alone; its state merges with the batch's when it joins,
+/// and the rows that stay are selected when others leave, with the same indices as the caches.
+public protocol BatchedGenerationStateProviding: LanguageModel {
+    /// One state for the rows of `states`, in order: `states[i]` covers `rowCounts[i]` rows,
+    /// and an empty state covers rows without decoder state, such as text-only prompts. State
+    /// used only during prefill is discarded. Returns an empty state when every part is empty.
+    func mergeGenerationStates(_ states: [LMOutput.State], rowCounts: [Int]) -> LMOutput.State
+
+    /// The state of the rows at `batchIndices`, in that order.
+    func selectGenerationState(_ state: LMOutput.State, batchIndices: MLXArray) -> LMOutput.State
+
+    /// The arrays of `state`, to evaluate with the batch's caches.
+    func generationStateArrays(_ state: LMOutput.State) -> [MLXArray]
+}
+
 /// Optional protocol that can be implemented by ``LanguageModel`` and will
 /// provide an automatic implementation of ``LanguageModel/newCache(parameters:)``
 public protocol KVCacheDimensionProvider {

@@ -572,6 +572,254 @@ struct QwenVLBatchedPositionTests {
 
 }
 
+/// The Qwen VL families whose image rows batch, as tiny random-weight models.
+enum QwenVLImageFamily: String, CaseIterable, Sendable {
+    case qwen2, qwen25, qwen3, qwen3MoE, qwen35, qwen35MoE
+
+    func model() throws -> any LanguageModel {
+        switch self {
+        case .qwen2: return try tinyQwenVLText(.qwen2)
+        case .qwen25: return try tinyQwenVLText(.qwen25)
+        case .qwen35, .qwen35MoE:
+            // Hybrid: linear-attention layers with a full-attention layer every second one.
+            let moe = self == .qwen35MoE
+            var text: [String: Any] = [
+                "model_type": moe ? "qwen3_5_moe" : "qwen3_5", "hidden_size": 64,
+                "num_hidden_layers": 4, "intermediate_size": 128, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 32, "vocab_size": 512,
+                "full_attention_interval": 2, "linear_num_value_heads": 4,
+                "linear_num_key_heads": 2, "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32, "linear_conv_kernel_dim": 4,
+                "max_position_embeddings": 4096,
+                "rope_parameters": [
+                    "type": "default", "mrope_section": [8, 4, 4], "rope_theta": 100000.0,
+                    "partial_rotary_factor": 1.0,
+                ],
+            ]
+            if moe {
+                // Both experts for every token: a top-1 choice between near-tied experts can
+                // flip under the GPU's batch rounding and change a row's output wholesale.
+                text["num_experts"] = 2
+                text["num_experts_per_tok"] = 2
+                text["moe_intermediate_size"] = 128
+                text["shared_expert_intermediate_size"] = 128
+            }
+            let configuration: [String: Any] = [
+                "model_type": moe ? "qwen3_5_moe" : "qwen3_5_vl", "image_token_id": 500,
+                "video_token_id": 501, "vision_start_token_id": 502,
+                "vision_end_token_id": 503, "vocab_size": 512, "text_config": text,
+                "vision_config": [
+                    "model_type": "qwen3_vl", "depth": 2, "hidden_size": 32,
+                    "intermediate_size": 64, "out_hidden_size": 64, "num_heads": 2,
+                    "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                    "num_position_embeddings": 64,
+                ],
+            ]
+            let config = try JSONDecoder().decode(
+                MLXVLM.Qwen35Configuration.self,
+                from: try JSONSerialization.data(withJSONObject: configuration))
+            let model: any LanguageModel = withRandomState(
+                MLXRandom.RandomState(seed: moe ? 922 : 921)
+            ) { moe ? MLXVLM.Qwen35MoE(config) : MLXVLM.Qwen35(config) }
+            model.train(false)
+            eval(model)
+            return model
+        case .qwen3, .qwen3MoE:
+            let moe = self == .qwen3MoE
+            let modelType = moe ? "qwen3_vl_moe" : "qwen3_vl"
+            var text: [String: Any] = [
+                "model_type": modelType, "hidden_size": 64, "num_hidden_layers": 2,
+                "intermediate_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "head_dim": 16, "vocab_size": 512, "max_position_embeddings": 4096,
+                "rms_norm_eps": 1e-6, "rope_theta": 100000.0,
+                "rope_scaling": ["type": "default", "mrope_section": [4, 2, 2]],
+            ]
+            if moe {
+                text["num_experts"] = 2
+                text["num_experts_per_tok"] = 1
+                text["decoder_sparse_step"] = 1
+                text["mlp_only_layers"] = [Int]()
+                text["moe_intermediate_size"] = 128
+                text["tie_word_embeddings"] = false
+            }
+            let configuration: [String: Any] = [
+                "model_type": modelType, "image_token_id": 500, "video_token_id": 501,
+                "vision_start_token_id": 502, "vision_end_token_id": 503, "vocab_size": 512,
+                "text_config": text,
+                "vision_config": [
+                    "model_type": "qwen3_vl", "depth": 2, "hidden_size": 32,
+                    "intermediate_size": 64, "out_hidden_size": 64, "num_heads": 2,
+                    "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                    "num_position_embeddings": 64, "deepstack_visual_indexes": [0, 1],
+                ],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: configuration)
+            let model: any LanguageModel =
+                moe
+                ? try withRandomState(MLXRandom.RandomState(seed: 920)) {
+                    Qwen3VLMoE(try JSONDecoder().decode(Qwen3VLMoEConfiguration.self, from: data))
+                }
+                : try withRandomState(MLXRandom.RandomState(seed: 919)) {
+                    Qwen3VL(try JSONDecoder().decode(Qwen3VLConfiguration.self, from: data))
+                }
+            model.train(false)
+            eval(model)
+            return model
+        }
+    }
+
+    /// Qwen 3.5's linear-attention layers use a Metal kernel, so its families run on the GPU,
+    /// where a batch's matmul shapes round differently from a single row's: every family here
+    /// differs from its single runs by 2e-3 to 7e-3 on the GPU (logits up to about 5), while
+    /// those that run on the CPU agree within 1e-4.
+    var device: Device { [.qwen35, .qwen35MoE].contains(self) ? .gpu : .cpu }
+    var logitTolerance: Float { device == .gpu ? 1e-2 : 1e-4 }
+
+    /// The image, vision-start and vision-end token ids of the family's configuration.
+    var imageTokens: (image: Int32, start: Int32, end: Int32) {
+        switch self {
+        case .qwen2, .qwen25: (60, 62, 63)
+        case .qwen3, .qwen3MoE, .qwen35, .qwen35MoE: (500, 502, 503)
+        }
+    }
+}
+
+@Suite(.serialized)
+struct QwenVLBatchedImageTests {
+    /// Image and text inputs of unequal lengths: image grids of 4 and 2 merged tokens. Tokens
+    /// are `[1, length]`, as the Qwen VL processors prepare them.
+    static func inputs(_ family: QwenVLImageFamily) -> [LMInput] {
+        let (pad, start, end) = family.imageTokens
+        func tokens(_ values: [Int32]) -> MLXArray { MLXArray(values).reshaped([1, -1]) }
+        func image(_ before: [Int32], pads: Int, after: [Int32], grid: THW, seed: UInt64)
+            -> LMInput
+        {
+            LMInput(
+                text: .init(
+                    tokens: tokens(
+                        before + [start] + [Int32](repeating: pad, count: pads) + [end] + after)),
+                image: .init(
+                    pixels: MLXRandom.normal(
+                        [grid.t * grid.h * grid.w, 3 * 2 * 16 * 16], key: MLXRandom.key(seed)),
+                    frames: [grid]))
+        }
+        return [
+            image([1], pads: 4, after: [2, 3], grid: THW(1, 4, 4), seed: 1),
+            LMInput(tokens: tokens([4, 5, 6])),
+            image([7, 8], pads: 2, after: [9, 10, 11, 12, 13], grid: THW(1, 2, 4), seed: 2),
+            LMInput(tokens: tokens((14 ..< 21).map { Int32($0) })),
+        ]
+    }
+
+    @Test(
+        "Qwen VL image and text rows decode as a batch like each row alone",
+        arguments: QwenVLImageFamily.allCases)
+    func rowsMatchSingles(family: QwenVLImageFamily) throws {
+        try Device.withDefaultDevice(family.device) {
+            let model = try family.model()
+            let stateModel = try #require(model as? any BatchedGenerationStateProviding)
+            let inputs = Self.inputs(family)
+            func prefill(_ input: LMInput) throws -> ([any KVCache], LMOutput.State) {
+                let cache = try model.newCache(parameters: nil)
+                guard
+                    case .logits(let output) = try model.prepare(
+                        input, cache: cache, state: nil, prefill: .init())
+                else {
+                    Issue.record("The model must complete its own prefill")
+                    return (cache, LMOutput.State())
+                }
+                eval(output.logits, cache)
+                return (cache, output.state ?? LMOutput.State())
+            }
+            // Each row continued alone, and separate prefills for the batch, whose caches it
+            // changes.
+            var singles = try inputs.map(prefill)
+            let joining = try inputs.map(prefill)
+            #expect(singles[0].1.isEmpty == false, "an image prefill leaves rope deltas")
+
+            var rows = [0, 1]
+            let batch = try singles[0].0.indices.map { layer in
+                try mergeCaches(rows.map { joining[$0].0[layer] })
+            }
+            var state = stateModel.mergeGenerationStates(
+                rows.map { joining[$0].1 }, rowCounts: [1, 1])
+            func check(_ step: Int) {
+                let token = Int32(30 + step)
+                let output = model.nextTokenLogits(
+                    .init(
+                        tokens: MLXArray([Int32](repeating: token, count: rows.count))
+                            .reshaped([rows.count, 1])),
+                    cache: batch, state: state)
+                state = output.state ?? LMOutput.State()
+                for (index, row) in rows.enumerated() {
+                    let expected = model.nextTokenLogits(
+                        .init(tokens: MLXArray([token]).reshaped([1, 1])), cache: singles[row].0,
+                        state: singles[row].1)
+                    singles[row].1 = expected.state ?? LMOutput.State()
+                    #expect(
+                        maxAbsDifference(output.logits[index ..< index + 1], expected.logits)
+                            < family.logitTolerance, "\(family), row \(row), step \(step)")
+                }
+            }
+            check(0)
+            check(1)
+            // Rows join while the others decode.
+            for row in [2, 3] {
+                for (layer, cache) in batch.enumerated() {
+                    cache.extend(other: try mergeCaches([joining[row].0[layer]]))
+                }
+                state = stateModel.mergeGenerationStates(
+                    [state, joining[row].1], rowCounts: [rows.count, 1])
+                rows.append(row)
+            }
+            check(2)
+            check(3)
+            // A row leaves; the others keep their own positions.
+            let keep = MLXArray([Int32(3), 0, 2])
+            batch.forEach { $0.filter(batchIndices: keep) }
+            state = stateModel.selectGenerationState(state, batchIndices: keep)
+            rows = [rows[3], rows[0], rows[2]]
+            check(4)
+            check(5)
+        }
+    }
+
+    @Test(
+        "Qwen VL image rows join a batch and decode the tokens they decode alone",
+        arguments: QwenVLImageFamily.allCases)
+    func iteratorRowsMatchSingles(family: QwenVLImageFamily) throws {
+        try Device.withDefaultDevice(family.device) {
+            let model = try family.model()
+            let inputs = Self.inputs(family)
+            let expected = try inputs.map { input in
+                Array(
+                    IteratorSequence(
+                        try TokenIterator(
+                            input: input, model: model, processor: nil, sampler: ArgMaxSampler(),
+                            prefill: .init(), maxTokens: 6)))
+            }
+
+            var iterator = BatchTokenIterator(model: model, maxTokens: 6)
+            var ids = iterator.insert(inputs: Array(inputs[0 ..< 2]))
+            var output = [Int: [Int]]()
+            var steps = 0
+            while let events = try iterator.next() {
+                for event in events {
+                    switch event {
+                    case .token(let id, let token): output[id, default: []].append(token)
+                    case .failed(let id, let error): Issue.record("row \(id): \(error)")
+                    case .prefill, .finished: break
+                    }
+                }
+                steps += 1
+                // Two more rows join while the first ones decode.
+                if steps == 2 { ids += iterator.insert(inputs: Array(inputs[2...])) }
+            }
+            #expect(ids.map { output[$0] ?? [] } == expected, "\(family)")
+        }
+    }
+}
+
 @Suite(.serialized)
 struct BatchedVLMPositionTests {
 

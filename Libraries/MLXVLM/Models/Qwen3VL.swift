@@ -1398,25 +1398,10 @@ enum Qwen3VLLanguage {
                         positionIds = tiled(positionIds!, repetitions: [3, batch, seqLength])
                     }
                 } else if let cache, let ropeDeltas = state[ropeDeltasKey] {
-                    let batch = (inputIds ?? inputEmbeddings!).dim(0)
-                    let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
-
-                    let lastCacheOffset = cache.last?.offset ?? 0
-
-                    var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
-
-                    var base = MLXArray(0 ..< seqLength).asType(.int32)
-                    base = base[.newAxis, 0...]
-                    base = broadcast(base, to: [batch, seqLength])
-
-                    if delta.dim(0) == 1 && batch > 1 {
-                        delta = repeated(delta, count: batch, axis: 0)
-                    }
-
-                    base = base + delta
-
-                    positionIds = base[.newAxis, 0..., 0...]
-                    positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
+                    let input = inputIds ?? inputEmbeddings!
+                    positionIds = QwenVL.decodePositionIds(
+                        cache: cache.last, ropeDeltas: ropeDeltas, batch: input.dim(0),
+                        length: input.dim(1))
                 }
             }
 
@@ -2086,4 +2071,22 @@ extension Qwen3VL {
     // Qwen3-VL shares Qwen's tags and tool-call boundary, but does not declare
     // the original Qwen3 family's model-specific hard-budget transition.
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+extension Qwen3VL: BatchedGenerationStateProviding {
+    public func mergeGenerationStates(_ states: [LMOutput.State], rowCounts: [Int])
+        -> LMOutput.State
+    {
+        QwenVL.mergeGenerationStates(states, rowCounts: rowCounts, key: ropeDeltasKey)
+    }
+
+    public func selectGenerationState(_ state: LMOutput.State, batchIndices: MLXArray)
+        -> LMOutput.State
+    {
+        QwenVL.selectGenerationState(state, batchIndices: batchIndices, key: ropeDeltasKey)
+    }
+
+    public func generationStateArrays(_ state: LMOutput.State) -> [MLXArray] {
+        [state[ropeDeltasKey]].compactMap { $0 }
+    }
 }

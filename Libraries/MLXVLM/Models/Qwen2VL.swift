@@ -156,8 +156,9 @@ private enum Language {
                 // MROPE path: compute 3D-aware cos/sin from position IDs
                 // #239: Qwen25VL.swift Attention.callAsFunction positionIds branch (:144)
                 let (cosValues, sinValues) = mropeCosSin(positionIds: positionIds, dtype: x.dtype)
-                let cos = cosValues[.newAxis, 0..., 0..., 0...]  // [1, batch, seq, dim]
-                let sin = sinValues[.newAxis, 0..., 0..., 0...]
+                // [batch, 1, seq, dim], broadcast over the heads of [batch, heads, seq, dim].
+                let cos = cosValues[0..., .newAxis, 0..., 0...]
+                let sin = sinValues[0..., .newAxis, 0..., 0...]
                 queries = (queries * cos) + (QwenVL.rotateHalf(queries) * sin)
                 keys = (keys * cos) + (QwenVL.rotateHalf(keys) * sin)
             } else {
@@ -302,28 +303,13 @@ private enum Language {
                 state[positionIdsKey] = nil
             }
 
-            // Decode steps: reconstruct positions from ropeDeltas + cache offset.
+            // Decode steps: reconstruct positions from ropeDeltas + each row's cache offset.
             if effectivePositionIds == nil, let ropeDeltas = state[ropeDeltasKey],
                 let cache, let input = inputs ?? inputEmbedding
             {
-                let batch = input.dim(0)
-                let seqLength = input.dim(1)
-                let lastCacheOffset = cache.last?.offset ?? 0
-
-                var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
-
-                var base = MLXArray(0 ..< seqLength).asType(.int32)
-                base = base[.newAxis, 0...]
-                base = broadcast(base, to: [batch, seqLength])
-
-                if delta.dim(0) == 1 && batch > 1 {
-                    delta = repeated(delta, count: batch, axis: 0)
-                }
-
-                base = base + delta
-
-                effectivePositionIds = base[.newAxis, 0..., 0...]
-                effectivePositionIds = broadcast(effectivePositionIds!, to: [3, batch, seqLength])
+                effectivePositionIds = QwenVL.decodePositionIds(
+                    cache: cache.last, ropeDeltas: ropeDeltas, batch: input.dim(0),
+                    length: input.dim(1))
             }
 
             var out = model(
@@ -1217,6 +1203,24 @@ public struct Qwen2VLConfiguration: Codable, Sendable {
         // these are overlaid in the top level
         self.textConfiguration = try TextConfiguration(from: decoder)
         self.baseConfiguration = try BaseConfiguration(from: decoder)
+    }
+}
+
+extension Qwen2VL: BatchedGenerationStateProviding {
+    public func mergeGenerationStates(_ states: [LMOutput.State], rowCounts: [Int])
+        -> LMOutput.State
+    {
+        QwenVL.mergeGenerationStates(states, rowCounts: rowCounts, key: ropeDeltasKey)
+    }
+
+    public func selectGenerationState(_ state: LMOutput.State, batchIndices: MLXArray)
+        -> LMOutput.State
+    {
+        QwenVL.selectGenerationState(state, batchIndices: batchIndices, key: ropeDeltasKey)
+    }
+
+    public func generationStateArrays(_ state: LMOutput.State) -> [MLXArray] {
+        [state[ropeDeltasKey]].compactMap { $0 }
     }
 }
 
