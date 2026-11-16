@@ -349,9 +349,18 @@ extension KVCacheLeaf {
         let state = cache.innerState()
         let kind = CacheLayerKind(cache: cache)
         guard isAttentionCache else {
+            var fixedBytes = state.reduce(0) { $0 + $1.nbytes }
+            // A rewindable convolution's history keeps growing after the probe, up to
+            // `stateLength + rollbackCapacity` rows.
+            if let convolution = cache as? RewindableConvolutionCache,
+                let history = convolution[1], history.ndim == 3, history.dim(1) > 0
+            {
+                let rows = convolution.stateLength + convolution.rollbackCapacity
+                fixedBytes += history.nbytes / history.dim(1) * max(0, rows - history.dim(1))
+            }
             return .init(
                 path: path, kind: kind, strategy: nil, bytesPerToken: 0,
-                fixedBytes: state.reduce(0) { $0 + $1.nbytes }, capacity: nil)
+                fixedBytes: fixedBytes, capacity: nil)
         }
 
         let capacity =

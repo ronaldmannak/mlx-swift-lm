@@ -210,6 +210,23 @@ import Testing
         }
     }
 
+    @Test func rewindableConvolutionHistoryIsCounted() throws {
+        // The probe records two history rows; generation fills the whole rewind window.
+        let model = LFM2Model(
+            try decode(
+                LFM2Configuration.self,
+                """
+                {
+                    "hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2,
+                    "num_key_value_heads": 1, "norm_eps": 1e-5, "vocab_size": 32,
+                    "layer_types": ["conv", "conv"], "conv_L_cache": 3,
+                    "block_ff_dim": 32, "block_multiple_of": 16, "block_auto_adjust_ff_dim": false
+                }
+                """))
+        let estimate = try expectEstimateMatchesGeneration(model, parameters: .init())
+        #expect(estimate.layers.allSatisfy { $0.bytesPerToken == 0 && $0.fixedBytes > 0 })
+    }
+
     @Test func latentAttentionMatchesGeneration() throws {
         try expectEstimateMatchesGeneration(deepseekV2(), parameters: .init())
     }
