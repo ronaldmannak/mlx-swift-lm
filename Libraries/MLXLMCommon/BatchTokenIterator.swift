@@ -459,6 +459,7 @@ public struct BatchTokenIterator {
     ///
     /// This also works after removing every row. It leaves queued prompts and lazy cache
     /// snapshots alone. Call it on the same model executor that drives ``next()``.
+    /// Work submitted independently by a model before its `prepare` throws can remain in flight.
     public mutating func synchronizeGeneration() {
         guard let submittedWork else { return }
         eval(submittedWork)
