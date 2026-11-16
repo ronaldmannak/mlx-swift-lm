@@ -221,10 +221,23 @@ public class BaichuanM1ModelInner: Module {
     ) -> MLXArray {
         var x = embedTokens(inputs)
 
-        let mask = mask ?? createAttentionMask(h: x, cache: cache?.first)
+        // As mlx-lm: one mask per attention kind, from that kind's first attention cache.
+        let swaLayers = Set(args.slidingWindowLayers)
+        func attentionCache(_ index: Int?) -> KVCache? {
+            index.flatMap { (cache?[$0] as? CacheList)?[1] }
+        }
+        let globalMask =
+            mask
+            ?? createAttentionMask(
+                h: x, cache: attentionCache(layers.indices.first { !swaLayers.contains($0) }))
+        let swaMask =
+            mask
+            ?? createAttentionMask(
+                h: x, cache: attentionCache(layers.indices.first { swaLayers.contains($0) }),
+                windowSize: args.slidingWindow)
 
         for (i, layer) in layers.enumerated() {
-            x = layer(x, mask: mask, cache: cache?[i])
+            x = layer(x, mask: swaLayers.contains(i) ? swaMask : globalMask, cache: cache?[i])
         }
 
         return norm(x)
