@@ -1,17 +1,11 @@
 // Copyright © 2026 Apple Inc.
 
-import MLX
-
 /// A classified leaf in a potentially nested cache topology.
 struct KVCacheLeaf {
     enum Kind {
         case recurrent
         case rotating(RotatingKVCache)
         case simple(KVCacheSimple)
-        /// Full-precision rows of a batch; never rewritten to a compressed form.
-        case batched(BatchKVCache)
-        /// Full-precision rows of a batch, each a sliding window.
-        case batchedRotating(BatchRotatingKVCache)
         /// Packed affine rows of a batch; never rewritten to another strategy.
         case batchedAffine
         case affine(QuantizedKVCache)
@@ -31,8 +25,6 @@ struct KVCacheLeaf {
         case let cache as VarianceNormalizedKVCache: .varianceNormalized(cache)
         case let cache as QuantizedKVCache: .affine(cache)
         case let cache as KVCacheSimple: .simple(cache)
-        case let cache as BatchKVCache: .batched(cache)
-        case let cache as BatchRotatingKVCache: .batchedRotating(cache)
         case is BatchQuantizedKVCache: .batchedAffine
         default: .unsupported
         }
@@ -41,15 +33,6 @@ struct KVCacheLeaf {
     var isAttentionCache: Bool {
         if case .recurrent = kind { return false }
         return true
-    }
-
-    /// Logical row positions for storage adoption and consistency audits only.
-    /// Reading batched positions may synchronize; decode keeps its own timeline.
-    var logicalPositions: [Int] {
-        if let batch = cache as? any BatchPositionedKVCache {
-            return batch.batchOffset.asArray(Int.self)
-        }
-        return [cache.offset]
     }
 
     var isCompressed: Bool {
@@ -69,9 +52,7 @@ struct KVCacheLeaf {
     var participatesInTurboQuantBoundaryProtection: Bool {
         switch kind {
         case .simple, .affine, .turboQuant: true
-        case .recurrent, .rotating, .batched, .batchedRotating, .batchedAffine,
-            .varianceNormalized, .unsupported:
-            false
+        case .recurrent, .rotating, .batchedAffine, .varianceNormalized, .unsupported: false
         }
     }
 
@@ -85,7 +66,7 @@ struct KVCacheLeaf {
         switch kind {
         case .recurrent:
             return nil
-        case .rotating, .batched, .batchedRotating, .unsupported:
+        case .rotating, .unsupported:
             return strategy == .fullPrecision
         case .simple(let simple):
             let state = simple.innerState()

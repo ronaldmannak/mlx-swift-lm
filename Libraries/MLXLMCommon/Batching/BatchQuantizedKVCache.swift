@@ -24,6 +24,9 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
         set { storage.offset = newValue }
     }
 
+    /// The logical position for cache progress, excluding unused left padding.
+    var logicalOffset: Int { Int(max(0, positions.max() ?? 0)) }
+
     public var batchOffset: MLXArray {
         if let positionsArray { return positionsArray }
         let array = MLXArray(positions)
