@@ -47,6 +47,8 @@ public struct BatchRowCacheSnapshot {
     public let snapshot: PromptCacheSnapshot
 
     /// Positions fed to the model, including the inferred prefix of a supplied cache.
+    /// The prefix uses the smallest attention-cache offset, or the smallest cache offset
+    /// when there is no attention cache.
     /// A stop token that reached the model is included. The sampled successor is not.
     public let processedPositionCount: Int
 }

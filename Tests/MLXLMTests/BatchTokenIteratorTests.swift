@@ -1253,8 +1253,10 @@ struct BatchTokenIteratorTests {
         }
     }
 
-    @Test("A captured row with a reused prefix resumes like uninterrupted generation")
-    func captureFinishedCacheAndResume() throws {
+    @Test(
+        "A captured row with a reused prefix resumes like uninterrupted generation",
+        arguments: [1, PrefillParameters.defaultStepSize])
+    func captureFinishedCacheAndResume(stepSize: Int) throws {
         try Device.withDefaultDevice(.cpu) {
             let model = tinyLlama()
             let prefix: [Int] = [1, 2]
@@ -1266,16 +1268,26 @@ struct BatchTokenIteratorTests {
             let seed = try model.newCache(parameters: nil)
             eval(model(MLXArray(prefix.map(Int32.init))[.newAxis], cache: seed))
 
-            var iterator = BatchTokenIterator(model: model, maxTokens: 6)
+            var iterator = BatchTokenIterator(
+                model: model, maxTokens: 6, prefill: .init(stepSize: stepSize))
             let id = iterator.insert(prompt: suffix, maxTokens: split, cache: seed)
-            _ = iterator.insert(prompt: Self.prompts[1])
+            let companion = iterator.insert(prompt: [6])
+            var progress: [Int] = []
             var emitted: [Int] = []
             var captured: [BatchRowCacheSnapshot] = []
             while let step = try iterator.next(capturingFinalCachesFor: [id]) {
+                for case .prefill(let rowID, let processed, _) in step.events where rowID == id {
+                    progress.append(processed)
+                }
+                if !step.caches.isEmpty {
+                    #expect(iterator.ids == [companion])
+                    #expect(iterator.pendingIDs.isEmpty)
+                }
                 emitted += tokens(step.events.filter { $0.id == id })
                 captured += step.caches
             }
 
+            #expect(progress == (stepSize == 1 ? [1, 2, 3] : [3]))
             let row = try #require(captured.first)
             #expect(captured.map(\.id) == [id])
             #expect(row.processedPositionCount == prompt.count + split)
