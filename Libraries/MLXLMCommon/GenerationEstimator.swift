@@ -336,7 +336,7 @@ extension KVCacheLeaf {
     fileprivate var strategy: KVCacheStrategyIdentifier? {
         switch kind {
         case .simple, .rotating: .fullPrecision
-        case .affine: .affine
+        case .affine, .batchedAffine: .affine
         case .turboQuant: .turboQuant
         case .varianceNormalized: .varianceNormalized
         case .recurrent, .unsupported: nil
