@@ -384,12 +384,14 @@ package final class KVCacheStorage {
 
     /// One-time compatibility inference for caches created outside the shared
     /// container API. Hot generation and reuse paths never scan child caches.
-    private static func inferProcessedTokenCount(from cache: [KVCache]) -> Int {
+    static func inferProcessedTokenCount(
+        from cache: [KVCache], assertAlignedOffsets: Bool = true
+    ) -> Int {
         let leaves = KVCacheTree.leaves(in: cache)
         let attentionOffsets = leaves.filter(\.isAttentionCache).map { attentionOffset($0.cache) }
         if let inferred = attentionOffsets.min() {
             assert(
-                attentionOffsets.allSatisfy { $0 == inferred },
+                !assertAlignedOffsets || attentionOffsets.allSatisfy { $0 == inferred },
                 "Attention cache offsets diverged before storage adoption")
             return inferred
         }
@@ -399,7 +401,7 @@ package final class KVCacheStorage {
         let legacyOffsets = leaves.map { $0.cache.offset }
         let inferred = legacyOffsets.min() ?? 0
         assert(
-            legacyOffsets.allSatisfy { $0 == inferred },
+            !assertAlignedOffsets || legacyOffsets.allSatisfy { $0 == inferred },
             "Recurrent cache offsets diverged before storage adoption")
         return inferred
     }
