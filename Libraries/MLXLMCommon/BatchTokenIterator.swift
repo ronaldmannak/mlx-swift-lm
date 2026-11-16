@@ -195,6 +195,8 @@ public struct BatchTokenIterator {
     private var batchCacheNeedsTrim = false
     /// The tokens the next step feeds: each row's sampled token.
     private var nextTokens: MLXArray?
+    /// Covers submitted work even after its rows are removed.
+    private var submittedWork: MLXArray?
     private var state: LMOutput.State?
     private var invalidatedByModelState = false
     /// `.failed` events from a ``next()`` call that then threw, returned by the next call.
@@ -453,6 +455,16 @@ public struct BatchTokenIterator {
         return (events, snapshots)
     }
 
+    /// Waits for the iterator's submitted prefill and decode work before handing off execution.
+    ///
+    /// This also works after removing every row. It leaves queued prompts and lazy cache
+    /// snapshots alone. Call it on the same model executor that drives ``next()``.
+    public mutating func synchronizeGeneration() {
+        guard let submittedWork else { return }
+        eval(submittedWork)
+        self.submittedWork = nil
+    }
+
     private mutating func next(
         capturingFinalCachesFor ids: Set<Int>, into snapshots: inout [BatchRowCacheSnapshot]
     ) throws -> [BatchEvent]? {
@@ -557,9 +569,7 @@ public struct BatchTokenIterator {
                     // Submit this chunk, even for a model that leaves its cache writes lazy,
                     // then wait for the previous one: the CPU builds the next chunk's graph
                     // while the GPU evaluates this one, with at most two chunks in flight.
-                    let state = resume.cache.flatMap { $0.innerState() }
-                    let marker = Self.chunkMarker(state)
-                    asyncEval(state + [marker])
+                    let marker = submit(resume.cache.flatMap { $0.innerState() })
                     if let previous = resume.submitted { eval(previous) }
                     resume.submitted = marker
                     // As PrefillParameters.forEachChunk does after each chunk.
@@ -588,19 +598,19 @@ public struct BatchTokenIterator {
         }
     }
 
-    /// A small array of its own that is ready once the chunk's cache writes, `state`, are: the
-    /// first element of the last one, copied. It is evaluated in the same `asyncEval` as
-    /// `state`, on the same stream, and MLX gives every array of one async evaluation on a
-    /// stream the same event, signaled after all of that evaluation's work there, so waiting
-    /// on the marker waits on every write. One element keeps it to a few ops per chunk. It
-    /// must not be a view of a cache buffer, which would keep the buffer alive and stop the
-    /// next chunk from writing it in place (MLX returns its input from a reduction over one
-    /// element, and from a concatenation of one array, so a constant element makes the
-    /// concatenation copy).
-    private static func chunkMarker(_ state: [MLXArray]) -> MLXArray {
-        guard let last = state.last else { return MLXArray.zeros([1]) }
-        let element = last.reshaped([-1])[..<1]
-        return concatenated([element, MLXArray.zeros([1], dtype: element.dtype)])
+    @discardableResult
+    private mutating func submit(_ outputs: [MLXArray]) -> MLXArray {
+        // Give the marker the current stream and its own tiny backing buffer. Include
+        // the previous marker so this one still covers work submitted on other streams.
+        let placeholder = MLXArray(Int32(0)).expandedDimensions(axis: 0)
+        var dependencies = outputs
+        if let submittedWork { dependencies.append(submittedWork) }
+        let marker =
+            dependencies.isEmpty
+            ? placeholder : depends(input: placeholder, dependencies: dependencies)
+        asyncEval(outputs + [marker])
+        submittedWork = marker
+        return marker
     }
 
     /// Feeds every row its next token and reports the tokens, finishing the rows that end.
@@ -708,22 +718,21 @@ public struct BatchTokenIterator {
             model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
             maxTokens: maxTokens, prefill: prefill)
         batch.rows = admitted.map(\.row)
-        batch.cache = merged
-        batch.state = admittedState
-        batch.nextTokens = batch.sampleNext(concatenated(admitted.map(\.logits)))
+        let sampled = batch.sampleNext(concatenated(admitted.map(\.logits)))
+        submit([sampled] + merged.flatMap { $0.state })
 
         if rows.isEmpty {
             rows = batch.rows
-            cache = batch.cache
-            nextTokens = batch.nextTokens
-            state = batch.state
+            cache = merged
+            nextTokens = sampled
+            state = admittedState
         } else {
-            for (layer, added) in zip(cache, batch.cache) {
+            for (layer, added) in zip(cache, merged) {
                 layer.extend(other: added)
             }
             batchCacheNeedsTrim = shouldClearCacheAfterBatchResize != nil
             rows += batch.rows
-            nextTokens = concatenated([nextTokens!, batch.nextTokens!])
+            nextTokens = concatenated([nextTokens!, sampled])
         }
         return []
     }
@@ -855,7 +864,10 @@ public struct BatchTokenIterator {
             throw StateError.invalidatedByModelState
         }
         state = output.state
-        nextTokens = sampleNext(output.logits[0..., -1, 0...])
+        let sampled = sampleNext(output.logits[0..., -1, 0...])
+        // Settle the cache with the token so lazy cache updates do not accumulate.
+        submit([sampled] + cache.flatMap { $0.state })
+        nextTokens = sampled
         return current.asArray(Int32.self).map { Int($0) }
     }
 
@@ -874,9 +886,6 @@ public struct BatchTokenIterator {
         for index in rows.indices {
             rows[index].processor?.didSample(token: sampled[index ..< index + 1])
         }
-        // The cache state settles with the token, as TokenIterator does, so an unevaluated
-        // chain of updates never keeps earlier steps alive.
-        asyncEval([sampled] + cache.flatMap { $0.state })
         return sampled
     }
 
