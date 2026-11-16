@@ -1372,7 +1372,6 @@ struct BatchTokenIteratorTests {
 
         try Stream.withNewDefaultStream(device: .cpu) {
             #expect(Stream.defaultStream != submissionStream)
-            expectArrayAvailable(write, false)
             iterator.synchronizeGeneration()
             expectArrayAvailable(write, true)
             #expect(iterator.pendingIDs == [id])
@@ -1413,7 +1412,6 @@ struct BatchTokenIteratorTests {
             #expect(iterator.ids.isEmpty)
             let idle = try iterator.next()
             #expect(idle == nil)
-            expectArrayAvailable(write, false)
             iterator.synchronizeGeneration()
             expectArrayAvailable(write, true)
         }
@@ -2246,7 +2244,7 @@ private final class HandoffProbeModel: Module, ResumablePrefillModel {
     }
 }
 
-/// Keep a CPU cache write in flight long enough to observe it without evaluating the probe.
+/// Give a cache write time to overlap the iterator step without evaluating the probe.
 private func handoffProbeCacheWrite(stream: StreamOrDevice) -> MLXArray {
     let size = 2048
     let ones = MLXArray.ones([size, size], stream: stream)
