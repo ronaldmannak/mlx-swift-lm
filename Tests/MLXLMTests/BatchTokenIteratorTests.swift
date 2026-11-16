@@ -1145,6 +1145,67 @@ struct BatchTokenIteratorTests {
         }.value
     }
 
+    @Test("Handoff waits for a submitted prefill chunk and allows prefill to resume")
+    func handoffDuringPrefill() throws {
+        let model = HandoffProbeModel()
+        var iterator = BatchTokenIterator(
+            model: model, maxTokens: 2, prefill: PrefillParameters(stepSize: 2))
+        let id = iterator.insert(prompt: Array(1 ..< 8))
+        let (write, submissionStream) = try Stream.withNewDefaultStream(device: .cpu) {
+            let write = handoffProbeCacheWrite(stream: .default)
+            model.nextCacheWrite = write
+            let events = try iterator.next()
+            #expect(events?.map(describe) == ["prefill(\(id), 2/7)"])
+            return (write, Stream.defaultStream)
+        }
+
+        try Stream.withNewDefaultStream(device: .cpu) {
+            #expect(Stream.defaultStream != submissionStream)
+            iterator.synchronizeGeneration()
+            expectArrayAvailable(write, true)
+            #expect(iterator.pendingIDs == [id])
+
+            var remaining: [String] = []
+            while let events = try iterator.next() {
+                remaining += events.map(describe)
+            }
+            #expect(
+                Array(remaining.prefix(3))
+                    == ["prefill(\(id), 4/7)", "prefill(\(id), 6/7)", "prefill(\(id), 7/7)"])
+            #expect(remaining.filter { $0 == "token(\(id), 0)" }.count == 2)
+            iterator.synchronizeGeneration()
+        }
+    }
+
+    @Test("Handoff waits for a cache update after the last decoding row is cancelled")
+    func handoffAfterCancellingLastRow() throws {
+        let model = HandoffProbeModel()
+        var iterator = BatchTokenIterator(model: model)
+        let id = iterator.insert(prompt: [1])
+        let cacheStream = Stream(.cpu)
+        let (write, submissionStream) = try Stream.withNewDefaultStream(device: .cpu) {
+            let prefill = try iterator.next()
+            #expect(prefill?.map(describe) == ["prefill(\(id), 1/1)"])
+            // The cache update runs independently of sampling on another stream.
+            let write = handoffProbeCacheWrite(stream: .stream(cacheStream))
+            model.nextCacheWrite = write
+            let decode = try iterator.next()
+            #expect(tokens(decode) == [0])
+            return (write, Stream.defaultStream)
+        }
+
+        try Stream.withNewDefaultStream(device: .cpu) {
+            #expect(Stream.defaultStream != submissionStream)
+            #expect(Stream.defaultStream != cacheStream)
+            iterator.remove([id])
+            #expect(iterator.ids.isEmpty)
+            let idle = try iterator.next()
+            #expect(idle == nil)
+            iterator.synchronizeGeneration()
+            expectArrayAvailable(write, true)
+        }
+    }
+
     @Test("Chunks written in place keep the cache's buffer: the chunk markers hold no view of it")
     func resumablePrefillReusesCacheBuffer() throws {
         let model = InPlaceChunkModel()
@@ -1925,6 +1986,54 @@ private final class LazyChunkModel: Module, ResumablePrefillModel {
     }
 }
 
+/// A model whose logits are independent of the work submitted for its recurrent cache.
+private final class HandoffProbeModel: Module, ResumablePrefillModel {
+    var nextCacheWrite: MLXArray?
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let tokens = input.tokens
+        if let cache { write(cache) }
+        return LMOutput(logits: MLXArray.zeros([tokens.dim(0), tokens.dim(-1), 8]))
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [ArraysCache(size: 1)] }
+
+    func prefillChunks(for prompt: LMInput.Text, prefill: PrefillParameters) -> [Range<Int>] {
+        prefill.chunkRanges(total: prompt.tokens.size)
+    }
+
+    func prefillChunk(_ prompt: LMInput.Text, range: Range<Int>, cache: [KVCache]) {
+        write(cache)
+    }
+
+    private func write(_ cache: [KVCache]) {
+        if let cache = cache[0] as? ArraysCache {
+            cache[0] = nextCacheWrite ?? MLXArray.zeros([1, 1])
+        }
+        nextCacheWrite = nil
+    }
+}
+
+/// Give a cache write time to overlap the iterator step without evaluating the probe.
+private func handoffProbeCacheWrite(stream: StreamOrDevice) -> MLXArray {
+    let size = 2048
+    let ones = MLXArray.ones([size, size], stream: stream)
+    let weights = MLX.divide(ones, MLXArray(Float(size)), stream: stream)
+    var product = ones
+    for _ in 0 ..< 4 {
+        product = MLX.matmul(product, weights, stream: stream)
+    }
+    return MLX.sum(product, keepDims: true, stream: stream)
+}
+
 /// The array convenience overload remains unimplemented, as on stateful VLM adapters.
 private final class BatchTextOnlyModel: Module, LanguageModel {
     private static let counterKey = LMOutput.Key<Int>("batch-test.counter")
@@ -2152,11 +2261,16 @@ private func expectEvaluatedBatchCache(
     let buffers = cache.innerState()
     try #require(buffers.count == 2, sourceLocation: sourceLocation)
     for buffer in buffers {
-        var available = false
-        #expect(
-            _mlx_array_is_available(&available, buffer.ctx) == 0, sourceLocation: sourceLocation)
-        #expect(available == evaluated, sourceLocation: sourceLocation)
+        expectArrayAvailable(buffer, evaluated, sourceLocation: sourceLocation)
     }
+}
+
+private func expectArrayAvailable(
+    _ array: MLXArray, _ expected: Bool, sourceLocation: SourceLocation = #_sourceLocation
+) {
+    var available = false
+    #expect(_mlx_array_is_available(&available, array.ctx) == 0, sourceLocation: sourceLocation)
+    #expect(available == expected, sourceLocation: sourceLocation)
 }
 
 /// The ids of the step's `.token` events, in batch order; empty for `nil`.
