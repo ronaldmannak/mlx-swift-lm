@@ -863,6 +863,43 @@ struct QwenVLBatchedImageTests {
             #expect(ids.map { output[$0] ?? [] } == expected, "\(family)")
         }
     }
+
+    @Test("Capturing Qwen VL image rows preserves their distinct RoPE deltas")
+    func capturedImageRowsPreserveState() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try QwenVLImageFamily.qwen25.model()
+            let stateModel = try #require(model as? any BatchedGenerationStateProviding)
+            let fixtures = Self.inputs(.qwen25)
+            let inputs = [fixtures[0], fixtures[2]]
+            let expected = try inputs.map { input in
+                let cache = try model.newCache(parameters: nil)
+                guard
+                    case .logits(let output) = try model.prepare(
+                        input, cache: cache, state: nil, prefill: .init())
+                else {
+                    Issue.record("An image prefill must produce logits")
+                    return [[Int32]]()
+                }
+                let state = try #require(output.state)
+                return stateModel.generationStateArrays(state).map { $0.asArray(Int32.self) }
+            }
+            try #require(expected[0] != expected[1])
+
+            var iterator = BatchTokenIterator(model: model, maxTokens: 1)
+            let ids = iterator.insert(inputs: inputs)
+            while let step = try iterator.next(capturingFinalCachesFor: Set(ids)) {
+                guard !step.caches.isEmpty else { continue }
+                #expect(step.caches.map(\.id) == ids)
+                let actual = try step.caches.map { captured in
+                    let state = try #require(captured.snapshot.state)
+                    return stateModel.generationStateArrays(state).map { $0.asArray(Int32.self) }
+                }
+                #expect(actual == expected)
+                return
+            }
+            Issue.record("Both finished image rows must yield a captured state")
+        }
+    }
 }
 
 @Suite(.serialized)
