@@ -37,6 +37,22 @@ public enum BatchEvent: Sendable {
     }
 }
 
+/// A row's cache, extracted before the iterator removes that row.
+///
+/// The snapshot can share native storage with the batch. Use it on the same
+/// model executor. The cache may retain less history than the position count,
+/// for example when an attention window has wrapped.
+public struct BatchRowCacheSnapshot {
+    public let id: Int
+    public let snapshot: PromptCacheSnapshot
+
+    /// Positions fed to the model, including the inferred prefix of a supplied cache.
+    /// The prefix uses the smallest attention-cache offset, or the smallest cache offset
+    /// when there is no attention cache.
+    /// A stop token that reached the model is included. The sampled successor is not.
+    public let processedPositionCount: Int
+}
+
 /// Tokens for a batch of prompts, decoded together, with rows joining and leaving at any step.
 ///
 /// The batched form of ``TokenIterator``: port of mlx-vlm's `BatchGenerator` and
@@ -134,11 +150,12 @@ public struct BatchTokenIterator {
         var sampler: LogitSampler
         var processor: LogitProcessor?
         let maxTokens: Int
+        var promptPositionCount = 0
         var generated = 0
     }
 
     private struct Pending {
-        let row: Row
+        var row: Row
         let prompt: [Int]
         let cache: [KVCache]?
         /// The row's prefill so far, for a ``ResumablePrefillModel``.
@@ -329,13 +346,28 @@ public struct BatchTokenIterator {
     /// Removing a row that ended in the last step finalizes its processor now instead of at the
     /// next ``next()``. Ids that were never inserted or are already finalized are ignored.
     public mutating func remove(_ ids: [Int]) {
+        _ = remove(ids, capturingFinalCachesFor: [])
+    }
+
+    /// Drops the indicated rows and captures selected decoding rows before removing them.
+    ///
+    /// Only IDs in both sets are eligible. Queued, partially prefilled, already ended,
+    /// and unknown rows yield no snapshot. Rows in a batch invalidated by a failed step
+    /// also yield no snapshot. Removal delivers no terminal event.
+    public mutating func remove(
+        _ ids: [Int], capturingFinalCachesFor captureIDs: Set<Int>
+    ) -> [BatchRowCacheSnapshot] {
         let removed = Set(ids)
+        var snapshots: [BatchRowCacheSnapshot] = []
         for item in pending where removed.contains(item.row.id) {
             var processor = item.row.processor
             processor?.finalizeGeneration()
         }
         pending.removeAll { removed.contains($0.row.id) }
         for index in rows.indices where removed.contains(rows[index].id) {
+            if !invalidatedByModelState && captureIDs.contains(rows[index].id) {
+                snapshots.append(captureRow(at: index))
+            }
             rows[index].processor?.finalizeGeneration()
         }
         let keep = rows.indices.filter { !removed.contains(rows[$0].id) }
@@ -351,6 +383,7 @@ public struct BatchTokenIterator {
         finalizeRemoved(&ended)
         finalizeRemoved(&undeliveredEnded)
         trimReplacedBatchCache()
+        return snapshots
     }
 
     /// Records that the caller delivered `token` from row `id`: forwards it to the row's
@@ -402,6 +435,27 @@ public struct BatchTokenIterator {
     ///   admission stops before any sampling or decoding, and the queued rows that have not
     ///   failed stay queued. `.failed` events from a throwing call are returned by the next one.
     public mutating func next() throws -> [BatchEvent]? {
+        var snapshots: [BatchRowCacheSnapshot] = []
+        return try next(capturingFinalCachesFor: [], into: &snapshots)
+    }
+
+    /// Advances the batch and captures selected rows that finish in this step.
+    ///
+    /// Snapshots are returned in batch order and only for selected `.finished` rows.
+    /// Like ``next()``, this returns `nil` when the iterator is idle.
+    public mutating func next(
+        capturingFinalCachesFor ids: Set<Int>
+    ) throws -> (events: [BatchEvent], caches: [BatchRowCacheSnapshot])? {
+        var snapshots: [BatchRowCacheSnapshot] = []
+        guard let events = try next(capturingFinalCachesFor: ids, into: &snapshots) else {
+            return nil
+        }
+        return (events, snapshots)
+    }
+
+    private mutating func next(
+        capturingFinalCachesFor ids: Set<Int>, into snapshots: inout [BatchRowCacheSnapshot]
+    ) throws -> [BatchEvent]? {
         // Let the step's temporary buffers go before trimming the allocator pool.
         defer { trimReplacedBatchCache() }
         finalizeEnded()
@@ -418,13 +472,13 @@ public struct BatchTokenIterator {
             guard !rows.isEmpty || !pending.isEmpty else { return nil }
 
             if let resumableModel {
-                return try resumableStep(resumableModel)
+                return try resumableStep(resumableModel, capturing: ids, into: &snapshots)
             }
             // Every queued row either fails here or joins the rows.
             var events = pending.isEmpty ? [] : try admit()
             if !rows.isEmpty {
                 do {
-                    events += try decode()
+                    events += try decode(capturing: ids, into: &snapshots)
                 } catch {
                     undelivered = events
                     undeliveredEnded = ending
@@ -442,13 +496,14 @@ public struct BatchTokenIterator {
     /// of the first queued row when due. The final chunk is the forward whose logits give the
     /// row's first sample; the row then joins the rows, and its first token comes with the
     /// next step.
-    private mutating func resumableStep(_ model: any ResumablePrefillModel) throws
-        -> [BatchEvent]
-    {
+    private mutating func resumableStep(
+        _ model: any ResumablePrefillModel, capturing ids: Set<Int>,
+        into snapshots: inout [BatchRowCacheSnapshot]
+    ) throws -> [BatchEvent] {
         var events: [BatchEvent] = []
         if !rows.isEmpty {
             do {
-                events = try decode()
+                events = try decode(capturing: ids, into: &snapshots)
             } catch {
                 undelivered = []
                 undeliveredEnded = ending
@@ -489,9 +544,7 @@ public struct BatchTokenIterator {
                 resume = started
             } else {
                 let rowCache = try rowCache(for: item, joining: [], admittedState: nil)
-                if let prefix = prefill.prefix {
-                    prefix(KVCacheStorage(rowCache, plan: .disabled).processedTokenCount)
-                }
+                item.row.promptPositionCount = promptPositionCount(for: item, cache: rowCache)
                 let prompt = LMInput.Text(tokens: MLXArray(item.prompt.map { Int32($0) }))
                 resume = Resume(
                     cache: rowCache, prompt: prompt,
@@ -551,30 +604,44 @@ public struct BatchTokenIterator {
     }
 
     /// Feeds every row its next token and reports the tokens, finishing the rows that end.
-    private mutating func decode() throws -> [BatchEvent] {
+    private mutating func decode(
+        capturing ids: Set<Int>, into snapshots: inout [BatchRowCacheSnapshot]
+    ) throws -> [BatchEvent] {
         let tokens = try step()
         var events: [BatchEvent] = []
         var keep: [Int] = []
         for (index, token) in tokens.enumerated() {
             let id = rows[index].id
+            rows[index].generated += 1
             if stopTokens.contains(token) {
                 events.append(.finished(id: id, reason: .stop, stopToken: token))
-                end(rows[index])
-                continue
-            }
-            rows[index].generated += 1
-            events.append(.token(id: id, token: token))
-            if rows[index].generated >= rows[index].maxTokens {
-                events.append(.finished(id: id, reason: .length, stopToken: nil))
-                end(rows[index])
             } else {
-                keep.append(index)
+                events.append(.token(id: id, token: token))
+                if rows[index].generated < rows[index].maxTokens {
+                    keep.append(index)
+                    continue
+                }
+                events.append(.finished(id: id, reason: .length, stopToken: nil))
             }
+            if ids.contains(id) {
+                snapshots.append(captureRow(at: index))
+            }
+            end(rows[index])
         }
         if keep.count < rows.count {
             filter(keeping: keep)
         }
         return events
+    }
+
+    private func captureRow(at index: Int) -> BatchRowCacheSnapshot {
+        let row = rows[index]
+        let snapshot = PromptCacheSnapshot(
+            cache: cache.map { $0.extract(index) },
+            state: rows.count == 1 ? state : nil)
+        return BatchRowCacheSnapshot(
+            id: row.id, snapshot: snapshot,
+            processedPositionCount: row.promptPositionCount + row.generated)
     }
 
     /// Prefills the queued prompts separately, in queue order, and joins the ones that can
@@ -680,9 +747,8 @@ public struct BatchTokenIterator {
         // lengths yet.
         let input = LMInput(tokens: MLXArray(item.prompt.map { Int32($0) }))
         let output: LMOutput
-        if let prefix = prefill.prefix {
-            prefix(KVCacheStorage(rowCache, plan: .disabled).processedTokenCount)
-        }
+        var item = item
+        item.row.promptPositionCount = promptPositionCount(for: item, cache: rowCache)
         switch try model.prepare(input, cache: rowCache, state: nil, prefill: prefill) {
         case .tokens(let remainder):
             output = model.nextTokenLogits(remainder[text: .newAxis], cache: rowCache, state: nil)
@@ -694,6 +760,18 @@ public struct BatchTokenIterator {
             output = prepared
         }
         return try joinable(item, cache: rowCache, output: output, joining: admitted)
+    }
+
+    private func promptPositionCount(for item: Pending, cache: [KVCache]) -> Int {
+        // Raw batch admission permits independent layer offsets. Keep the
+        // alignment check when the caller requests the existing prefix callback.
+        let prefix =
+            item.cache != nil || prefill.prefix != nil
+            ? KVCacheStorage.inferProcessedTokenCount(
+                from: cache, assertAlignedOffsets: prefill.prefix != nil)
+            : 0
+        prefill.prefix?(prefix)
+        return prefix + item.prompt.count
     }
 
     /// The cache a queued row is prefilled into: a copy of its supplied cache, or a fresh one,

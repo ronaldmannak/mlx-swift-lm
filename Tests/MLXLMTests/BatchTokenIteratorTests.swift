@@ -1234,6 +1234,158 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("A supplied cache can have independent layer offsets")
+    func capturedPrefixWithIndependentLayerOffsets() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = BatchTextOnlyModel(
+                preparation: .tokens, cacheFactory: { [KVCacheSimple(), KVCacheSimple()] })
+            let seed = try model.newCache(parameters: nil)
+            for (layer, length) in zip(seed, [2, 3]) {
+                let keys = MLXArray.zeros([1, 1, length, 1], dtype: .float32)
+                _ = layer.update(keys: keys, values: keys)
+            }
+            var iterator = BatchTokenIterator(model: model)
+            let id = iterator.insert(prompt: [7], cache: seed)
+            #expect(tokens(try iterator.next()) == [8])
+            let row = try #require(iterator.remove([id], capturingFinalCachesFor: [id]).first)
+            #expect(row.processedPositionCount == 4)
+            #expect(row.snapshot.cache.map(\.offset) == [4, 5])
+        }
+    }
+
+    @Test(
+        "A captured row with a reused prefix resumes like uninterrupted generation",
+        arguments: [1, PrefillParameters.defaultStepSize])
+    func captureFinishedCacheAndResume(stepSize: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            let prefix: [Int] = [1, 2]
+            let suffix: [Int] = [3, 4, 5]
+            let prompt = prefix + suffix
+            let split = 3
+            let expected = try generateAlone(
+                model, prompt: prompt, sampler: ArgMaxSampler(), maxTokens: 6)
+            let seed = try model.newCache(parameters: nil)
+            eval(model(MLXArray(prefix.map(Int32.init))[.newAxis], cache: seed))
+
+            var iterator = BatchTokenIterator(
+                model: model, maxTokens: 6, prefill: .init(stepSize: stepSize))
+            let id = iterator.insert(prompt: suffix, maxTokens: split, cache: seed)
+            let companion = iterator.insert(prompt: [6])
+            var progress: [Int] = []
+            var emitted: [Int] = []
+            var captured: [BatchRowCacheSnapshot] = []
+            while let step = try iterator.next(capturingFinalCachesFor: [id]) {
+                for case .prefill(let rowID, let processed, _) in step.events where rowID == id {
+                    progress.append(processed)
+                }
+                if !step.caches.isEmpty {
+                    #expect(iterator.ids == [companion])
+                    #expect(iterator.pendingIDs.isEmpty)
+                }
+                emitted += tokens(step.events.filter { $0.id == id })
+                captured += step.caches
+            }
+
+            #expect(progress == (stepSize == 1 ? [1, 2, 3] : [3]))
+            let row = try #require(captured.first)
+            #expect(captured.map(\.id) == [id])
+            #expect(row.processedPositionCount == prompt.count + split)
+            #expect(row.snapshot.cache.allSatisfy { $0.offset == row.processedPositionCount })
+            #expect(seed.allSatisfy { $0.offset == prefix.count })
+
+            // The cached positions stop just before the next known token in the solo run.
+            // Feed that token as the suffix and compare the rest of the continuation.
+            let nextToken = expected[split]
+            var resumed = BatchTokenIterator(model: model, maxTokens: expected.count - split - 1)
+            let resumedID = resumed.insert(prompt: [nextToken], cache: row.snapshot.cache)
+            let continuation = try collect(&resumed, uids: [resumedID])[0]
+            #expect(emitted + [nextToken] + continuation == expected)
+        }
+    }
+
+    @Test("A captured cache covers a fed stop token and excludes the sampled lookahead")
+    func capturedCacheCoversStopToken() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = BatchTextOnlyModel(preparation: .tokens)
+            var iterator = BatchTokenIterator(model: model, stopTokens: [3])
+            let id = iterator.insert(prompt: [1, 2])
+            let step = try #require(try iterator.next(capturingFinalCachesFor: [id]))
+            #expect(tokens(step.events).isEmpty)
+            #expect(finishes(step.events) == [BatchFinish(id: id, reason: .stop, stopToken: 3)])
+            let row = try #require(step.caches.first)
+            #expect(step.caches.map(\.id) == [id])
+            #expect(row.processedPositionCount == 3)
+            let cache = try #require(row.snapshot.cache.first as? KVCacheSimple)
+            let keys = try #require(cache.state.first)
+            #expect(keys.asArray(Float.self) == [1, 2, 3])
+            #expect(try iterator.next(capturingFinalCachesFor: [id]) == nil)
+        }
+    }
+
+    @Test("Removal captures only the selected rows being removed")
+    func captureRemovedCache() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = BatchTextOnlyModel(preparation: .tokens)
+            var iterator = BatchTokenIterator(model: model, maxTokens: 4)
+            let ids = iterator.insert(prompts: [[1, 2], [5], [7, 9, 11]])
+            let first = try #require(try iterator.next(capturingFinalCachesFor: Set(ids)))
+            #expect(first.caches.isEmpty)
+
+            let captured = iterator.remove(
+                [ids[0], ids[1]], capturingFinalCachesFor: [ids[0], ids[2], Int.max])
+            let row = try #require(captured.first)
+            #expect(captured.map(\.id) == [ids[0]])
+            #expect(row.processedPositionCount == 3)
+            let cache = try #require(row.snapshot.cache.first as? KVCacheSimple)
+            let keys = try #require(cache.state.first)
+            #expect(keys.asArray(Float.self) == [1, 2, 3])
+            #expect(iterator.ids == [ids[2]])
+            #expect(try collect(&iterator, uids: [ids[2]]) == [[13, 14, 15]])
+        }
+    }
+
+    @Test("A row removed during chunked prefill yields no cache snapshot")
+    func partialPrefillDoesNotCapture() throws {
+        try Device.withDefaultDevice(.cpu) {
+            var iterator = BatchTokenIterator(model: tinyLlama(), prefill: .init(stepSize: 2))
+            let id = iterator.insert(prompt: [1, 2, 3, 4, 5, 6, 7])
+            let step = try #require(try iterator.next(capturingFinalCachesFor: [id]))
+            #expect(step.events.map(describe) == ["prefill(\(id), 2/7)"])
+            #expect(step.caches.isEmpty)
+            #expect(iterator.pendingIDs == [id])
+            #expect(iterator.remove([id], capturingFinalCachesFor: [id]).isEmpty)
+            #expect(try iterator.next(capturingFinalCachesFor: [id]) == nil)
+        }
+    }
+
+    @Test("A rotating snapshot preserves logical progress beyond its retained window")
+    func captureWrappedRotatingCache() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let seed = RotatingKVCache(maxSize: 4)
+            for token in 1 ... 7 {
+                let keys = MLXArray(Float(token)).reshaped([1, 1, 1, 1])
+                _ = seed.update(keys: keys, values: keys)
+            }
+            let model = BatchTextOnlyModel(
+                preparation: .tokens, cacheFactory: { [RotatingKVCache(maxSize: 4)] })
+            var iterator = BatchTokenIterator(model: model, maxTokens: 2)
+            let id = iterator.insert(prompt: [8], cache: [seed])
+            let first = try #require(try iterator.next(capturingFinalCachesFor: [id]))
+            #expect(first.caches.isEmpty)
+            let last = try #require(try iterator.next(capturingFinalCachesFor: [id]))
+            let row = try #require(last.caches.first)
+            #expect(last.caches.map(\.id) == [id])
+            #expect(row.processedPositionCount == 10)
+            let cache = try #require(row.snapshot.cache.first as? RotatingKVCache)
+            let keys = try #require(cache.state.first)
+            #expect(cache.offset == 10)
+            #expect(keys.dim(2) == 4)
+            #expect(keys.asArray(Float.self).sorted() == [7, 8, 9, 10])
+            #expect(seed.offset == 7)
+        }
+    }
+
     @Test("A row continues from its prompt cache")
     func promptCache() throws {
         try Device.withDefaultDevice(.cpu) {
