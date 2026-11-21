@@ -84,9 +84,9 @@ struct Inkling2KernelTests {
         #expect(maxDifference(kernel, reference) < 2e-2)
     }
 
-    @Test("A bfloat16 model prefills through the kernels as through the reference path")
-    func modelPrefill() throws {
-        MLXRandom.seed(0)
+    /// A small bfloat16 Inkling 2 Mini whose looped layers complete depth blocks, with the
+    /// router, depth queries and experts in float32 as the checkpoints keep them.
+    private func bfloat16Model() throws -> Inkling2Model {
         let model = Inkling2Model(
             try JSONDecoder().decode(
                 Inkling2Configuration.self,
@@ -123,6 +123,13 @@ struct Inkling2KernelTests {
         }
         model.update(parameters: ModuleParameters.unflattened(weights))
         eval(model)
+        return model
+    }
+
+    @Test("A bfloat16 model prefills through the kernels as through the reference path")
+    func modelPrefill() throws {
+        MLXRandom.seed(0)
+        let model = try bfloat16Model()
         let tokens = MLXRandom.randInt(Int32(0) ..< 120, [2, 48])
 
         func prefill() throws -> [MLXArray] {
@@ -140,5 +147,29 @@ struct Inkling2KernelTests {
             // both experts, so no near tie in routing can flip and amplify the difference.
             #expect(maxDifference(kernel, expected) < 0.3)
         }
+    }
+
+    @Test("Training takes the reference paths, so gradients flow through attention")
+    func trainingGradients() throws {
+        MLXRandom.seed(0)
+        let model = try bfloat16Model()
+        // On the GPU, a bfloat16 prefill would take both kernels, which have no gradient.
+        let tokens = MLXRandom.randInt(Int32(0) ..< 120, [2, 24])
+        model.train()
+        let lossAndGradient = valueAndGrad(model: model) { model, tokens, _ in
+            model(tokens, cache: nil).asType(.float32).square().mean()
+        }
+        let (loss, gradients) = try withError {
+            let (loss, gradients) = lossAndGradient(model, tokens, MLXArray(0))
+            let flat = gradients.flattened()
+            eval([loss] + flat.map(\.1))
+            return (loss, flat)
+        }
+        #expect(loss.item(Float.self).isFinite)
+        #expect(gradients.allSatisfy { all(isFinite($0.1)).item(Bool.self) })
+        // The depth queries only reach the loss through depth attention.
+        let depthQueries = gradients.filter { $0.0.hasSuffix(".query") }
+        #expect(!depthQueries.isEmpty)
+        #expect(depthQueries.contains { abs($0.1).max().item(Float.self) > 0 })
     }
 }

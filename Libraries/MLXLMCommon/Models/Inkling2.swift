@@ -184,13 +184,14 @@ final class Inkling2DynamicConvolution: Module {
 
 /// Attention of learned queries over the depth sources of each token: the completed
 /// blocks and the current partial block, all unit-RMS float32 `[B, L, D]`.
-/// Returns `[B, L, Q, D]`.
+/// Returns `[B, L, Q, D]`. The kernel has no gradient, so training passes
+/// `useKernel: false`.
 func inkling2DepthAttention(
-    blocks: MLXArray?, partial: MLXArray, query: MLXArray
+    blocks: MLXArray?, partial: MLXArray, query: MLXArray, useKernel: Bool = true
 ) -> MLXArray {
     let query = query.asType(.float32).reshaped(-1, partial.dim(-1))
     let scale = pow(Float(partial.dim(-1)), -0.5)
-    if inkling2UsesKernels(), let blocks, blocks.dim(0) > 0 {
+    if useKernel, inkling2UsesKernels(), let blocks, blocks.dim(0) > 0 {
         return inkling2DepthAttentionKernel(
             blocks: blocks, partial: partial, query: query, scale: scale)
     }
@@ -215,7 +216,8 @@ final class Inkling2DepthQuery: Module {
     }
 
     func callAsFunction(blocks: MLXArray?, partial: MLXArray) -> MLXArray {
-        inkling2DepthAttention(blocks: blocks, partial: partial, query: query)
+        inkling2DepthAttention(
+            blocks: blocks, partial: partial, query: query, useKernel: !training)
     }
 }
 
@@ -253,7 +255,8 @@ final class Inkling2MessageInput: Module {
 
     func callAsFunction(_ bank: Inkling2MessageBank, loopedLayer: Int) -> MLXArray {
         inkling2DepthAttention(
-            blocks: bank.blocks, partial: bank.partial, query: query[loopedLayer])
+            blocks: bank.blocks, partial: bank.partial, query: query[loopedLayer],
+            useKernel: !training)
     }
 }
 
@@ -558,7 +561,9 @@ final class Inkling2Attention: Module {
         let output = attention(
             queries: queries, keys: keys, values: values, positionBias: positionBias,
             sinks: sinks, queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
-            keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true)
+            keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true,
+            // The prefill kernel has no gradient.
+            forceReference: training)
 
         let gated = output.reshaped(B, L, -1).asType(.float32) * sigmoid(gate.asType(.float32))
         return oProjection(gated.asType(gate.dtype))
