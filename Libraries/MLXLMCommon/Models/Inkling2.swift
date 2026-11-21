@@ -184,12 +184,17 @@ final class Inkling2DynamicConvolution: Module {
 
 /// Attention of learned queries over the depth sources of each token: the completed
 /// blocks and the current partial block, all unit-RMS float32 `[B, L, D]`.
-/// Returns `[B, L, Q, D]`.
+/// Returns `[B, L, Q, D]`. The kernel has no gradient, so training passes
+/// `useKernel: false`.
 func inkling2DepthAttention(
-    blocks: MLXArray?, partial: MLXArray, query: MLXArray
+    blocks: MLXArray?, partial: MLXArray, query: MLXArray, useKernel: Bool = true
 ) -> MLXArray {
     let query = query.asType(.float32).reshaped(-1, partial.dim(-1))
     let scale = pow(Float(partial.dim(-1)), -0.5)
+    if useKernel, inkling2UsesKernels(), let blocks, blocks.dim(0) > 0 {
+        return inkling2DepthAttentionKernel(
+            blocks: blocks, partial: partial, query: query, scale: scale)
+    }
     var sources = partial[.newAxis]
     if let blocks, blocks.dim(0) > 0 {
         sources = concatenated([blocks, sources], axis: 0)
@@ -211,7 +216,8 @@ final class Inkling2DepthQuery: Module {
     }
 
     func callAsFunction(blocks: MLXArray?, partial: MLXArray) -> MLXArray {
-        inkling2DepthAttention(blocks: blocks, partial: partial, query: query)
+        inkling2DepthAttention(
+            blocks: blocks, partial: partial, query: query, useKernel: !training)
     }
 }
 
@@ -249,7 +255,8 @@ final class Inkling2MessageInput: Module {
 
     func callAsFunction(_ bank: Inkling2MessageBank, loopedLayer: Int) -> MLXArray {
         inkling2DepthAttention(
-            blocks: bank.blocks, partial: bank.partial, query: query[loopedLayer])
+            blocks: bank.blocks, partial: bank.partial, query: query[loopedLayer],
+            useKernel: !training)
     }
 }
 
@@ -553,7 +560,10 @@ final class Inkling2Attention: Module {
         queries = queries.transposed(0, 2, 1, 3)
         let output = attention(
             queries: queries, keys: keys, values: values, positionBias: positionBias,
-            sinks: sinks, queryPositions: queryPositions, storedKeyPositions: storedKeyPositions)
+            sinks: sinks, queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
+            keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true,
+            // The prefill kernel has no gradient.
+            forceReference: training)
 
         let gated = output.reshaped(B, L, -1).asType(.float32) * sigmoid(gate.asType(.float32))
         return oProjection(gated.asType(gate.dtype))
@@ -572,14 +582,37 @@ final class Inkling2Attention: Module {
         }
     }
 
+    /// Whether a multi-token write returns every key in temporal order, ending at the new
+    /// ones. A pinned prefix breaks that order.
+    private static func keysInOrder(_ cache: KVCache) -> Bool {
+        switch cache {
+        case let cache as RotatingKVCache: cache.keepCount == 0
+        case is KVCacheSimple, is BatchKVCache, is BatchRotatingKVCache: true
+        default: false
+        }
+    }
+
     /// Attention with the relative-position bias and a sink per query and head.
-    /// `queries` `[B, H, L, D]`; returns `[B, L, H, D]`.
+    /// `queries` `[B, H, L, D]`; returns `[B, L, H, D]`. `keysInOrder` says the keys are in
+    /// temporal order and end at the queries, which the prefill kernel requires.
     func attention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, positionBias: MLXArray,
-        sinks: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray
+        sinks: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray,
+        keysInOrder: Bool = true, forceReference: Bool = false
     ) -> MLXArray {
         let (B, L) = (queries.dim(0), queries.dim(2))
-        if B == 1 && L == 1 {
+        if !forceReference, L > 1, keysInOrder, inkling2UsesKernels(), headDim % 8 == 0,
+            [queries.dtype, keys.dtype, values.dtype].allSatisfy({ $0 == .bfloat16 })
+        {
+            // Each row's keys before its first position are padding.
+            let S = keys.dim(2)
+            let keyStart = MLX.maximum(
+                Float(S) - (queryPositions[0..., L - 1] + 1), MLXArray(Float(0)))
+            return inkling2RelativeAttentionKernel(
+                queries: queries, keys: keys, values: values, positionBias: positionBias,
+                sinks: sinks, keyStart: keyStart, scale: scale, window: window)
+        }
+        if !forceReference, B == 1 && L == 1 {
             return singleTokenAttention(
                 queries: queries, keys: keys, values: values, positionBias: positionBias,
                 sinks: sinks, queryPositions: queryPositions,
