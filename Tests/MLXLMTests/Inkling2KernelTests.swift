@@ -177,6 +177,8 @@ struct Inkling2KernelTests {
         MLXRandom.seed(3)
         for (channels, dtype) in [(1024, DType.bfloat16), (2304, .bfloat16), (64, .float32)] {
             let convolution = Inkling2ShortConvolution(dimensions: channels, kernelSize: 4)
+            // A new module starts in training, which skips the kernels; loading ends it.
+            convolution.train(false)
             convolution.conv1d.update(
                 parameters: ModuleParameters.unflattened([
                     "weight": (MLXRandom.normal([channels, 4, 1]) * 0.5).asType(dtype)
@@ -200,6 +202,7 @@ struct Inkling2KernelTests {
         MLXRandom.seed(5)
         let args = try textConfiguration(R: extent, window: window)
         let attention = Inkling2Attention(args, sliding: window > 0)
+        attention.train(false)
         let query = Float(keys + 7)
         let bias = MLXRandom.normal([1, 1, 8, extent]).asType(.bfloat16)
         let stored = MLXRandom.randInt(0 ..< Int32(query + 4), [1, keys]).asType(.float32)
@@ -219,6 +222,7 @@ struct Inkling2KernelTests {
         MLXRandom.seed(9)
         let router = Inkling2Router(
             try textConfiguration(experts: experts, topK: topK, routeScale: 2.5))
+        router.train(false)
         // Each expert's twin ties it, so the order of equal scores is checked too.
         func twins(_ x: MLXArray) -> MLXArray {
             concatenated([x[..<(experts / 2)], x[..<(experts / 2)]], axis: 0)
@@ -243,6 +247,7 @@ struct Inkling2KernelTests {
     func expertCombine(shape: [Int]) throws {
         MLXRandom.seed(13)
         let moe = Inkling2SparseMoE(try textConfiguration())
+        moe.train(false)
         let outputs = MLXRandom.normal(shape).asType(.bfloat16)
         let weights = MLXRandom.uniform(0 ..< 2, Array(shape.dropLast()))
         for dtype in [DType.bfloat16, .float32] {
@@ -301,6 +306,7 @@ struct Inkling2KernelTests {
     func compiledDecode(batch: Int) throws {
         MLXRandom.seed(0)
         let model = try bfloat16Model(experts: 8, topK: 2)
+        model.train(false)
         let tokens = MLXRandom.randInt(Int32(0) ..< 120, [batch, 60])
         func decode(general: Bool) throws -> [MLXArray] {
             let cache = try model.newCache(parameters: nil)
