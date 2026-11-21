@@ -44,7 +44,8 @@ struct KVCacheLeaf {
         case .recurrent, .rotating: .copy
         case .varianceNormalized: .varianceNormalized
         case .simple where cache is ChunkedKVCache: .unsupported
-        case .simple, .affine, .turboQuant: .trim
+        // A batch's packed affine rows trim like a single cache's.
+        case .simple, .affine, .batchedAffine, .turboQuant: .trim
         case .unsupported:
             cache is any AuxiliaryKVCache && cache.isTrimmable ? .trim : .unsupported
         }
