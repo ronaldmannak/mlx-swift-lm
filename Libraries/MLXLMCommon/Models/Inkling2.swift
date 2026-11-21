@@ -19,12 +19,29 @@ import MLXNN
 
 private let routerScoreEpsilon: Float = 1e-20
 
-/// `rms_norm` without a weight, as `mx.fast.rms_norm(x, None, eps)`.
-func inkling2UnitRMS(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
-    MLXFast.rmsNorm(x, weight: MLXArray.ones([x.dim(-1)], dtype: x.dtype), eps: eps)
+/// `rms_norm` without a weight on `x` in float32, as `mx.fast.rms_norm(x, None, eps)`,
+/// returned as `dtype`.
+func inkling2UnitRMS(_ x: MLXArray, eps: Float = 1e-6, dtype: DType = .float32) -> MLXArray {
+    MLXFast.rmsNorm(x.asType(.float32), weight: nil, eps: eps).asType(dtype)
 }
 
-private func l2Clip(_ x: MLXArray, scale: MLXArray?, threshold: Float) -> MLXArray {
+/// `norm(x).asType(dtype)`.
+func inkling2Normed(_ norm: RMSNorm, _ x: MLXArray, dtype: DType) -> MLXArray {
+    if inkling2UsesKernels(), x.dtype == .float32 {
+        // MLX's float32 norm multiplies by the weight last, so applying it after the
+        // unweighted norm gives the same bits, and the casts fuse into a compiled multiply.
+        return (MLXFast.rmsNorm(x, weight: nil, eps: norm.eps) * norm.weight.asType(.float32))
+            .asType(dtype)
+    }
+    return norm(x).asType(dtype)
+}
+
+func inkling2L2Clip(
+    _ x: MLXArray, scale: MLXArray?, threshold: Float, useKernel: Bool = true
+) -> MLXArray {
+    if useKernel, inkling2L2ClipKernelTakes(x) {
+        return inkling2L2ClipKernel(x, scale: scale, threshold: threshold)
+    }
     var states = x.asType(.float32)
     if let scale {
         states = states * scale
@@ -62,7 +79,7 @@ final class Inkling2ScaledClip: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        l2Clip(x, scale: scale, threshold: threshold)
+        inkling2L2Clip(x, scale: scale, threshold: threshold, useKernel: !training)
     }
 }
 
@@ -120,16 +137,23 @@ final class Inkling2ShortConvolution: Module {
             groups: dimensions, bias: false)
     }
 
-    /// Returns the output and the convolution window, from which the caller takes the
-    /// next state.
+    /// Returns the output and the next state: each row's last `kernelSize - 1` valid inputs.
+    /// `lengths` are the rows' valid lengths of a right-padded batch prompt.
     func callAsFunction(
-        _ x: MLXArray, state: MLXArray?, mask: MLXArray?
+        _ x: MLXArray, state: MLXArray?, mask: MLXArray?, lengths: MLXArray? = nil,
+        forceReference: Bool = false
     ) -> (MLXArray, MLXArray) {
+        if !forceReference, !training, mask == nil, lengths == nil, inkling2UsesKernels() {
+            return inkling2ShortConvolutionKernel(x, state: state, weight: conv1d.weight)
+        }
         let window = convolutionWindow(x, state: state, mask: mask, kernelSize: kernelSize)
         // As the reference, the convolution runs in the weight's dtype.
         var out = conv1d(window.asType(conv1d.weight.dtype)).asType(.float32)
         out = (out + x.asType(.float32)) / sqrt(Float(kernelSize + 1))
-        return (out.asType(x.dtype), window)
+        return (
+            out.asType(x.dtype),
+            convolutionState(window, lengths: lengths, count: kernelSize - 1)
+        )
     }
 
     /// Keeps this process' channels; `groups` is fixed when a convolution is made.
@@ -161,8 +185,10 @@ final class Inkling2DynamicConvolution: Module {
         _weightProjection.wrappedValue = Linear(inputDimensions, heads * kernelSize, bias: false)
     }
 
+    /// Returns the output and the next state, as ``Inkling2ShortConvolution`` does.
     func callAsFunction(
-        _ x: MLXArray, dynamicInput: MLXArray, state: MLXArray?, mask: MLXArray?
+        _ x: MLXArray, dynamicInput: MLXArray, state: MLXArray?, mask: MLXArray?,
+        lengths: MLXArray?
     ) -> (MLXArray, MLXArray) {
         let (B, L, C) = (x.dim(0), x.dim(1), x.dim(2))
         let K = kernelSize
@@ -178,7 +204,7 @@ final class Inkling2DynamicConvolution: Module {
         ).reshaped(B, L, heads, -1, K)
         var out = (windows * weights).sum(axis: -1).reshaped(B, L, C)
         out = (out + x.asType(.float32)) / sqrt(Float(2 * K + 1))
-        return (out.asType(x.dtype), window)
+        return (out.asType(x.dtype), convolutionState(window, lengths: lengths, count: K - 1))
     }
 }
 
@@ -233,9 +259,14 @@ final class Inkling2MessageGate: Module {
         _messageGate.wrappedValue = Linear(rank, dimensions, bias: false)
     }
 
-    /// `x` and `message` are float32.
-    func callAsFunction(_ x: MLXArray, message: MLXArray) -> MLXArray {
-        var states = concatenated([inkling2UnitRMS(x), inkling2UnitRMS(message)], axis: -1)
+    /// Mixes row `gate` of `messages` `[B, L, 4, D]` into `x`; both are float32.
+    fileprivate func callAsFunction(
+        _ x: MLXArray, messages: Inkling2Messages, gate: Int
+    ) -> MLXArray {
+        let message = messages.raw[.ellipsis, gate, 0...]
+        var states = concatenated(
+            [inkling2UnitRMS(x), messages.normed[.ellipsis, gate, 0...]],
+            axis: -1)
         let dtype =
             (downProjection as? QuantizedLinear)?.scales.dtype ?? downProjection.weight.dtype
         states = downProjection(states.asType(dtype)).asType(.float32)
@@ -254,9 +285,10 @@ final class Inkling2MessageInput: Module {
     }
 
     func callAsFunction(_ bank: Inkling2MessageBank, loopedLayer: Int) -> MLXArray {
+        // A slice, not an index: an index gathers.
         inkling2DepthAttention(
-            blocks: bank.blocks, partial: bank.partial, query: query[loopedLayer],
-            useKernel: !training)
+            blocks: bank.blocks, partial: bank.partial,
+            query: query[loopedLayer ..< loopedLayer + 1].squeezed(axis: 0), useKernel: !training)
     }
 }
 
@@ -363,8 +395,15 @@ final class Inkling2Router: Module {
         _correctionBias.wrappedValue = MLXArray.zeros([args.routedExperts], dtype: .float32)
     }
 
-    func callAsFunction(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, forceReference: Bool = false
+    ) -> (indices: MLXArray, weights: MLXArray) {
         let logits = matmul(x.asType(.float32), weight.asType(.float32).T)
+        if !forceReference, !training, usesGPU(), supportsFusedRouterTopK(logits, k: topK) {
+            return inkling2RouterKernel(
+                logits: logits, bias: correctionBias.asType(.float32), k: topK,
+                routeScale: routeScale)
+        }
         let scores = sigmoid(logits)
         let biased = scores + correctionBias.asType(.float32)
         if usesGPU(), supportsFusedRouterTopK(biased, k: topK) {
@@ -396,12 +435,22 @@ final class Inkling2SparseMoE: Module {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = router(x)
-        let outputs = experts(x, indices: indices).asType(.float32)
-        var y = weightedExpertSum(outputs, weights)
-        if let shardingGroup {
-            y = MLXDistributed.allSum(y, group: shardingGroup)
+        let outputs = experts(x, indices: indices)
+        guard let shardingGroup else {
+            return combine(outputs, weights: weights, dtype: x.dtype)
         }
-        return y.asType(x.dtype)
+        let y = combine(outputs, weights: weights, dtype: .float32)
+        return MLXDistributed.allSum(y, group: shardingGroup).asType(x.dtype)
+    }
+
+    /// The experts' outputs `[..., k, D]` weighted and summed in float32, as `dtype`.
+    func combine(
+        _ outputs: MLXArray, weights: MLXArray, dtype: DType, forceReference: Bool = false
+    ) -> MLXArray {
+        if !forceReference, !training, usesGPU() {
+            return inkling2ExpertCombineKernel(outputs, weights: weights, dtype: dtype)
+        }
+        return weightedExpertSum(outputs.asType(.float32), weights).asType(dtype)
     }
 }
 
@@ -488,42 +537,83 @@ final class Inkling2Attention: Module {
     }
 
     private func convolve(
-        _ convolution: Module, _ x: MLXArray, input: MLXArray, state: MLXArray?, mask: MLXArray?
+        _ convolution: Module, _ x: MLXArray, input: MLXArray, state: MLXArray?, mask: MLXArray?,
+        lengths: MLXArray?
     ) -> (MLXArray, MLXArray) {
         if let convolution = convolution as? Inkling2ShortConvolution {
-            return convolution(x, state: state, mask: mask)
+            return convolution(x, state: state, mask: mask, lengths: lengths)
         }
         return (convolution as! Inkling2DynamicConvolution)(
-            x, dynamicInput: input, state: state, mask: mask)
+            x, dynamicInput: input, state: state, mask: mask, lengths: lengths)
     }
 
-    /// `query`, `key` and `value` are the normed inputs of the three projections.
-    /// `convolutionStates` holds the key and value states in slots 0 and 1.
+    /// Everything before the cache write, from the normed inputs of the query, key and value
+    /// projections: clipped queries `[B, L, H, D]` and relative states, keys and values
+    /// `[B, Hkv, L, D]`, the output gate, the sinks, and the next key and value convolution
+    /// states.
+    func project(
+        query: MLXArray, key: MLXArray, value: MLXArray, states: (MLXArray?, MLXArray?),
+        mask: MLXArray?, lengths: MLXArray?
+    ) -> (
+        queries: MLXArray, relative: MLXArray, keys: MLXArray, values: MLXArray,
+        gate: MLXArray, sinks: MLXArray, keyState: MLXArray, valueState: MLXArray
+    ) {
+        let (B, L) = (query.dim(0), query.dim(1))
+        let (keys, keyState) = convolve(
+            keyConvolution, kProjection(key), input: key, state: states.0, mask: mask,
+            lengths: lengths)
+        let (values, valueState) = convolve(
+            valueConvolution, vProjection(value), input: value, state: states.1, mask: mask,
+            lengths: lengths)
+
+        let queries = queryClip(qProjection(query).reshaped(B, L, heads, -1))
+        let relative = relativeClip(rProjection(query).reshaped(B, L, heads, -1))
+        let clippedKeys = inkling2L2Clip(
+            keys.reshaped(B, L, kvHeads, -1), scale: nil, threshold: qkClipThreshold,
+            useKernel: !training)
+        let headValues = values.reshaped(B, L, kvHeads, -1)
+        let normedValues = inkling2UnitRMS(
+            headValues, eps: eps, dtype: headValues.dtype)
+        return (
+            queries, relative, clippedKeys.transposed(0, 2, 1, 3),
+            normedValues.transposed(0, 2, 1, 3), gateProjection(query), sinkProjection(query),
+            keyState, valueState
+        )
+    }
+
+    /// Longer contexts scale a global layer's queries and relative states up.
+    func lengthScaled(
+        queries: MLXArray, relative: MLXArray, positions: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        guard !isSliding else { return (queries, relative) }
+        let tau =
+            1 + logScalingAlpha
+            * log(MLX.maximum((positions + 1) / logScalingFloor, MLXArray(Float(1))))
+        let tau4 = tau.reshaped(positions.dim(0), positions.dim(1), 1, 1)
+        return (
+            (queries.asType(.float32) * tau4).asType(queries.dtype),
+            (relative.asType(.float32) * tau4).asType(relative.dtype)
+        )
+    }
+
+    /// The gated output projection of the attention output `[B, L, H, D]`.
+    func output(_ attention: MLXArray, gate: MLXArray) -> MLXArray {
+        let (B, L) = (attention.dim(0), attention.dim(1))
+        let gated = attention.reshaped(B, L, -1).asType(.float32) * sigmoid(gate.asType(.float32))
+        return oProjection(gated.asType(gate.dtype))
+    }
+
+    /// `query`, `key` and `value` are the normed inputs of the three projections. Returns
+    /// the output and the next key and value convolution states.
     func callAsFunction(
         query: MLXArray, key: MLXArray, value: MLXArray, cache: Inkling2VisitCache?,
-        convolutionStates: inout [MLXArray?], windows: inout [MLXArray?], mask: MLXArray?
-    ) -> MLXArray {
+        states: (MLXArray?, MLXArray?), mask: MLXArray?, lengths: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray) {
         let (B, L) = (query.dim(0), query.dim(1))
-
-        var keys: MLXArray
-        var values: MLXArray
-        (keys, windows[0]) = convolve(
-            keyConvolution, kProjection(key), input: key, state: convolutionStates[0],
-            mask: mask)
-        (values, windows[1]) = convolve(
-            valueConvolution, vProjection(value), input: value, state: convolutionStates[1],
-            mask: mask)
-
-        let gate = gateProjection(query)
-        let sinks = sinkProjection(query)
-        var queries = queryClip(qProjection(query).reshaped(B, L, heads, -1))
-        var relative = relativeClip(rProjection(query).reshaped(B, L, heads, -1))
-        keys = l2Clip(keys.reshaped(B, L, kvHeads, -1), scale: nil, threshold: qkClipThreshold)
-        values = values.reshaped(B, L, kvHeads, -1)
-        values = inkling2UnitRMS(values.asType(.float32), eps: eps).asType(values.dtype)
-
-        keys = keys.transposed(0, 2, 1, 3)
-        values = values.transposed(0, 2, 1, 3)
+        let projected = project(
+            query: query, key: key, value: value, states: states, mask: mask, lengths: lengths)
+        var keys = projected.keys
+        var values = projected.values
 
         // Positions follow the cache after its write, which may roll ragged rows.
         let queryPositions: MLXArray
@@ -546,38 +636,33 @@ final class Inkling2Attention: Module {
             storedKeyPositions = queryPositions + 1
         }
 
-        if !isSliding {
-            // Longer contexts scale the queries and relative states up.
-            let tau =
-                1 + logScalingAlpha
-                * log(MLX.maximum((queryPositions + 1) / logScalingFloor, MLXArray(Float(1))))
-            let tau4 = tau.reshaped(B, L, 1, 1)
-            queries = (queries.asType(.float32) * tau4).asType(queries.dtype)
-            relative = (relative.asType(.float32) * tau4).asType(relative.dtype)
-        }
-        let positionBias = relativeLogits(relative)
-
-        queries = queries.transposed(0, 2, 1, 3)
+        let (queries, relative) = lengthScaled(
+            queries: projected.queries, relative: projected.relative, positions: queryPositions)
         let output = attention(
-            queries: queries, keys: keys, values: values, positionBias: positionBias,
-            sinks: sinks, queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
+            queries: queries.transposed(0, 2, 1, 3), keys: keys, values: values,
+            positionBias: relativeLogits(relative), sinks: projected.sinks,
+            queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
             keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true,
             // The prefill kernel has no gradient.
             forceReference: training)
-
-        let gated = output.reshaped(B, L, -1).asType(.float32) * sigmoid(gate.asType(.float32))
-        return oProjection(gated.asType(gate.dtype))
+        return (
+            self.output(output, gate: projected.gate), projected.keyState, projected.valueState
+        )
     }
 
-    /// Each row's positions of the `length` tokens just written, `[B, L]` float32.
-    private static func queryPositions(_ cache: KVCache, batch: Int, length: Int) -> MLXArray {
-        let steps = MLXArray(Int32(0) ..< Int32(length))[.newAxis]
+    /// Each row's positions of the `length` tokens just written, `[B, L]` float32, or with
+    /// `written: false` of the next `length` tokens.
+    static func queryPositions(
+        _ cache: KVCache, batch: Int, length: Int, written: Bool = true
+    ) -> MLXArray {
+        let start = written ? -length : 0
         switch cache.ropeOffset {
         case .scalar(let offset):
-            return broadcast(
-                (steps + Int32(offset - length)).asType(.float32), to: [batch, length])
+            let positions = (0 ..< length).map { Float(offset + start + $0) }
+            return broadcast(MLXArray(positions)[.newAxis], to: [batch, length])
         case .batch(let offsets):
-            return (expandedDimensions(offsets.asType(.int32), axis: 1) - Int32(length) + steps)
+            let steps = MLXArray(Int32(0) ..< Int32(length))[.newAxis]
+            return (expandedDimensions(offsets.asType(.int32), axis: 1) + Int32(start) + steps)
                 .asType(.float32)
         }
     }
@@ -689,6 +774,25 @@ final class Inkling2Attention: Module {
         queries: MLXArray, keys: MLXArray, values: MLXArray, positionBias: MLXArray,
         sinks: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray
     ) -> MLXArray {
+        let mask = decodeMask(
+            positionBias: positionBias, queryPositions: queryPositions,
+            storedKeyPositions: storedKeyPositions)
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale,
+            mask: mask.asType(queries.dtype), sinks: sinks[0, 0].asType(queries.dtype))
+        return output.transposed(0, 2, 1, 3)
+    }
+
+    /// The additive mask of one query of one row, `[1, H, 1, S]` in `positionBias`'s dtype.
+    func decodeMask(
+        positionBias: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray,
+        forceReference: Bool = false
+    ) -> MLXArray {
+        if !forceReference, !training, inkling2UsesKernels() {
+            return inkling2DecodeMaskKernel(
+                positionBias: positionBias, queryPositions: queryPositions,
+                storedKeyPositions: storedKeyPositions, window: window)
+        }
         let R = positionBias.dim(-1)
         let (distance, visible) = distances(
             queryPositions: queryPositions, storedKeyPositions: storedKeyPositions)
@@ -696,23 +800,21 @@ final class Inkling2Attention: Module {
         var bias = take(
             positionBias[0, 0], clip(flatDistance, min: 0, max: R - 1).asType(.int32), axis: -1)
         bias = which(flatDistance .< Float(R), bias, MLXArray(Float(0)).asType(bias.dtype))
-        let mask = which(visible[0, 0], bias, MLXArray(-Float.infinity).asType(bias.dtype))
-            .asType(queries.dtype)
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale,
-            mask: mask.reshaped(1, heads, 1, -1),
-            sinks: sinks[0, 0].asType(queries.dtype))
-        return output.transposed(0, 2, 1, 3)
+        return which(visible[0, 0], bias, MLXArray(-Float.infinity).asType(bias.dtype))
+            .reshaped(1, heads, 1, -1)
     }
 }
 
 // MARK: - Decoder layer
 
+/// A loop pass's messages for a layer `[B, L, 4, D]` (query, key, value and MLP) and their
+/// unit RMS, normed once for the four gates.
+private typealias Inkling2Messages = (raw: MLXArray, normed: MLXArray)
+
 package final class Inkling2DecoderLayer: Module {
     let index: Int
     let isSliding: Bool
     let isBlockBoundary: Bool
-    let convKernelSize: Int
 
     @ModuleInfo(key: "attention_input") var attentionInput: Inkling2DepthQuery?
     @ModuleInfo(key: "mlp_input") var mlpInput: Inkling2DepthQuery
@@ -737,7 +839,6 @@ package final class Inkling2DecoderLayer: Module {
         self.index = index
         isSliding = args.isSliding(index)
         isBlockBoundary = index % args.layersPerResidualBlock == 0
-        convKernelSize = args.convKernelSize
         let dim = args.hiddenSize
         let eps = args.rmsNormEps
 
@@ -774,12 +875,16 @@ package final class Inkling2DecoderLayer: Module {
 
     /// The normed inputs of the query, key and value projections.
     private func attentionInputs(
-        _ x: MLXArray, depth: MLXArray?, messages: MLXArray?
+        _ x: MLXArray, depth: MLXArray?, messages: Inkling2Messages?
     ) -> (MLXArray, MLXArray, MLXArray) {
         let dtype = x.dtype
         var inputs: (MLXArray, MLXArray, MLXArray)
         if isSliding {
             let h = depth?[.ellipsis, 0, 0...] ?? x
+            if messages == nil, let inputNorm {
+                let normed = inkling2Normed(inputNorm, h, dtype: dtype)
+                return (normed, normed, normed)
+            }
             inputs = (h, h, h)
         } else if let depth {
             inputs = (
@@ -790,20 +895,22 @@ package final class Inkling2DecoderLayer: Module {
         }
         if let messages {
             inputs = (
-                queryMessageGate!(inputs.0, message: messages[.ellipsis, 0, 0...]),
-                keyMessageGate!(inputs.1, message: messages[.ellipsis, 1, 0...]),
-                valueMessageGate!(inputs.2, message: messages[.ellipsis, 2, 0...])
+                queryMessageGate!(inputs.0, messages: messages, gate: 0),
+                keyMessageGate!(inputs.1, messages: messages, gate: 1),
+                valueMessageGate!(inputs.2, messages: messages, gate: 2)
             )
         }
         if let inputNorm {
             return (
-                inputNorm(inputs.0).asType(dtype), inputNorm(inputs.1).asType(dtype),
-                inputNorm(inputs.2).asType(dtype)
+                inkling2Normed(inputNorm, inputs.0, dtype: dtype),
+                inkling2Normed(inputNorm, inputs.1, dtype: dtype),
+                inkling2Normed(inputNorm, inputs.2, dtype: dtype)
             )
         }
         return (
-            queryInputNorm!(inputs.0).asType(dtype), keyInputNorm!(inputs.1).asType(dtype),
-            valueInputNorm!(inputs.2).asType(dtype)
+            inkling2Normed(queryInputNorm!, inputs.0, dtype: dtype),
+            inkling2Normed(keyInputNorm!, inputs.1, dtype: dtype),
+            inkling2Normed(valueInputNorm!, inputs.2, dtype: dtype)
         )
     }
 
@@ -812,19 +919,42 @@ package final class Inkling2DecoderLayer: Module {
         _ x: MLXArray, blocks: MLXArray?, cache: Inkling2VisitCache?, mask: MLXArray?,
         messages: MLXArray?
     ) -> (MLXArray, MLXArray?) {
-        let dtype = x.dtype
+        let messages = messages.map { ($0, inkling2UnitRMS($0)) }
+        if let step = decode(x, blocks: blocks, cache: cache, mask: mask, messages: messages) {
+            return step
+        }
         let convolution = cache?.convolution
-        var states: [MLXArray?] = (0 ..< 4).map { convolution?[$0] }
-        var windows: [MLXArray?] = Array(repeating: nil, count: 4)
+        let lengths = convolution?.currentLengths
 
-        let blockInput = x
-        let normedInput = inkling2UnitRMS(blockInput.asType(.float32))
+        let normedInput = inkling2UnitRMS(x)
         let depth = attentionInput?(blocks: blocks, partial: normedInput)
         let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
-        var h = attention(
-            query: q, key: k, value: v, cache: cache, convolutionStates: &states,
-            windows: &windows, mask: mask)
-        (h, windows[2]) = postAttentionConvolution(h, state: states[2], mask: mask)
+        let (h, keyState, valueState) = attention(
+            query: q, key: k, value: v, cache: cache,
+            states: (convolution?[0], convolution?[1]), mask: mask, lengths: lengths)
+        let (out, newBlocks, attentionState, mlpState) = feedForward(
+            x, normedInput: normedInput, attention: h, blocks: blocks, messages: messages,
+            states: (convolution?[2], convolution?[3]), mask: mask, lengths: lengths)
+
+        if let convolution {
+            for (i, state) in [keyState, valueState, attentionState, mlpState].enumerated() {
+                convolution[i] = state
+            }
+            convolution.advance(x.dim(1))
+        }
+        return (out, newBlocks)
+    }
+
+    /// The rest of the layer after the attention's output projection `h`. Returns the
+    /// output, the blocks, and the next post-attention and post-MLP convolution states.
+    private func feedForward(
+        _ x: MLXArray, normedInput: MLXArray, attention h: MLXArray, blocks: MLXArray?,
+        messages: Inkling2Messages?, states: (MLXArray?, MLXArray?), mask: MLXArray?,
+        lengths: MLXArray?
+    ) -> (MLXArray, MLXArray?, MLXArray, MLXArray) {
+        let dtype = x.dtype
+        let (h, attentionState) = postAttentionConvolution(
+            h, state: states.0, mask: mask, lengths: lengths)
 
         var blocks = blocks
         var residual = h.asType(.float32)
@@ -832,25 +962,111 @@ package final class Inkling2DecoderLayer: Module {
             let block = normedInput[.newAxis]
             blocks = blocks.map { concatenated([$0, block], axis: 0) } ?? block
         } else {
-            residual = blockInput.asType(.float32) + residual
+            residual = x.asType(.float32) + residual
         }
 
-        h = mlpInput(blocks: blocks, partial: inkling2UnitRMS(residual))[.ellipsis, 0, 0...]
+        var m = mlpInput(blocks: blocks, partial: inkling2UnitRMS(residual))[
+            .ellipsis, 0, 0...]
         if let messages {
-            h = mlpMessageGate!(h, message: messages[.ellipsis, 3, 0...])
+            m = mlpMessageGate!(m, messages: messages, gate: 3)
         }
-        h = mlp(postAttentionNorm(h).asType(dtype))
-        (h, windows[3]) = postMLPConvolution(h, state: states[3], mask: mask)
+        let (out, mlpState) = postMLPConvolution(
+            mlp(inkling2Normed(postAttentionNorm, m, dtype: dtype)),
+            state: states.1, mask: mask,
+            lengths: lengths)
+        return ((residual + out.asType(.float32)).asType(dtype), blocks, attentionState, mlpState)
+    }
 
-        if let convolution {
-            let lengths = convolution.currentLengths
-            for (i, window) in windows.enumerated() {
-                convolution[i] = convolutionState(
-                    window!, lengths: lengths, count: convKernelSize - 1)
-            }
-            convolution.advance(x.dim(1))
+    // MARK: Decode
+
+    // A decode step runs as two compiled traces, before and after the cache writes, whose
+    // offsets move every token. Arguments: `[x, key state, value state, positions]` and
+    // `[x, normed input, attention, gate, post-attention state, post-MLP state]`, each
+    // followed by the blocks (every layer but the first) and the loop messages and their
+    // unit RMS, if any.
+    private let compiledDecodeInput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+        layer.decodeInput(arguments)
+    }
+    private let compiledDecodeOutput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+        layer.decodeOutput(arguments)
+    }
+
+    /// The blocks and messages after `count` leading arguments.
+    private func extras(
+        _ arguments: [MLXArray], after count: Int
+    ) -> (MLXArray?, Inkling2Messages?) {
+        let blocks = index > 0 ? arguments[count] : nil
+        let start = count + (index > 0 ? 1 : 0)
+        let messages =
+            arguments.count > start
+            ? (arguments[start], arguments[start + 1]) : nil
+        return (blocks, messages)
+    }
+
+    /// Returns `[normed input, queries, keys, values, position bias, sinks, gate, stored
+    /// position, key state, value state]`.
+    private func decodeInput(_ arguments: [MLXArray]) -> [MLXArray] {
+        let (x, positions) = (arguments[0], arguments[3])
+        let (blocks, messages) = extras(arguments, after: 4)
+        let normedInput = inkling2UnitRMS(x)
+        let depth = attentionInput?(blocks: blocks, partial: normedInput)
+        let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
+        let projected = attention.project(
+            query: q, key: k, value: v, states: (arguments[1], arguments[2]), mask: nil,
+            lengths: nil)
+        let (queries, relative) = attention.lengthScaled(
+            queries: projected.queries, relative: projected.relative, positions: positions)
+        return [
+            normedInput, queries.transposed(0, 2, 1, 3), projected.keys, projected.values,
+            attention.relativeLogits(relative), projected.sinks, projected.gate,
+            (positions + 1).reshaped(x.dim(0), 1, 1, 1), projected.keyState,
+            projected.valueState,
+        ]
+    }
+
+    /// Returns `[output, blocks, post-attention state, post-MLP state]`.
+    private func decodeOutput(_ arguments: [MLXArray]) -> [MLXArray] {
+        let (blocks, messages) = extras(arguments, after: 6)
+        let (out, newBlocks, attentionState, mlpState) = feedForward(
+            arguments[0], normedInput: arguments[1],
+            attention: attention.output(arguments[2], gate: arguments[3]), blocks: blocks,
+            messages: messages, states: (arguments[4], arguments[5]), mask: nil, lengths: nil)
+        return [out, newBlocks!, attentionState, mlpState]
+    }
+
+    /// One token per row on the GPU, through the compiled traces; nil where the general path
+    /// must run: prompts, padding, training, a sharded layer, or no convolution states yet.
+    private func decode(
+        _ x: MLXArray, blocks: MLXArray?, cache: Inkling2VisitCache?, mask: MLXArray?,
+        messages: Inkling2Messages?
+    ) -> (MLXArray, MLXArray?)? {
+        guard x.dim(1) == 1, mask == nil, let cache, cache.convolution.currentLengths == nil,
+            inkling2UsesKernels(), !training, mlp.shardingGroup == nil,
+            (blocks != nil) == (index > 0)
+        else { return nil }
+        let convolution = cache.convolution
+        let states = (0 ..< 4).compactMap { convolution[$0] }
+        guard states.count == 4 else { return nil }
+        let B = x.dim(0)
+        let extras = [blocks, messages?.raw, messages?.normed].compactMap { $0 }
+
+        // Each row writes one token, so the next positions are the query positions.
+        let positions = Inkling2Attention.queryPositions(
+            cache.keyValues, batch: B, length: 1, written: false)
+        let input = compiledDecodeInput(self, [x, states[0], states[1], positions] + extras)
+        let (keys, values) = cache.keyValues.update(keys: input[2], values: input[3])
+        let stored = cache.positions.update(keys: input[7], values: input[7]).0.reshaped(B, -1)
+        let attended = attention.attention(
+            queries: input[1], keys: keys, values: values, positionBias: input[4],
+            sinks: input[5], queryPositions: positions, storedKeyPositions: stored)
+        let output = compiledDecodeOutput(
+            self, [x, input[0], attended, input[6], states[2], states[3]] + extras)
+
+        for (i, state) in [input[8], input[9], output[2], output[3]].enumerated() {
+            convolution[i] = state
         }
-        return ((residual + h.asType(.float32)).asType(dtype), blocks)
+        convolution.advance(1)
+        return (output[0], output[1])
     }
 }
 
@@ -948,7 +1164,7 @@ public final class Inkling2TextModel: Module {
                 if pass > 0 {
                     let completed = blocks.map { $0[(preludeBlocks + 1)...] }
                     bank = Inkling2MessageBank(
-                        blocks: completed, partial: inkling2UnitRMS(h.asType(.float32)))
+                        blocks: completed, partial: inkling2UnitRMS(h))
                     (h, blocks) = prelude
                 }
                 (h, blocks) = run(loop.core, h, blocks, bank: bank)
@@ -959,9 +1175,9 @@ public final class Inkling2TextModel: Module {
         }
 
         h =
-            finalInput(blocks: blocks, partial: inkling2UnitRMS(h.asType(.float32)))[
+            finalInput(blocks: blocks, partial: inkling2UnitRMS(h))[
                 .ellipsis, 0, 0...]
-        return norm(h).asType(dtype)
+        return inkling2Normed(norm, h, dtype: dtype)
     }
 
     private static func visitCaches(_ cache: [KVCache]) -> [Inkling2VisitCache] {

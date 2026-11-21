@@ -8,6 +8,42 @@ import Testing
 @testable import MLXLLM
 @testable import MLXLMCommon
 
+/// A small text configuration with `Hq` query and `Hkv` key-value heads of `D` dimensions.
+private func textConfiguration(
+    Hq: Int = 8, Hkv: Int = 2, D: Int = 128, R: Int = 24, window: Int = 0,
+    experts: Int = 2, topK: Int = 1, routeScale: Float = 1
+) throws -> Inkling2TextConfiguration {
+    try JSONDecoder().decode(
+        Inkling2TextConfiguration.self,
+        from: Data(
+            """
+            {"hidden_size": 64, "num_hidden_layers": 1, "vocab_size": 8,
+             "num_attention_heads": \(Hq), "num_key_value_heads": \(Hkv), "head_dim": \(D),
+             "swa_num_attention_heads": \(Hq), "swa_num_key_value_heads": \(Hkv),
+             "swa_head_dim": \(D), "sliding_window_size": \(max(window, 1)),
+             "local_layer_ids": \(window > 0 ? "[0]" : "[]"), "d_rel": 4, "rel_extent": \(R),
+             "log_scaling_n_floor": 8192, "log_scaling_alpha": 0.1, "rms_norm_eps": 1e-6,
+             "qk_l2_clip_threshold": 22.6, "rel_l2_clip_threshold": 8,
+             "sconv_kernel_size": 4, "n_layers_per_attn_res_block": 6,
+             "n_routed_experts": \(experts), "num_experts_per_tok": \(topK),
+             "intermediate_size": 64, "mlp_gate_softcap": 4, "mlp_up_softcap": 25,
+             "route_scale": \(routeScale), "final_logit_softcapping": 30}
+            """.utf8))
+}
+
+/// Whether `a` and `b` hold the same bits.
+private func sameBits(_ a: MLXArray, _ b: MLXArray) -> Bool {
+    guard a.dtype == b.dtype, a.shape == b.shape else { return false }
+    let width: DType =
+        switch a.dtype.size {
+        case 1: .uint8
+        case 2: .uint16
+        case 4: .uint32
+        default: .uint64
+        }
+    return arrayEqual(a.view(dtype: width), b.view(dtype: width)).item(Bool.self)
+}
+
 /// Inkling 2's Metal kernels against the reference ops they replace.
 @Suite(.serialized)
 struct Inkling2KernelTests {
@@ -38,22 +74,7 @@ struct Inkling2KernelTests {
     func relativeAttention(L: Int, S: Int, window: Int, padding: Int) throws {
         MLXRandom.seed(11)
         let (B, Hq, Hkv, D, R) = (2, 8, 2, 128, 24)
-        let args = try JSONDecoder().decode(
-            Inkling2TextConfiguration.self,
-            from: Data(
-                """
-                {"hidden_size": 64, "num_hidden_layers": 1, "vocab_size": 8,
-                 "num_attention_heads": \(Hq), "num_key_value_heads": \(Hkv), "head_dim": \(D),
-                 "swa_num_attention_heads": \(Hq), "swa_num_key_value_heads": \(Hkv),
-                 "swa_head_dim": \(D), "sliding_window_size": \(max(window, 1)),
-                 "local_layer_ids": \(window > 0 ? "[0]" : "[]"), "d_rel": 4, "rel_extent": \(R),
-                 "log_scaling_n_floor": 8192, "log_scaling_alpha": 0.1, "rms_norm_eps": 1e-6,
-                 "qk_l2_clip_threshold": 22.6, "rel_l2_clip_threshold": 8,
-                 "sconv_kernel_size": 4, "n_layers_per_attn_res_block": 6,
-                 "n_routed_experts": 2, "num_experts_per_tok": 1, "intermediate_size": 64,
-                 "mlp_gate_softcap": 4, "mlp_up_softcap": 25, "route_scale": 1,
-                 "final_logit_softcapping": 30}
-                """.utf8))
+        let args = try textConfiguration(Hq: Hq, Hkv: Hkv, D: D, R: R, window: window)
         let attention = Inkling2Attention(args, sliding: window > 0)
         func clipped(_ shape: [Int]) -> MLXArray {
             let x = MLXRandom.normal(shape)
@@ -86,7 +107,7 @@ struct Inkling2KernelTests {
 
     /// A small bfloat16 Inkling 2 Mini whose looped layers complete depth blocks, with the
     /// router, depth queries and experts in float32 as the checkpoints keep them.
-    private func bfloat16Model() throws -> Inkling2Model {
+    private func bfloat16Model(experts: Int = 2, topK: Int = 2) throws -> Inkling2Model {
         let model = Inkling2Model(
             try JSONDecoder().decode(
                 Inkling2Configuration.self,
@@ -101,8 +122,8 @@ struct Inkling2KernelTests {
                         "log_scaling_n_floor": 16, "log_scaling_alpha": 0.1,
                         "rms_norm_eps": 1e-6, "qk_l2_clip_threshold": 3.0,
                         "rel_l2_clip_threshold": 2.0, "sconv_kernel_size": 4,
-                        "n_layers_per_attn_res_block": 3, "n_routed_experts": 2,
-                        "num_experts_per_tok": 2, "intermediate_size": 128,
+                        "n_layers_per_attn_res_block": 3, "n_routed_experts": \(experts),
+                        "num_experts_per_tok": \(topK), "intermediate_size": 128,
                         "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0, "route_scale": 2.0,
                         "final_logit_softcapping": 30.0,
                         "loop_config": {"core_start": 3, "core_end": 6, "num_passes": 3,
@@ -146,6 +167,165 @@ struct Inkling2KernelTests {
             // kernels off the GPU and CPU already differ by about 0.18 here. Every token takes
             // both experts, so no near tie in routing can flip and amplify the difference.
             #expect(maxDifference(kernel, expected) < 0.3)
+        }
+    }
+
+    @Test(
+        "The short convolution kernel matches its ops",
+        arguments: [(1, true), (1, false), (2, true), (5, true), (33, false), (33, true)])
+    func shortConvolution(length: Int, hasState: Bool) throws {
+        MLXRandom.seed(3)
+        for (channels, dtype) in [(1024, DType.bfloat16), (2304, .bfloat16), (64, .float32)] {
+            let convolution = Inkling2ShortConvolution(dimensions: channels, kernelSize: 4)
+            // A new module starts in training, which skips the kernels; loading ends it.
+            convolution.train(false)
+            convolution.conv1d.update(
+                parameters: ModuleParameters.unflattened([
+                    "weight": (MLXRandom.normal([channels, 4, 1]) * 0.5).asType(dtype)
+                ]))
+            let x = MLXRandom.normal([2, length, channels]).asType(dtype)
+            let state = hasState ? MLXRandom.normal([2, 3, channels]) : nil
+            let (out, next) = convolution(x, state: state, mask: nil)
+            let (expected, expectedNext) = convolution(
+                x, state: state, mask: nil, forceReference: true)
+            #expect(sameBits(out, expected))
+            #expect(sameBits(next, expectedNext))
+        }
+    }
+
+    /// Keys at random positions, some empty (0) and some ahead of the query, as a wrapped
+    /// rotating cache holds them.
+    @Test(
+        "The decode mask kernel matches its ops",
+        arguments: [(0, 40, 24), (16, 40, 24), (16, 10, 32), (0, 300, 64)])
+    func decodeMask(window: Int, keys: Int, extent: Int) throws {
+        MLXRandom.seed(5)
+        let args = try textConfiguration(R: extent, window: window)
+        let attention = Inkling2Attention(args, sliding: window > 0)
+        attention.train(false)
+        let query = Float(keys + 7)
+        let bias = MLXRandom.normal([1, 1, 8, extent]).asType(.bfloat16)
+        let stored = MLXRandom.randInt(0 ..< Int32(query + 4), [1, keys]).asType(.float32)
+        let positions = MLXArray([query]).reshaped(1, 1)
+        let mask = attention.decodeMask(
+            positionBias: bias, queryPositions: positions, storedKeyPositions: stored)
+        let expected = attention.decodeMask(
+            positionBias: bias, queryPositions: positions, storedKeyPositions: stored,
+            forceReference: true)
+        #expect(sameBits(mask, expected))
+    }
+
+    @Test(
+        "The router kernel matches the fused router it replaces",
+        arguments: [(128, 8), (16, 4), (2, 2)])
+    func router(experts: Int, topK: Int) throws {
+        MLXRandom.seed(9)
+        let router = Inkling2Router(
+            try textConfiguration(experts: experts, topK: topK, routeScale: 2.5))
+        router.train(false)
+        // Each expert's twin ties it, so the order of equal scores is checked too.
+        func twins(_ x: MLXArray) -> MLXArray {
+            concatenated([x[..<(experts / 2)], x[..<(experts / 2)]], axis: 0)
+        }
+        router.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": twins(MLXRandom.normal([experts, 64]) * 0.2),
+                "e_score_correction_bias": twins(MLXRandom.normal([experts]) * 0.01),
+            ]))
+        for _ in 0 ..< 16 {
+            let x = MLXRandom.normal([1, 1, 64]).asType(.bfloat16)
+            let (indices, weights) = router(x)
+            let (expectedIndices, expectedWeights) = router(x, forceReference: true)
+            #expect(sameBits(indices, expectedIndices))
+            #expect(sameBits(weights, expectedWeights))
+        }
+    }
+
+    @Test(
+        "The expert combine kernel matches its ops",
+        arguments: [[1, 1, 8, 2304], [2, 3, 8, 64], [1, 5, 2, 128]])
+    func expertCombine(shape: [Int]) throws {
+        MLXRandom.seed(13)
+        let moe = Inkling2SparseMoE(try textConfiguration())
+        moe.train(false)
+        let outputs = MLXRandom.normal(shape).asType(.bfloat16)
+        let weights = MLXRandom.uniform(0 ..< 2, Array(shape.dropLast()))
+        for dtype in [DType.bfloat16, .float32] {
+            #expect(
+                sameBits(
+                    moe.combine(outputs, weights: weights, dtype: dtype),
+                    moe.combine(outputs, weights: weights, dtype: dtype, forceReference: true)))
+        }
+    }
+
+    /// Rows of 16 and 64 values are summed in order; longer rows in runs of four per lane.
+    @Test(
+        "The L2 clip kernel matches its ops",
+        arguments: [(24, 16), (24, 64), (8, 128), (24, 128), (3, 200)])
+    func l2Clip(heads: Int, dimensions: Int) throws {
+        MLXRandom.seed(19)
+        let x = (MLXRandom.normal([1, 1, heads, dimensions]) * 3).asType(.bfloat16)
+        let scale = (1 + 0.1 * MLXRandom.normal([heads, dimensions])).asType(.bfloat16)
+        // A low threshold clips some rows and leaves others.
+        let threshold = Float(dimensions).squareRoot() * 3
+        #expect(inkling2L2ClipKernelTakes(x))
+        for scale in [scale, nil] {
+            #expect(
+                sameBits(
+                    inkling2L2Clip(x, scale: scale, threshold: threshold),
+                    inkling2L2Clip(x, scale: scale, threshold: threshold, useKernel: false)))
+        }
+    }
+
+    /// Hundreds of rows, since a rounding difference in one row's norm can be rare.
+    @Test("Norms without a ones weight, and with the weight after, give MLX's bits")
+    func rmsNorm() throws {
+        MLXRandom.seed(17)
+        for dimensions in [16, 128, 2304] {
+            let x = MLXRandom.normal([1, 512, dimensions]) * 3
+            #expect(
+                sameBits(
+                    inkling2UnitRMS(x),
+                    MLXFast.rmsNorm(x, weight: MLXArray.ones([dimensions]), eps: 1e-6)))
+            for (weightType, dtype) in [
+                (DType.bfloat16, DType.bfloat16), (.bfloat16, .float32), (.float32, .bfloat16),
+            ] {
+                let norm = RMSNorm(dimensions: dimensions, eps: 1e-6)
+                norm.update(
+                    parameters: ModuleParameters.unflattened([
+                        "weight": (1 + 0.1 * MLXRandom.normal([dimensions])).asType(weightType)
+                    ]))
+                #expect(sameBits(inkling2Normed(norm, x, dtype: dtype), norm(x).asType(dtype)))
+            }
+        }
+    }
+
+    /// Prepared lengths give every decode step a mask, which sends it down the general
+    /// path. One token per row is valid, so the mask hides nothing.
+    @Test("Compiled decode steps give the general path's bits", arguments: [1, 2])
+    func compiledDecode(batch: Int) throws {
+        MLXRandom.seed(0)
+        let model = try bfloat16Model(experts: 8, topK: 2)
+        model.train(false)
+        let tokens = MLXRandom.randInt(Int32(0) ..< 120, [batch, 60])
+        func decode(general: Bool) throws -> [MLXArray] {
+            let cache = try model.newCache(parameters: nil)
+            var logits = [model(tokens[0..., ..<20], cache: cache)]
+            for step in 20 ..< 60 {
+                if general {
+                    for case let convolution as ArraysCache in cache {
+                        convolution.prepare(lengths: Array(repeating: 1, count: batch))
+                    }
+                }
+                logits.append(model(tokens[0..., step ..< step + 1], cache: cache))
+                eval(logits.last!)
+            }
+            return logits
+        }
+        let compiled = try decode(general: false)
+        let general = try decode(general: true)
+        for (a, b) in zip(compiled, general) {
+            #expect(sameBits(a, b))
         }
     }
 
