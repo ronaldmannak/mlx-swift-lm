@@ -77,6 +77,25 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
     /// The number of rows.
     public var batchSize: Int { positions.count }
 
+    /// The rows the buffers have room for. It exceeds ``batchSize`` after rows left in
+    /// place: the spare slots follow the live rows, and the next row to join is written
+    /// into one instead of every row being copied into a larger buffer.
+    private var rowCapacity: Int { keys?.dim(0) ?? 0 }
+
+    /// The buffer position of the batch's first column. It moves right when rows leave in
+    /// place and every remaining row is left with padding: those columns are skipped
+    /// rather than copied away, until the buffers next grow or are rebuilt.
+    private var start = 0
+
+    /// The buffers without their spare row slots and skipped columns.
+    private var liveStorage: (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        if rowCapacity == batchSize, start == 0 { return (keys, values) }
+        return (
+            keys[..<batchSize, 0..., start..., 0...], values[..<batchSize, 0..., start..., 0...]
+        )
+    }
+
     /// Whether any row carries left padding.
     private var hasLeftPadding: Bool { leftPaddingValues.contains { $0 != 0 } }
 
@@ -113,16 +132,20 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = idx
-        if self.keys == nil || previous + keys.dim(2) > self.keys!.dim(2) {
+        if self.keys == nil || start + previous + keys.dim(2) > self.keys!.dim(2) {
             let length = (step + keys.dim(2) - 1) / step * step
+            // Spare row slots grow with the live rows.
+            let rows = self.keys?.dim(0) ?? keys.dim(0)
             let newKeys = MLXArray.zeros(
-                [keys.dim(0), keys.dim(1), length, keys.dim(3)], dtype: keys.dtype)
+                [rows, keys.dim(1), length, keys.dim(3)], dtype: keys.dtype)
             let newValues = MLXArray.zeros(
-                [values.dim(0), values.dim(1), length, values.dim(3)], dtype: values.dtype)
+                [rows, values.dim(1), length, values.dim(3)], dtype: values.dtype)
             if var currentKeys = self.keys, var currentValues = self.values {
-                if previous % step != 0 {
-                    currentKeys = currentKeys[.ellipsis, ..<previous, 0...]
-                    currentValues = currentValues[.ellipsis, ..<previous, 0...]
+                if start > 0 || previous % step != 0 {
+                    // Growing copies the buffers anyway, so the skipped columns go too.
+                    currentKeys = currentKeys[.ellipsis, start ..< start + previous, 0...]
+                    currentValues = currentValues[.ellipsis, start ..< start + previous, 0...]
+                    start = 0
                 }
                 self.keys = concatenated([currentKeys, newKeys], axis: 2)
                 self.values = concatenated([currentValues, newValues], axis: 2)
@@ -135,14 +158,22 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
         let n = Int32(keys.dim(2))
         idx += keys.dim(2)
         setPositions(positions.map { $0 + n })
-        self.keys![.ellipsis, previous ..< idx, 0...] = keys
-        self.values![.ellipsis, previous ..< idx, 0...] = values
-        return (self.keys![.ellipsis, ..<idx, 0...], self.values![.ellipsis, ..<idx, 0...])
+        guard rowCapacity > batchSize || start > 0 else {
+            self.keys![.ellipsis, previous ..< idx, 0...] = keys
+            self.values![.ellipsis, previous ..< idx, 0...] = values
+            return (self.keys![.ellipsis, ..<idx, 0...], self.values![.ellipsis, ..<idx, 0...])
+        }
+        let rows = batchSize
+        let written = start + previous ..< start + idx
+        self.keys![..<rows, 0..., written, 0...] = keys
+        self.values![..<rows, 0..., written, 0...] = values
+        let used = start ..< start + idx
+        return (self.keys![..<rows, 0..., used, 0...], self.values![..<rows, 0..., used, 0...])
     }
 
     public override var state: [MLXArray] {
         get {
-            guard let keys, let values else { return [batchOffset, leftPadding] }
+            guard let (keys, values) = liveStorage else { return [batchOffset, leftPadding] }
             return [
                 keys[.ellipsis, ..<idx, 0...], values[.ellipsis, ..<idx, 0...],
                 batchOffset, leftPadding,
@@ -154,12 +185,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
                 keys = nil
                 values = nil
                 idx = 0
+                start = 0
                 setPositions(newValue[0].asArray(Int32.self))
                 setLeftPadding(newValue[1].asArray(Int32.self))
             case 4:
                 keys = newValue[0]
                 values = newValue[1]
                 idx = newValue[0].dim(2)
+                start = 0
                 setPositions(newValue[2].asArray(Int32.self))
                 setLeftPadding(newValue[3].asArray(Int32.self))
             default:
@@ -244,9 +277,10 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
         guard let rightPadding, let rightPaddingValues else { return }
         // A circular roll of the whole buffer lands each row's tokens at
         // `padding ..< idx`; what wraps around is masked or unused.
-        if let keys, let values {
+        if let (keys, values) = liveStorage {
             self.keys = dynamicRoll(keys, shifts: rightPadding[0..., .newAxis], axis: 2)
             self.values = dynamicRoll(values, shifts: rightPadding[0..., .newAxis], axis: 2)
+            start = 0
         }
         setPositions(zip(positions, rightPaddingValues).map { $0 - $1 })
         setLeftPadding(zip(leftPaddingValues, rightPaddingValues).map { $0 + $1 })
@@ -261,13 +295,16 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
             values = nil
             setRightPadding(nil)
             idx = 0
+            start = 0
             setLeftPadding([])
             setPositions([])
             return
         }
         let indices = MLXArray(rows.map { Int32($0) })
-        keys = keys?[indices]
-        values = values?[indices]
+        let storage = liveStorage
+        keys = storage?.keys[indices]
+        values = storage?.values[indices]
+        start = 0
         setPositions(rows.map { positions[$0] })
         var padding = rows.map { leftPaddingValues[$0] }
         // A ragged prefill's right padding goes with its rows, as in mlx-vlm:
@@ -313,9 +350,9 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
             }
         }
         try validateBatchKVExtension(
-            keys: keys, values: values, batchSize: batchSize, end: idx,
-            otherKeys: other.keys, otherValues: other.values, otherBatchSize: other.batchSize,
-            otherEnd: other.idx)
+            keys: liveStorage?.keys, values: liveStorage?.values, batchSize: batchSize, end: idx,
+            otherKeys: other.liveStorage?.keys, otherValues: other.liveStorage?.values,
+            otherBatchSize: other.batchSize, otherEnd: other.idx)
     }
 
     /// Appends the rows of `other`. Port of mlx-lm's `BatchKVCache.extend`: rows without keys
@@ -330,8 +367,9 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
             "BatchKVCache.extend takes finalized rows; finalize a ragged prefill first")
         guard batchSize > 0 else {
             // New array objects, so writes to either cache leave the other unchanged.
-            keys = other.keys?[.ellipsis]
-            values = other.values?[.ellipsis]
+            keys = other.liveStorage?.keys[.ellipsis]
+            values = other.liveStorage?.values[.ellipsis]
+            start = 0
             idx = other.idx
             setLeftPadding(other.leftPaddingValues)
             setPositions(other.positions)
@@ -344,9 +382,10 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
             setPositions(positions + other.positions)
             return
         }
+        if extendIntoSpareRows(other) { return }
         // Rows without keys take zero-width arrays, which the padding below fills.
         func arrays(_ cache: BatchKVCache) -> (MLXArray, MLXArray) {
-            if let keys = cache.keys, let values = cache.values { return (keys, values) }
+            if let storage = cache.liveStorage { return storage }
             return (
                 MLXArray.zeros(
                     [cache.batchSize, templateKeys.dim(1), 0, templateKeys.dim(3)],
@@ -365,6 +404,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
         let added = rightJustify(otherKeys, otherValues, end: other.idx, to: end, width: width)
         keys = concatenated([own.keys, added.keys])
         values = concatenated([own.values, added.values])
+        start = 0
         let ownShift = Int32(end - idx)
         let addedShift = Int32(end - other.idx)
         setLeftPadding(
@@ -372,6 +412,88 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
                 + other.leftPaddingValues.map { $0 + addedShift })
         setPositions(positions + other.positions)
         idx = end
+    }
+
+    /// Writes the rows of `other` into this batch's spare row slots, when it has enough of
+    /// them and the new rows are no longer than the batch. Only the new rows are written:
+    /// the live rows stay where they are, in the buffer they are in.
+    ///
+    /// - Returns: `false`, with nothing changed, when the rows have to be appended by copy
+    private func extendIntoSpareRows(_ other: BatchKVCache) -> Bool {
+        guard !inPlaceBatchResizeDisabled, keys != nil, values != nil,
+            let added = other.liveStorage,
+            rowCapacity - batchSize >= other.batchSize, other.idx <= idx
+        else { return false }
+        // The same contents `extend` gives the rows by copy: tokens ending at `idx`, zeros
+        // to their left.
+        let rows = rightJustify(
+            added.keys[.ellipsis, ..<other.idx, 0...], added.values[.ellipsis, ..<other.idx, 0...],
+            end: other.idx, to: idx, width: idx)
+        let slots = batchSize ..< batchSize + other.batchSize
+        keys![slots, 0..., start ..< start + idx, 0...] = rows.keys
+        values![slots, 0..., start ..< start + idx, 0...] = rows.values
+        let shift = Int32(idx - other.idx)
+        setLeftPadding(leftPaddingValues + other.leftPaddingValues.map { $0 + shift })
+        setPositions(positions + other.positions)
+        return true
+    }
+
+    /// The order the rows are in after the rows at `removed` leave a batch of `count` and
+    /// its last rows move into their slots: entry `i` is the current index of the row that
+    /// slot `i` holds afterwards. Only the rows that change slot have to be copied.
+    static func orderAfterRemoving(_ removed: [Int], from count: Int) -> [Int] {
+        var order = Array(0 ..< count)
+        for index in removed.sorted(by: >) {
+            let last = order.removeLast()
+            if index < order.count { order[index] = last }
+        }
+        return order
+    }
+
+    /// Whether ``moveRows(to:moved:)`` can leave the rows in `order` without copying the
+    /// rows that stay in their slots.
+    ///
+    /// Not when half the buffers' rows, or half their columns in use, would then hold
+    /// nothing: a shrinking batch gives memory back through ``filter(batchIndices:)``.
+    func canMoveRows(to order: [Int]) -> Bool {
+        guard !inPlaceBatchResizeDisabled, keys != nil, values != nil, rightPadding == nil,
+            !order.isEmpty, rowCapacity < 2 * order.count
+        else { return false }
+        let shared = Int(min(order.map { leftPaddingValues[$0] }.min() ?? 0, Int32(idx)))
+        return start + shared <= idx - shared
+    }
+
+    /// The rows `order` moves to another slot, as arrays of their own: keys, then values.
+    /// Empty when no row moves.
+    ///
+    /// Evaluate them before ``moveRows(to:moved:)``. A row copied out of the buffer while
+    /// the buffer is still being read cannot be written back into it in place.
+    func rowsMoving(to order: [Int]) -> [MLXArray] {
+        let sources = order.enumerated().filter { $0.offset != $0.element }.map {
+            Int32($0.element)
+        }
+        guard !sources.isEmpty, let keys, let values else { return [] }
+        let indices = MLXArray(sources)
+        return [keys[indices], values[indices]]
+    }
+
+    /// Leaves the rows in `order`, which ``canMoveRows(to:)`` accepted, writing `moved`,
+    /// from ``rowsMoving(to:)``, into the slots that change rows. The slots after
+    /// `order.count` become spare.
+    func moveRows(to order: [Int], moved: [MLXArray]) {
+        var next = 0
+        for (slot, source) in order.enumerated() where slot != source {
+            keys![slot ..< slot + 1] = moved[0][next ..< next + 1]
+            values![slot ..< slot + 1] = moved[1][next ..< next + 1]
+            next += 1
+        }
+        setPositions(order.map { positions[$0] })
+        // The left padding every remaining row has is skipped, where `filter` slices it off.
+        let padding = order.map { leftPaddingValues[$0] }
+        let shared = min(padding.min() ?? 0, Int32(idx))
+        start += Int(shared)
+        idx -= Int(shared)
+        setLeftPadding(padding.map { $0 - shared })
     }
 
     /// The row at `index` without its left padding, as a ``KVCacheSimple``. A row whose
@@ -387,9 +509,9 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
         let cache = KVCacheSimple()
         let padding = Int(leftPaddingValues[index])
         if let keys, let values, padding < idx {
-            cache.keys = MLX.contiguous(keys[index ..< index + 1, 0..., padding ..< idx, 0...])
-            cache.values = MLX.contiguous(
-                values[index ..< index + 1, 0..., padding ..< idx, 0...])
+            let columns = start + padding ..< start + idx
+            cache.keys = MLX.contiguous(keys[index ..< index + 1, 0..., columns, 0...])
+            cache.values = MLX.contiguous(values[index ..< index + 1, 0..., columns, 0...])
             cache.offset = idx - padding
         }
         return cache
@@ -449,6 +571,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchableK
         copy.values = values?[.ellipsis]
         copy.setRightPadding(rightPaddingValues)
         copy.idx = idx
+        copy.start = start
         copy.step = step
         return copy
     }
@@ -547,3 +670,6 @@ private final class PaddingMasks: @unchecked Sendable {
         }
     }
 }
+
+// BENCH ONLY: resize by copy as before, to measure what the in-place path buys.
+private let inPlaceBatchResizeDisabled = getenv("BENCH_NO_INPLACE_RESIZE") != nil
