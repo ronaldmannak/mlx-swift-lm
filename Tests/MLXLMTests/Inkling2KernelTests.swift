@@ -215,6 +215,51 @@ struct Inkling2KernelTests {
         #expect(sameBits(mask, expected))
     }
 
+    /// Three rows with keys at random positions, some empty (0), as batched caches hold
+    /// them. 2048 keys take MLX's two-pass attention.
+    @Test(
+        "Batched decode attention gives each row its solo bits",
+        arguments: [(0, 40), (16, 40), (0, 300), (16, 2048), (0, 2048)])
+    func batchedDecodeAttention(window: Int, keys S: Int) throws {
+        MLXRandom.seed(13)
+        let (B, Hq, Hkv, D, R) = (3, 8, 2, 128, 24)
+        let args = try textConfiguration(Hq: Hq, Hkv: Hkv, D: D, R: R, window: window)
+        let attention = Inkling2Attention(args, sliding: window > 0)
+        attention.train(false)
+        func clipped(_ shape: [Int]) -> MLXArray {
+            let x = MLXRandom.normal(shape)
+            return (x / sqrt((x * x).sum(axis: -1, keepDims: true)) * 3).asType(.bfloat16)
+        }
+        let queries = clipped([B, Hq, 1, D])
+        let keys = clipped([B, Hkv, S, D])
+        let values = inkling2UnitRMS(MLXRandom.normal([B, Hkv, S, D])).asType(.bfloat16)
+        let bias = (MLXRandom.normal([B, 1, Hq, R]) * 0.5).asType(.bfloat16)
+        let sinks = (MLXRandom.normal([B, 1, Hq]) * 0.5).asType(.bfloat16)
+        let positions = MLXArray([Float(S + 3), Float(S - 1), Float(S / 2)]).reshaped(B, 1)
+        let stored = MLXRandom.randInt(0 ..< Int32(S + 4), [B, S]).asType(.float32)
+        func attend(_ rows: Range<Int>, forceReference: Bool = false) -> MLXArray {
+            attention.attention(
+                queries: queries[rows], keys: keys[rows], values: values[rows],
+                positionBias: bias[rows], sinks: sinks[rows], queryPositions: positions[rows],
+                storedKeyPositions: stored[rows], forceReference: forceReference)
+        }
+
+        let mask = attention.decodeMask(
+            positionBias: bias, queryPositions: positions, storedKeyPositions: stored)
+        let expectedMask = attention.decodeMask(
+            positionBias: bias, queryPositions: positions, storedKeyPositions: stored,
+            forceReference: true)
+        #expect(sameBits(mask, expectedMask))
+
+        let batched = attend(0 ..< B)
+        #expect(batched.shape == [B, 1, Hq, D])
+        for row in 0 ..< B {
+            #expect(sameBits(batched[row ..< row + 1], attend(row ..< row + 1)))
+        }
+        let reference = Device.withDefaultDevice(.cpu) { attend(0 ..< B, forceReference: true) }
+        #expect(maxDifference(batched, reference) < 2e-2)
+    }
+
     @Test(
         "The router kernel matches the fused router it replaces",
         arguments: [(128, 8), (16, 4), (2, 2)])
