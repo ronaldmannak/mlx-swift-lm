@@ -44,6 +44,9 @@ struct InklingStreamAdapter: TokenStreamDecoder {
     private let tokenizer: any Tokenizer
     private let markers: Markers
     private let tools: [[String: any Sendable]]?
+    /// The tool names the caller declared. `nil` means no list was given, so any name
+    /// parses; an empty list accepts no calls.
+    private let declaredToolNames: Set<String>?
     private let validationPolicy: ToolCallValidationPolicy
     // The template has no generation prompt: the model writes `<|message_model|>` itself.
     private var state = State.header([])
@@ -72,8 +75,10 @@ struct InklingStreamAdapter: TokenStreamDecoder {
             let endMessage = tokenizer.convertTokenToId("<|end_message|>"),
             let invokeToolJSON = tokenizer.convertTokenToId("<|content_invoke_tool_json|>"),
             let endSampling = tokenizer.convertTokenToId("<|content_model_end_sampling|>"),
-            Set([messageModel, contentText, contentThinking, endMessage, invokeToolJSON, endSampling])
-                .count == 6
+            Set([
+                messageModel, contentText, contentThinking, endMessage, invokeToolJSON, endSampling,
+            ])
+            .count == 6
         else { return nil }
         self.tokenizer = tokenizer
         self.markers = Markers(
@@ -81,6 +86,13 @@ struct InklingStreamAdapter: TokenStreamDecoder {
             contentThinking: contentThinking, endMessage: endMessage,
             invokeToolJSON: invokeToolJSON, endSampling: endSampling)
         self.tools = tools
+        // The template reads a tool's name from `function` when present, else from the tool.
+        self.declaredToolNames = tools.map { tools in
+            Set(
+                tools.compactMap { tool in
+                    ((tool["function"] as? [String: any Sendable]) ?? tool)["name"] as? String
+                })
+        }
         self.validationPolicy = toolCallPolicy.validation
         self.detokenizer = tokenizer.makeStreamingDetokenizer()
         self.stopStringFilter = StopStringFilter(stopStrings: stopStrings)
@@ -105,14 +117,16 @@ struct InklingStreamAdapter: TokenStreamDecoder {
             return closed
         case markers.contentThinking, markers.contentText:
             guard case .header = state else {
-                return emitEvent(.protocolError("Inkling content marker outside a message header"), emit)
+                return emitEvent(
+                    .protocolError("Inkling content marker outside a message header"), emit)
             }
             // A header before a content marker names the speaker, which is not shown.
             start(token == markers.contentThinking ? .reasoning : .response)
             return true
         case markers.invokeToolJSON:
             guard case .header(let tokens) = state else {
-                return emitEvent(.protocolError("Inkling tool marker outside a message header"), emit)
+                return emitEvent(
+                    .protocolError("Inkling tool marker outside a message header"), emit)
             }
             let name = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -151,7 +165,8 @@ struct InklingStreamAdapter: TokenStreamDecoder {
             guard !reported else { return true }
             state = .betweenMessages(reported: true)
             let text = tokenizer.decode(tokenIds: [token], skipSpecialTokens: false)
-            return emitEvent(.protocolError("Unexpected token between Inkling messages: \(text)"), emit)
+            return emitEvent(
+                .protocolError("Unexpected token between Inkling messages: \(text)"), emit)
         }
     }
 
@@ -231,6 +246,10 @@ struct InklingStreamAdapter: TokenStreamDecoder {
         guard let arguments = (object["args"] ?? object["arguments"] ?? [:]) as? [String: Any]
         else {
             return rejected(.invalidArguments, "Inkling tool call arguments are not an object")
+        }
+        guard declaredToolNames?.contains(name) ?? true else {
+            return rejected(
+                .undeclaredTool, RejectedToolCall.Reason.undeclaredTool.diagnosticDetail)
         }
         var call = ToolCall(
             function: .init(name: name, arguments: arguments.mapValues { JSONValue.from($0) }),

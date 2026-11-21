@@ -599,12 +599,12 @@ private final class InklingTestTokenizer: Tokenizer, @unchecked Sendable {
 
 @Suite
 struct InklingProtocolTests {
-    private func decode(_ tokens: [Int], tokenizer: InklingTestTokenizer) throws
-        -> [TokenStreamEvent]
-    {
+    private func decode(
+        _ tokens: [Int], tokenizer: InklingTestTokenizer, tools: [[String: any Sendable]]? = nil
+    ) throws -> [TokenStreamEvent] {
         var decoder = try #require(
             ToolCallFormat.inkling.makeProtocolTokenStreamDecoder(
-                tokenizer: tokenizer, tools: nil, stopStrings: []))
+                tokenizer: tokenizer, tools: tools, stopStrings: []))
         #expect(decoder.additionalStopTokenIDs == [tokenizer.endSampling])
         var events: [TokenStreamEvent] = []
         for token in tokens {
@@ -704,5 +704,39 @@ struct InklingProtocolTests {
             tokenizer: t)
         #expect(reasons(cutOff) == [.incompleteOutput])
         #expect(calls(malformed + cutOff).isEmpty)
+    }
+
+    @Test("A call to a tool the caller didn't declare is rejected, not run")
+    func undeclaredTools() throws {
+        let t = InklingTestTokenizer()
+        let turn = [
+            t.messageModel, t.id("get_weather"), t.invokeToolJSON,
+            t.id(#"{"name":"get_weather","args":{"city":"Paris"}}"#), t.endMessage,
+            t.messageModel, t.id("ping"), t.invokeToolJSON, t.id(#"{"name":"ping"}"#),
+            t.endMessage, t.endSampling,
+        ]
+        func rejected(_ events: [TokenStreamEvent]) -> [String?] {
+            events.compactMap {
+                if case .rejectedToolCall(let rejection) = $0, rejection.reason == .undeclaredTool {
+                    return rejection.toolName
+                }
+                return nil
+            }
+        }
+        let weather: [String: any Sendable] = [
+            "type": "function", "function": ["name": "get_weather"] as [String: any Sendable],
+        ]
+        let declared = try decode(turn, tokenizer: t, tools: [weather])
+        #expect(calls(declared).map(\.name) == ["get_weather"])
+        #expect(rejected(declared) == ["ping"])
+
+        // A tool given without a `function` wrapper is declared by its own name.
+        let bare = try decode(turn, tokenizer: t, tools: [["name": "ping"]])
+        #expect(calls(bare).map(\.name) == ["ping"])
+        #expect(rejected(bare) == ["get_weather"])
+
+        let none = try decode(turn, tokenizer: t, tools: [])
+        #expect(calls(none).isEmpty)
+        #expect(rejected(none) == ["get_weather", "ping"])
     }
 }
