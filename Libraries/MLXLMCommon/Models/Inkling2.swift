@@ -370,7 +370,9 @@ final class Inkling2Router: Module {
                 order: .descending)
             return (indices, weights * routeScale)
         }
-        let indices = argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        // The choice of experts has no gradient; the weights of the chosen ones do.
+        let indices = stopGradient(
+            argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK])
         var weights = takeAlong(scores, indices, axis: -1)
         weights = weights / (weights.sum(axis: -1, keepDims: true) + routerScoreEpsilon)
         return (indices, weights * routeScale)
