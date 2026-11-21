@@ -43,6 +43,14 @@ public final class Inkling2Model: Module, LLMModel {
             configuration: configuration.text)
     }
 
+    /// Also emits the hidden states a DSpark drafter asks for.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        inkling2Output(
+            embeddings: model.languageModel.embed(input.tokens), cache: cache, state: state)
+    }
+
     /// The vision tower is never read.
     public var excludedCheckpointNamespaces: [String] {
         ["model.visual", "vision_tower", "model.vision_tower"]
@@ -83,5 +91,11 @@ extension Inkling2Model: TensorParallelModel {
     }
 }
 
-// The default `LLMModel` prefill, and no model state from the forward pass.
+// The default `LLMModel` prefill, and no model state from the forward pass unless a DSpark
+// drafter asks for its hidden states.
 extension Inkling2Model: ResumablePrefillModel, BatchDecodableModel {}
+
+extension Inkling2Model: Inkling2LanguageModel {
+    package var inkling2TextModel: Inkling2TextModel { model.languageModel }
+    package var inkling2Head: Linear { lmHead }
+}

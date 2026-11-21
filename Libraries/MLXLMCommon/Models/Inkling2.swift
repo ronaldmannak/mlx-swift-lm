@@ -138,13 +138,17 @@ final class Inkling2ShortConvolution: Module {
     }
 
     /// Returns the output and the next state: each row's last `kernelSize - 1` valid inputs.
-    /// `lengths` are the rows' valid lengths of a right-padded batch prompt.
+    /// `lengths` are the rows' valid lengths of a right-padded batch prompt. With
+    /// `keepWindow`, the second value is the whole window instead: the previous state, then
+    /// the inputs, in float32.
     func callAsFunction(
         _ x: MLXArray, state: MLXArray?, mask: MLXArray?, lengths: MLXArray? = nil,
-        forceReference: Bool = false
+        forceReference: Bool = false, keepWindow: Bool = false
     ) -> (MLXArray, MLXArray) {
         if !forceReference, !training, mask == nil, lengths == nil, inkling2UsesKernels() {
-            return inkling2ShortConvolutionKernel(x, state: state, weight: conv1d.weight)
+            let (out, next) = inkling2ShortConvolutionKernel(x, state: state, weight: conv1d.weight)
+            guard keepWindow else { return (out, next) }
+            return (out, convolutionWindow(x, state: state, mask: nil, kernelSize: kernelSize))
         }
         let window = convolutionWindow(x, state: state, mask: mask, kernelSize: kernelSize)
         // As the reference, the convolution runs in the weight's dtype.
@@ -152,7 +156,7 @@ final class Inkling2ShortConvolution: Module {
         out = (out + x.asType(.float32)) / sqrt(Float(kernelSize + 1))
         return (
             out.asType(x.dtype),
-            convolutionState(window, lengths: lengths, count: kernelSize - 1)
+            keepWindow ? window : convolutionState(window, lengths: lengths, count: kernelSize - 1)
         )
     }
 
@@ -185,10 +189,11 @@ final class Inkling2DynamicConvolution: Module {
         _weightProjection.wrappedValue = Linear(inputDimensions, heads * kernelSize, bias: false)
     }
 
-    /// Returns the output and the next state, as ``Inkling2ShortConvolution`` does.
+    /// Returns the output and the next state or the window, as ``Inkling2ShortConvolution``
+    /// does.
     func callAsFunction(
         _ x: MLXArray, dynamicInput: MLXArray, state: MLXArray?, mask: MLXArray?,
-        lengths: MLXArray?
+        lengths: MLXArray?, keepWindow: Bool = false
     ) -> (MLXArray, MLXArray) {
         let (B, L, C) = (x.dim(0), x.dim(1), x.dim(2))
         let K = kernelSize
@@ -204,7 +209,10 @@ final class Inkling2DynamicConvolution: Module {
         ).reshaped(B, L, heads, -1, K)
         var out = (windows * weights).sum(axis: -1).reshaped(B, L, C)
         out = (out + x.asType(.float32)) / sqrt(Float(2 * K + 1))
-        return (out.asType(x.dtype), convolutionState(window, lengths: lengths, count: K - 1))
+        return (
+            out.asType(x.dtype),
+            keepWindow ? window : convolutionState(window, lengths: lengths, count: K - 1)
+        )
     }
 }
 
@@ -459,10 +467,73 @@ final class Inkling2SparseMoE: Module {
 /// The caches of one layer visit. `positions` stores each key's position plus one, written
 /// through a cache of the same kind as `keyValues`, so it follows every trim, wrap, merge
 /// and roll of the keys; a zero marks a slot that holds no key.
+///
+/// The four convolution states, of the key, value, post-attention and post-MLP
+/// convolutions, are the slots of one `ArraysCache`. When generation asks for a rewind window
+/// (``KVCacheConfiguration/Rewind``), each convolution has an ``Inkling2ConvolutionCache``
+/// instead, which also keeps its recent inputs, so a speculative round can step back over
+/// the positions it rejects.
 struct Inkling2VisitCache {
     let keyValues: KVCache
     let positions: KVCache
-    let convolution: ArraysCache
+    let convolutions: [ArraysCache]
+
+    /// Whether the convolutions keep their recent inputs. Their calls then return windows.
+    var rewinds: Bool { convolutions.count > 1 }
+
+    /// Each row's valid length during a ragged prefill.
+    var lengths: MLXArray? { convolutions[0].currentLengths }
+
+    func makeMask(N: Int) -> MLXArray? { convolutions[0].makeMask(N: N) }
+
+    /// The state of convolution `i`.
+    func state(_ i: Int) -> MLXArray? { rewinds ? convolutions[i][0] : convolutions[0][i] }
+
+    /// Stores what the four convolutions return for `length` new positions: their next
+    /// states, or, with ``rewinds``, their windows.
+    func commit(_ results: [MLXArray], length: Int) {
+        guard rewinds else {
+            for (i, state) in results.enumerated() {
+                convolutions[0][i] = state
+            }
+            convolutions[0].advance(length)
+            return
+        }
+        precondition(lengths == nil, "A rewindable Inkling 2 cache holds one unpadded row")
+        for (cache, window) in zip(convolutions, results) {
+            let count = window.dim(1) - length
+            (cache as! RewindableConvolutionCache).record(
+                input: window[0..., count...], initialState: window[0..., ..<count],
+                currentState: contiguous(window[0..., length...]))
+        }
+    }
+}
+
+/// One convolution's state and recent inputs, for a cache with a rewind window.
+///
+/// A staged speculative round writes through an auxiliary entry and trims it back to the
+/// accepted positions, so this cache joins rounds whose sliding layers stage their keys.
+/// (LFM2 rewinds its `RewindableConvolutionCache`s in place instead, which a wrapped ring
+/// cannot.)
+final class Inkling2ConvolutionCache: RewindableConvolutionCache, AuxiliaryKVCache {
+    override class var serializedClassName: String? { "Inkling2ConvolutionCache" }
+
+    override class func restore(state: [MLXArray], metaState: [String]) throws -> any KVCache {
+        let restored = try RewindableConvolutionCache.restore(state: state, metaState: metaState)
+        return (restored as! RewindableConvolutionCache).converted()
+    }
+
+    override func copy() -> any KVCache { converted() }
+}
+
+extension RewindableConvolutionCache {
+    /// A copy as an ``Inkling2ConvolutionCache``.
+    fileprivate func converted() -> Inkling2ConvolutionCache {
+        let cache = Inkling2ConvolutionCache(
+            stateLength: stateLength, rollbackCapacity: rollbackCapacity)
+        copyContents(to: cache)
+        return cache
+    }
 }
 
 final class Inkling2Attention: Module {
@@ -538,22 +609,24 @@ final class Inkling2Attention: Module {
 
     private func convolve(
         _ convolution: Module, _ x: MLXArray, input: MLXArray, state: MLXArray?, mask: MLXArray?,
-        lengths: MLXArray?
+        lengths: MLXArray?, keepWindow: Bool
     ) -> (MLXArray, MLXArray) {
         if let convolution = convolution as? Inkling2ShortConvolution {
-            return convolution(x, state: state, mask: mask, lengths: lengths)
+            return convolution(
+                x, state: state, mask: mask, lengths: lengths, keepWindow: keepWindow)
         }
         return (convolution as! Inkling2DynamicConvolution)(
-            x, dynamicInput: input, state: state, mask: mask, lengths: lengths)
+            x, dynamicInput: input, state: state, mask: mask, lengths: lengths,
+            keepWindow: keepWindow)
     }
 
     /// Everything before the cache write, from the normed inputs of the query, key and value
     /// projections: clipped queries `[B, L, H, D]` and relative states, keys and values
     /// `[B, Hkv, L, D]`, the output gate, the sinks, and the next key and value convolution
-    /// states.
+    /// states, or with `keepWindows` their windows.
     func project(
         query: MLXArray, key: MLXArray, value: MLXArray, states: (MLXArray?, MLXArray?),
-        mask: MLXArray?, lengths: MLXArray?
+        mask: MLXArray?, lengths: MLXArray?, keepWindows: Bool = false
     ) -> (
         queries: MLXArray, relative: MLXArray, keys: MLXArray, values: MLXArray,
         gate: MLXArray, sinks: MLXArray, keyState: MLXArray, valueState: MLXArray
@@ -561,10 +634,10 @@ final class Inkling2Attention: Module {
         let (B, L) = (query.dim(0), query.dim(1))
         let (keys, keyState) = convolve(
             keyConvolution, kProjection(key), input: key, state: states.0, mask: mask,
-            lengths: lengths)
+            lengths: lengths, keepWindow: keepWindows)
         let (values, valueState) = convolve(
             valueConvolution, vProjection(value), input: value, state: states.1, mask: mask,
-            lengths: lengths)
+            lengths: lengths, keepWindow: keepWindows)
 
         let queries = queryClip(qProjection(query).reshaped(B, L, heads, -1))
         let relative = relativeClip(rProjection(query).reshaped(B, L, heads, -1))
@@ -604,14 +677,16 @@ final class Inkling2Attention: Module {
     }
 
     /// `query`, `key` and `value` are the normed inputs of the three projections. Returns
-    /// the output and the next key and value convolution states.
+    /// the output and the next key and value convolution states, or their windows when the
+    /// cache ``Inkling2VisitCache/rewinds``.
     func callAsFunction(
         query: MLXArray, key: MLXArray, value: MLXArray, cache: Inkling2VisitCache?,
         states: (MLXArray?, MLXArray?), mask: MLXArray?, lengths: MLXArray?
     ) -> (MLXArray, MLXArray, MLXArray) {
         let (B, L) = (query.dim(0), query.dim(1))
         let projected = project(
-            query: query, key: key, value: value, states: states, mask: mask, lengths: lengths)
+            query: query, key: key, value: value, states: states, mask: mask, lengths: lengths,
+            keepWindows: cache?.rewinds ?? false)
         var keys = projected.keys
         var values = projected.values
 
@@ -672,6 +747,8 @@ final class Inkling2Attention: Module {
     private static func keysInOrder(_ cache: KVCache) -> Bool {
         switch cache {
         case let cache as RotatingKVCache: cache.keepCount == 0
+        // A speculative round's view of a ring: its window, then the staged keys.
+        case let cache as RotatingStagedKVCache: cache.live.keepCount == 0
         case is KVCacheSimple, is BatchKVCache, is BatchRotatingKVCache: true
         default: false
         }
@@ -923,38 +1000,34 @@ package final class Inkling2DecoderLayer: Module {
         if let step = decode(x, blocks: blocks, cache: cache, mask: mask, messages: messages) {
             return step
         }
-        let convolution = cache?.convolution
-        let lengths = convolution?.currentLengths
+        let lengths = cache?.lengths
 
         let normedInput = inkling2UnitRMS(x)
         let depth = attentionInput?(blocks: blocks, partial: normedInput)
         let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
         let (h, keyState, valueState) = attention(
             query: q, key: k, value: v, cache: cache,
-            states: (convolution?[0], convolution?[1]), mask: mask, lengths: lengths)
+            states: (cache?.state(0), cache?.state(1)), mask: mask, lengths: lengths)
         let (out, newBlocks, attentionState, mlpState) = feedForward(
             x, normedInput: normedInput, attention: h, blocks: blocks, messages: messages,
-            states: (convolution?[2], convolution?[3]), mask: mask, lengths: lengths)
+            states: (cache?.state(2), cache?.state(3)), mask: mask, lengths: lengths,
+            keepWindows: cache?.rewinds ?? false)
 
-        if let convolution {
-            for (i, state) in [keyState, valueState, attentionState, mlpState].enumerated() {
-                convolution[i] = state
-            }
-            convolution.advance(x.dim(1))
-        }
+        cache?.commit([keyState, valueState, attentionState, mlpState], length: x.dim(1))
         return (out, newBlocks)
     }
 
     /// The rest of the layer after the attention's output projection `h`. Returns the
-    /// output, the blocks, and the next post-attention and post-MLP convolution states.
+    /// output, the blocks, and the next post-attention and post-MLP convolution states, or
+    /// with `keepWindows` their windows.
     private func feedForward(
         _ x: MLXArray, normedInput: MLXArray, attention h: MLXArray, blocks: MLXArray?,
         messages: Inkling2Messages?, states: (MLXArray?, MLXArray?), mask: MLXArray?,
-        lengths: MLXArray?
+        lengths: MLXArray?, keepWindows: Bool = false
     ) -> (MLXArray, MLXArray?, MLXArray, MLXArray) {
         let dtype = x.dtype
         let (h, attentionState) = postAttentionConvolution(
-            h, state: states.0, mask: mask, lengths: lengths)
+            h, state: states.0, mask: mask, lengths: lengths, keepWindow: keepWindows)
 
         var blocks = blocks
         var residual = h.asType(.float32)
@@ -973,7 +1046,7 @@ package final class Inkling2DecoderLayer: Module {
         let (out, mlpState) = postMLPConvolution(
             mlp(inkling2Normed(postAttentionNorm, m, dtype: dtype)),
             state: states.1, mask: mask,
-            lengths: lengths)
+            lengths: lengths, keepWindow: keepWindows)
         return ((residual + out.asType(.float32)).asType(dtype), blocks, attentionState, mlpState)
     }
 
@@ -1040,12 +1113,11 @@ package final class Inkling2DecoderLayer: Module {
         _ x: MLXArray, blocks: MLXArray?, cache: Inkling2VisitCache?, mask: MLXArray?,
         messages: Inkling2Messages?
     ) -> (MLXArray, MLXArray?)? {
-        guard x.dim(1) == 1, mask == nil, let cache, cache.convolution.currentLengths == nil,
+        guard x.dim(1) == 1, mask == nil, let cache, cache.lengths == nil,
             inkling2UsesKernels(), !training, mlp.shardingGroup == nil,
             (blocks != nil) == (index > 0)
         else { return nil }
-        let convolution = cache.convolution
-        let states = (0 ..< 4).compactMap { convolution[$0] }
+        let states = (0 ..< 4).compactMap { cache.state($0) }
         guard states.count == 4 else { return nil }
         let B = x.dim(0)
         let extras = [blocks, messages?.raw, messages?.normed].compactMap { $0 }
@@ -1062,10 +1134,13 @@ package final class Inkling2DecoderLayer: Module {
         let output = compiledDecodeOutput(
             self, [x, input[0], attended, input[6], states[2], states[3]] + extras)
 
-        for (i, state) in [input[8], input[9], output[2], output[3]].enumerated() {
-            convolution[i] = state
+        var next = [input[8], input[9], output[2], output[3]]
+        if cache.rewinds {
+            // One position's window: the previous state, then the one input, which ends the
+            // next state.
+            next = zip(states, next).map { concatenated([$0[0..., ..<1], $1], axis: 1) }
         }
-        convolution.advance(1)
+        cache.commit(next, length: 1)
         return (output[0], output[1])
     }
 }
@@ -1088,8 +1163,8 @@ public enum Inkling2Error: LocalizedError {
 /// The Inkling 2 text model: token embedding, decoder layers (looped for Inkling 2 Mini),
 /// and the final depth attention and norm.
 ///
-/// The caller owns the caches from ``newCache(parameters:)``: three per layer visit (keys
-/// and values, key positions, convolution states). Positions come from the caches, so a
+/// The caller owns the caches from ``newCache(parameters:)``: per layer visit, keys and
+/// values, key positions, and convolution states. Positions come from the caches, so a
 /// sequence can be fed in chunks.
 public final class Inkling2TextModel: Module {
     package let configuration: Inkling2TextConfiguration
@@ -1101,8 +1176,6 @@ public final class Inkling2TextModel: Module {
     @ModuleInfo(key: "final_input") var finalInput: Inkling2DepthQuery
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "message_input") var messageInput: Inkling2MessageInput?
-
-    package static let cachesPerVisit = 3
 
     package init(_ args: Inkling2TextConfiguration) {
         configuration = args
@@ -1131,12 +1204,30 @@ public final class Inkling2TextModel: Module {
 
     /// Final normed hidden states `[B, L, hidden]` for input embeddings `[B, L, hidden]`.
     package func callAsFunction(embeddings: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        hiddenStates(embeddings: embeddings, cache: cache, capturing: []).hidden
+    }
+
+    /// Final normed hidden states `[B, L, hidden]`, and a tap for each of `visits`: the
+    /// hidden state entering that layer visit, the partial block, or for `layerVisits.count`
+    /// the final normed state. A DSpark drafter reads these taps.
+    package func hiddenStates(
+        embeddings: MLXArray, cache: [KVCache]?, capturing visits: [Int]
+    ) -> (hidden: MLXArray, captured: [MLXArray]) {
         precondition(
-            cache == nil || cache?.count == Self.cachesPerVisit * layerVisits.count,
+            cache.map { [3, 6].map { $0 * layerVisits.count }.contains($0.count) } ?? true,
             "Inkling 2 requires the caches from newCache(parameters:)")
+        precondition(
+            visits.allSatisfy { (0 ... layerVisits.count).contains($0) },
+            "Inkling 2 taps name layer visits 0 through \(layerVisits.count)")
         let dtype = embeddings.dtype
-        let caches = cache.map(Self.visitCaches)
-        let mask = caches?.first?.convolution.makeMask(N: embeddings.dim(1))
+        let caches = cache.map { Self.visitCaches($0, visits: layerVisits.count) }
+        let mask = caches?.first?.makeMask(N: embeddings.dim(1))
+        var taps = [Int: MLXArray]()
+        // A pass over a few positions, such as a speculative verify, costs mostly per-op
+        // overhead. Starting what is built every four visits lets the GPU work while the rest
+        // of the graph is built, as mlx-vlm's verify does; it saves 3-4 ms of a 2- to
+        // 8-token verify on Inkling 2 Mini. Training traces the whole graph instead.
+        let pipelines = !training && (2 ... 16).contains(embeddings.dim(1))
 
         var visit = 0
         func run(
@@ -1145,10 +1236,16 @@ public final class Inkling2TextModel: Module {
         ) -> (MLXArray, MLXArray?) {
             var (h, blocks) = (h, blocks)
             for (i, index) in range.enumerated() {
+                if visits.contains(visit) {
+                    taps[visit] = h
+                }
                 let messages = bank.map { messageInput!($0, loopedLayer: i) }
                 (h, blocks) = layers[index](
                     h, blocks: blocks, cache: caches?[visit], mask: mask, messages: messages)
                 visit += 1
+                if pipelines, visit.isMultiple(of: 4) {
+                    asyncEval(h)
+                }
             }
             return (h, blocks)
         }
@@ -1177,37 +1274,53 @@ public final class Inkling2TextModel: Module {
         h =
             finalInput(blocks: blocks, partial: inkling2UnitRMS(h))[
                 .ellipsis, 0, 0...]
-        return inkling2Normed(norm, h, dtype: dtype)
+        let hidden = inkling2Normed(norm, h, dtype: dtype)
+        taps[layerVisits.count] = hidden
+        return (hidden, visits.map { taps[$0]! })
     }
 
-    private static func visitCaches(_ cache: [KVCache]) -> [Inkling2VisitCache] {
-        stride(from: 0, to: cache.count, by: cachesPerVisit).map { i in
-            guard let convolution = cache[i + 2] as? ArraysCache else {
-                preconditionFailure("Inkling 2 cache \(i + 2) must hold convolution states")
+    private static func visitCaches(_ cache: [KVCache], visits: Int) -> [Inkling2VisitCache] {
+        let count = cache.count / visits
+        return stride(from: 0, to: cache.count, by: count).map { i in
+            let convolutions = cache[(i + 2) ..< (i + count)].map { entry in
+                guard let convolution = entry as? ArraysCache else {
+                    preconditionFailure("Inkling 2 cache \(i + 2) must hold convolution states")
+                }
+                return convolution
             }
             precondition(
                 usesPlainAttentionCacheRoute(cache[i]),
                 "Inkling 2 attention reads full-precision keys and values only")
             return Inkling2VisitCache(
-                keyValues: cache[i], positions: cache[i + 1], convolution: convolution)
+                keyValues: cache[i], positions: cache[i + 1], convolutions: convolutions)
         }
     }
 
-    /// Three caches per layer visit: keys and values (rotating for sliding layers), their
-    /// positions in a cache of the same kind, and the four convolution states.
+    /// Per layer visit: keys and values (rotating for sliding layers), their positions in a
+    /// cache of the same kind, and the four convolution states, in one cache or, with a
+    /// rewind window, in an ``Inkling2ConvolutionCache`` each.
     package func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         if let strategy = try parameters?.resolvedKVCacheConfiguration()?.strategy,
             strategy != .fullPrecision
         {
             throw Inkling2Error.unsupportedKVCacheStrategy
         }
+        let rewind = parameters?.kvCache?.rewind?.maxTokens
         return try layerVisits.flatMap { index -> [KVCache] in
             func attentionCache() throws -> KVCache {
                 try makeHybridAttentionKVCache(
                     parameters: parameters, slidingWindow: configuration.slidingWindow,
                     usesSlidingWindow: configuration.isSliding(index))
             }
-            return [try attentionCache(), try attentionCache(), ArraysCache(size: 4)]
+            let convolutions: [KVCache] =
+                rewind.map { rewind in
+                    (0 ..< 4).map { _ in
+                        Inkling2ConvolutionCache(
+                            stateLength: configuration.convKernelSize - 1,
+                            rollbackCapacity: rewind)
+                    }
+                } ?? [ArraysCache(size: 4)]
+            return [try attentionCache(), try attentionCache()] + convolutions
         }
     }
 }
@@ -1219,6 +1332,42 @@ package func inkling2Logits(
     let cap = configuration.finalLogitSoftcap
     let logits = tanh(lmHead(hidden).asType(.float32) / cap) * cap
     return logits[.ellipsis, ..<configuration.unpaddedVocabularySize]
+}
+
+// MARK: - Speculative decoding
+
+/// An Inkling 2 model, whose text model and vocabulary head a DSpark drafter shares.
+///
+/// The drafter lives beside the text model; MLXLLM's and MLXVLM's wrappers, which conform,
+/// live in other modules.
+package protocol Inkling2LanguageModel: LanguageModel {
+    var inkling2TextModel: Inkling2TextModel { get }
+    var inkling2Head: Linear { get }
+}
+
+extension Inkling2LanguageModel {
+    /// Logits for input embeddings `[B, L, hidden]`. When `state` asks for drafter state
+    /// (``mtpEmitFlagKey``), the output state also holds the taps ``mtpTargetLayerIdsKey``
+    /// names, concatenated in that order, under ``mtpLastHiddenStatesKey``.
+    package func inkling2Output(
+        embeddings: MLXArray, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let emits = state?[mtpEmitFlagKey] ?? false
+        let visits = emits ? (state?[mtpTargetLayerIdsKey] ?? []) : []
+        let (hidden, taps) = inkling2TextModel.hiddenStates(
+            embeddings: embeddings, cache: cache, capturing: visits)
+        let logits = inkling2Logits(
+            hidden, lmHead: inkling2Head, configuration: inkling2TextModel.configuration)
+        guard emits else { return LMOutput(logits: logits) }
+
+        var output = state ?? LMOutput.State()
+        output[mtpLastHiddenStatesKey] = taps.isEmpty ? hidden : concatenated(taps, axis: -1)
+        // DSpark reads hidden states, not the target's keys and values.
+        output[mtpSharedKVStatesKey] = [:]
+        output[mtpSharedKVOffsetsKey] = [:]
+        output[mtpSharedKVSourceIndicesKey] = [:]
+        return LMOutput(logits: logits, state: output)
+    }
 }
 
 // MARK: - Tensor parallelism

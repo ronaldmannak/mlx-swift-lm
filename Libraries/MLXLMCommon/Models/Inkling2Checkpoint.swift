@@ -255,7 +255,8 @@ package enum Inkling2Checkpoint {
 
     // MARK: - oMLX
 
-    private static let oMLXLayer = try! NSRegularExpression(pattern: #"^model\.layers\.(\d+)\.(.+)$"#)
+    private static let oMLXLayer = try! NSRegularExpression(
+        pattern: #"^model\.layers\.(\d+)\.(.+)$"#)
 
     private struct Splits {
         let names: [String]
@@ -337,7 +338,9 @@ package enum Inkling2Checkpoint {
         let prefix = "model.language_model.layers.\(parts[0])."
         for (source, target) in oMLXRenames {
             if rest == source { return prefix + target }
-            if rest.hasPrefix(source + ".") { return prefix + target + rest.dropFirst(source.count) }
+            if rest.hasPrefix(source + ".") {
+                return prefix + target + rest.dropFirst(source.count)
+            }
         }
         return nil
     }
