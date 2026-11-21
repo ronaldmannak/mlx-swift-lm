@@ -268,7 +268,7 @@ struct Inkling2KernelTests {
             #expect(
                 sameBits(
                     inkling2L2Clip(x, scale: scale, threshold: threshold),
-                    inkling2L2Clip(x, scale: scale, threshold: threshold, forceReference: true)))
+                    inkling2L2Clip(x, scale: scale, threshold: threshold, useKernel: false)))
         }
     }
 

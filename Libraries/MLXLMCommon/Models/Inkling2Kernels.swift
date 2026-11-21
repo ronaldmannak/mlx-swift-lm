@@ -6,6 +6,9 @@
 // Port of `mlx_lm/models/inkling2/kernels.py` from jundot/mlx-lm@0c4c9919 (MIT): Inkling 2's
 // depth attention and its prefill attention with a relative-position bias and per-token
 // sinks, which MLX's fused attention does not take.
+//
+// The decode kernels below replace chains of small ops. The short convolution, router and
+// expert combine follow exo's Inkling kernels (exo-explore/exo#2530, Apache-2.0).
 
 import Foundation
 import MLX
