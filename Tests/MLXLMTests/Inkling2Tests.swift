@@ -384,6 +384,211 @@ private func oQQuantization(_ args: Inkling2TextConfiguration, expertBits: Int)
         quantization: .init(groupSize: 64, bits: expertBits), perLayerQuantization: settings)
 }
 
+/// The reverse of the mlx-vlm renames, for tensor and module paths alike. The experts' gate
+/// and up halves are split by `mlxVLMCheckpoint`.
+private let mlxVLMNames: [(String, String)] = [
+    (#"^lm_head(?=\.|$)"#, "language_model.lm_head"),
+    (#"^model\.language_model\.message_input\.query$"#, "language_model.model.message_queries"),
+    (#"^model\.language_model(?=\.)"#, "language_model.model"),
+    (#"\.q_message_gate\."#, ".controllers.attn."),
+    (#"\.(k|v|mlp)_message_gate\."#, ".controllers.$1."),
+    (#"(\.controllers\.\w+)\.down_proj\.weight$"#, "$1.down_weight"),
+    (#"(\.controllers\.\w+)\.forget_gate_proj\.weight$"#, "$1.forget_weight"),
+    (#"(\.controllers\.\w+)\.message_gate_proj\.weight$"#, "$1.gain_weight"),
+    (#"\.post_attention_convolution\.conv1d(?=\.|$)"#, ".attn_sconv.conv"),
+    (#"\.post_mlp_convolution\.conv1d(?=\.|$)"#, ".mlp_sconv.conv"),
+    (#"sconv\.conv1d(?=\.|$)"#, "sconv.conv"),
+    (#"\.self_attn\.q_l2_clip\.scale$"#, ".self_attn.q_scale"),
+    (#"\.self_attn\.rel_l2_clip\.scale$"#, ".self_attn.rel_scale"),
+    (#"\.self_attn\.rel_logits_proj\.proj$"#, ".self_attn.rel_proj"),
+    (#"\.mlp\.gate\.weight$"#, ".mlp.gate_weight"),
+    (#"\.mlp\.gate\.e_score_correction_bias$"#, ".mlp.e_score_correction_bias"),
+    (#"\.mlp\.experts\.down_proj(?=\.|$)"#, ".mlp.switch_mlp.down_proj"),
+    (#"\.global_scale$"#, ".weight_scale_2"),
+    (#"^model\.vision_tower\.merger\.linear_1(?=\.|$)"#, "vision_tower.proj_in"),
+    (#"^model\.vision_tower\.merger\.linear_2(?=\.|$)"#, "vision_tower.proj_out"),
+    (#"^model\.vision_tower(?=\.)"#, "vision_tower"),
+    (#"embeddings\.position_embedding\.weight$"#, "embeddings.position_embedding"),
+]
+
+/// mlx-vlm's layout of `model`, as `Model.sanitize` in mlx-vlm's `inkling2.py` writes it:
+/// gate and up rows split apart, and each NVFP4 expert's outer factor `amax / denominator`
+/// in place of its global scale.
+private func mlxVLMCheckpoint(_ model: Module) -> [String: MLXArray] {
+    let gateUp = try! NSRegularExpression(pattern: #"^(.+)\.mlp\.experts\.gate_up_proj\.(\w+)$"#)
+    var checkpoint = [String: MLXArray]()
+    for (name, value) in model.parameters().flattened() {
+        let value = name.hasSuffix(".global_scale") ? value / 2688 : value
+        guard let match = gateUp.firstMatch(in: name, range: NSRange(name.startIndex..., in: name))
+        else {
+            checkpoint[rename(name, mlxVLMNames)] = value
+            continue
+        }
+        let part = { (i: Int) in String(name[Range(match.range(at: i), in: name)!]) }
+        let prefix = rename(part(1), mlxVLMNames) + ".mlp.switch_mlp."
+        if part(2) == "global_scale" {
+            checkpoint[prefix + "gate_proj.weight_scale_2"] = value
+            checkpoint[prefix + "up_proj.weight_scale_2"] = value
+        } else {
+            // Alternating rows hold gate and up.
+            var shape = value.shape
+            shape[shape.count - 2] /= 2
+            shape.insert(2, at: shape.count - 1)
+            let rows = value.reshaped(shape)
+            checkpoint[prefix + "gate_proj." + part(2)] = rows[.ellipsis, 0, 0...]
+            checkpoint[prefix + "up_proj." + part(2)] = rows[.ellipsis, 1, 0...]
+        }
+    }
+    return checkpoint
+}
+
+/// The settings of `model`'s quantized layers under mlx-vlm's module names, with the
+/// experts' gate and up halves listed apart.
+private func mlxVLMQuantization(
+    _ model: Module, default quantization: BaseConfiguration.Quantization
+) -> BaseConfiguration.PerLayerQuantization {
+    var settings = [String: BaseConfiguration.QuantizationOption]()
+    for (path, module) in model.namedModules() {
+        guard let layer = module as? Quantized else { continue }
+        let option = BaseConfiguration.QuantizationOption.quantize(
+            .init(groupSize: layer.groupSize, bits: layer.bits, mode: layer.mode))
+        if path.hasSuffix(".mlp.experts.gate_up_proj") {
+            let prefix =
+                rename(String(path.dropLast(".experts.gate_up_proj".count)), mlxVLMNames)
+                + ".switch_mlp."
+            settings[prefix + "gate_proj"] = option
+            settings[prefix + "up_proj"] = option
+        } else {
+            settings[rename(path, mlxVLMNames)] = option
+        }
+    }
+    return .init(quantization: quantization, perLayerQuantization: settings)
+}
+
+/// Quantizes like NetProjects' affine mlx-vlm builds: experts at `expertBits`, attention at 6
+/// bits, embeddings, head and vision tower at 4. Sinks, convolution projections, loop gates,
+/// the router and the patch embedding stay as they are. The tiny vision tower is 32 wide, so
+/// it uses groups of 32, and a layer whose inputs don't divide into groups stays too.
+private func quantizeLikeMLXVLM(_ model: Module, expertBits: Int)
+    -> BaseConfiguration.PerLayerQuantization
+{
+    quantize(model: model) { path, module in
+        let setting: (Int, Int, QuantizationMode)
+        if path.contains(".mlp.experts.") {
+            setting = (64, expertBits, .affine)
+        } else if path.hasPrefix("model.vision_tower.") {
+            guard !path.contains(".embeddings.") else { return nil }
+            setting = (32, 4, .affine)
+        } else if path.contains(".self_attn."), !path.hasSuffix("sink_proj"),
+            !path.contains("sconv")
+        {
+            setting = (64, 6, .affine)
+        } else if path.hasSuffix("embed_tokens") || path == "lm_head" {
+            setting = (64, 4, .affine)
+        } else {
+            return nil
+        }
+        if let linear = module as? Linear, linear.weight.dim(-1) % setting.0 != 0 { return nil }
+        return module is Quantizable ? setting : nil
+    }
+    eval(model)
+    return mlxVLMQuantization(model, default: .init(groupSize: 64, bits: expertBits))
+}
+
+/// Every tensor name in `netprojects/Inkling-2-Mini-MLX-3bit` and `-4-8bit`, with layer
+/// numbers replaced by `N`.
+private let publishedMLXVLMNames = """
+    language_model.lm_head.biases language_model.lm_head.scales language_model.lm_head.weight
+    language_model.model.embed_norm.weight language_model.model.embed_tokens.biases
+    language_model.model.embed_tokens.scales language_model.model.embed_tokens.weight
+    language_model.model.final_input.query language_model.model.layers.N.attention_input.query
+    language_model.model.layers.N.attn_sconv.conv.weight
+    language_model.model.layers.N.controllers.attn.down_weight
+    language_model.model.layers.N.controllers.attn.forget_weight
+    language_model.model.layers.N.controllers.attn.gain_weight
+    language_model.model.layers.N.controllers.k.down_weight
+    language_model.model.layers.N.controllers.k.forget_weight
+    language_model.model.layers.N.controllers.k.gain_weight
+    language_model.model.layers.N.controllers.mlp.down_weight
+    language_model.model.layers.N.controllers.mlp.forget_weight
+    language_model.model.layers.N.controllers.mlp.gain_weight
+    language_model.model.layers.N.controllers.v.down_weight
+    language_model.model.layers.N.controllers.v.forget_weight
+    language_model.model.layers.N.controllers.v.gain_weight
+    language_model.model.layers.N.input_layernorm.weight
+    language_model.model.layers.N.k_input_layernorm.weight
+    language_model.model.layers.N.mlp.e_score_correction_bias
+    language_model.model.layers.N.mlp.gate_weight
+    language_model.model.layers.N.mlp.switch_mlp.down_proj.biases
+    language_model.model.layers.N.mlp.switch_mlp.down_proj.scales
+    language_model.model.layers.N.mlp.switch_mlp.down_proj.weight
+    language_model.model.layers.N.mlp.switch_mlp.down_proj.weight_scale_2
+    language_model.model.layers.N.mlp.switch_mlp.gate_proj.biases
+    language_model.model.layers.N.mlp.switch_mlp.gate_proj.scales
+    language_model.model.layers.N.mlp.switch_mlp.gate_proj.weight
+    language_model.model.layers.N.mlp.switch_mlp.gate_proj.weight_scale_2
+    language_model.model.layers.N.mlp.switch_mlp.up_proj.biases
+    language_model.model.layers.N.mlp.switch_mlp.up_proj.scales
+    language_model.model.layers.N.mlp.switch_mlp.up_proj.weight
+    language_model.model.layers.N.mlp.switch_mlp.up_proj.weight_scale_2
+    language_model.model.layers.N.mlp_input.query
+    language_model.model.layers.N.mlp_sconv.conv.weight
+    language_model.model.layers.N.post_attention_layernorm.weight
+    language_model.model.layers.N.q_input_layernorm.weight
+    language_model.model.layers.N.self_attn.gate_proj.biases
+    language_model.model.layers.N.self_attn.gate_proj.scales
+    language_model.model.layers.N.self_attn.gate_proj.weight
+    language_model.model.layers.N.self_attn.k_proj.biases
+    language_model.model.layers.N.self_attn.k_proj.scales
+    language_model.model.layers.N.self_attn.k_proj.weight
+    language_model.model.layers.N.self_attn.k_sconv.conv.weight
+    language_model.model.layers.N.self_attn.k_sconv.static_weight
+    language_model.model.layers.N.self_attn.k_sconv.weight_proj.weight
+    language_model.model.layers.N.self_attn.o_proj.biases
+    language_model.model.layers.N.self_attn.o_proj.scales
+    language_model.model.layers.N.self_attn.o_proj.weight
+    language_model.model.layers.N.self_attn.q_proj.biases
+    language_model.model.layers.N.self_attn.q_proj.scales
+    language_model.model.layers.N.self_attn.q_proj.weight
+    language_model.model.layers.N.self_attn.q_scale
+    language_model.model.layers.N.self_attn.r_proj.biases
+    language_model.model.layers.N.self_attn.r_proj.scales
+    language_model.model.layers.N.self_attn.r_proj.weight
+    language_model.model.layers.N.self_attn.rel_proj
+    language_model.model.layers.N.self_attn.rel_scale
+    language_model.model.layers.N.self_attn.sink_proj.weight
+    language_model.model.layers.N.self_attn.v_proj.biases
+    language_model.model.layers.N.self_attn.v_proj.scales
+    language_model.model.layers.N.self_attn.v_proj.weight
+    language_model.model.layers.N.self_attn.v_sconv.conv.weight
+    language_model.model.layers.N.self_attn.v_sconv.static_weight
+    language_model.model.layers.N.self_attn.v_sconv.weight_proj.weight
+    language_model.model.layers.N.v_input_layernorm.weight language_model.model.message_queries
+    language_model.model.norm.weight vision_tower.embeddings.class_embedding
+    vision_tower.embeddings.cls_position_embedding
+    vision_tower.embeddings.patch_embedding.weight vision_tower.embeddings.position_embedding
+    vision_tower.layers.N.lambda_1 vision_tower.layers.N.lambda_2
+    vision_tower.layers.N.layernorm_after.bias vision_tower.layers.N.layernorm_after.weight
+    vision_tower.layers.N.layernorm_before.bias vision_tower.layers.N.layernorm_before.weight
+    vision_tower.layers.N.mlp.fc1.bias vision_tower.layers.N.mlp.fc1.biases
+    vision_tower.layers.N.mlp.fc1.scales vision_tower.layers.N.mlp.fc1.weight
+    vision_tower.layers.N.mlp.fc2.bias vision_tower.layers.N.mlp.fc2.biases
+    vision_tower.layers.N.mlp.fc2.scales vision_tower.layers.N.mlp.fc2.weight
+    vision_tower.layers.N.self_attn.k_proj.bias vision_tower.layers.N.self_attn.k_proj.biases
+    vision_tower.layers.N.self_attn.k_proj.scales vision_tower.layers.N.self_attn.k_proj.weight
+    vision_tower.layers.N.self_attn.out_proj.bias
+    vision_tower.layers.N.self_attn.out_proj.biases
+    vision_tower.layers.N.self_attn.out_proj.scales
+    vision_tower.layers.N.self_attn.out_proj.weight vision_tower.layers.N.self_attn.q_proj.bias
+    vision_tower.layers.N.self_attn.q_proj.biases vision_tower.layers.N.self_attn.q_proj.scales
+    vision_tower.layers.N.self_attn.q_proj.weight vision_tower.layers.N.self_attn.v_proj.bias
+    vision_tower.layers.N.self_attn.v_proj.biases vision_tower.layers.N.self_attn.v_proj.scales
+    vision_tower.layers.N.self_attn.v_proj.weight vision_tower.pre_layernorm.bias
+    vision_tower.pre_layernorm.weight vision_tower.proj_in.biases vision_tower.proj_in.scales
+    vision_tower.proj_in.weight vision_tower.proj_out.biases vision_tower.proj_out.scales
+    vision_tower.proj_out.weight
+    """.split(whereSeparator: \.isWhitespace).map(String.init)
+
 /// `model`, with other random weights, then loaded from `weights` written to a directory.
 private func loaded<Model: BaseLanguageModel>(
     _ weights: [String: MLXArray], into model: Model,
@@ -585,6 +790,73 @@ struct Inkling2Tests {
             let input = tokens([1, 10])
             #expect(maxDifference(reloaded(input, cache: nil), model(input, cache: nil)) < 1e-5)
         }
+    }
+
+    @Test(
+        "An mlx-vlm conversion with NVFP4 and MXFP8 experts loads exactly",
+        arguments: [false, true])
+    func mlxVLMNVFP4CheckpointLoads(loop: Bool) throws {
+        try onCPU {
+            let model = try makeInkling2(loop: loop)
+            quantizeExpertsNatively(model)
+            let reloaded = try loaded(
+                mlxVLMCheckpoint(model), loop: loop,
+                quantization: mlxVLMQuantization(
+                    model, default: .init(groupSize: 16, bits: 4, mode: .nvfp4)))
+            let input = tokens([1, 10])
+            #expect(maxDifference(reloaded(input, cache: nil), model(input, cache: nil)) < 1e-5)
+            #expect(
+                reloaded.model.languageModel.layers[0].mlp.experts.gateUpProjection
+                    is Inkling2ScaledSwitchLinear)
+        }
+    }
+
+    @Test(
+        "An affine mlx-vlm conversion loads exactly",
+        arguments: [(false, 3), (true, 2), (true, 3)])
+    func mlxVLMAffineCheckpointLoads(loop: Bool, expertBits: Int) throws {
+        try onCPU {
+            let model = try makeInkling2(loop: loop)
+            let quantization = quantizeLikeMLXVLM(model, expertBits: expertBits)
+            let reloaded = try loaded(
+                mlxVLMCheckpoint(model), loop: loop, quantization: quantization)
+            let input = tokens([1, 10])
+            #expect(maxDifference(reloaded(input, cache: nil), model(input, cache: nil)) < 1e-5)
+        }
+    }
+
+    @Test("Gate and up halves that an expert scales differently are refused")
+    func mlxVLMRefusesSplitScales() throws {
+        let model = try makeInkling2(loop: true)
+        quantizeExpertsNatively(model)
+        var weights = mlxVLMCheckpoint(model)
+        let name = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight_scale_2"
+        weights[name] = try #require(weights[name]) * 2
+        #expect(throws: ModelFactoryError.self) {
+            _ = try Inkling2Checkpoint.prepare(
+                .init(weights: weights), configuration: model.configuration, includeVision: false)
+        }
+    }
+
+    @Test("Every tensor a published mlx-vlm build names has a place in the model")
+    func mlxVLMNamesMatchPublishedBuilds() throws {
+        let model = try makeInkling2VLM()
+        let parameters = Set(model.parameters().flattened().map(\.0))
+        let modules = Set(model.namedModules().map(\.0))
+        let quantizationLeaves: Set<Substring> = ["scales", "biases", "global_scale"]
+        // Some tensors exist only in some layers, so a name needs a place in one of them.
+        let unplaced = publishedMLXVLMNames.filter { pattern in
+            !(0 ..< 8).contains { layer in
+                let name = Inkling2Checkpoint.mlxVLMName(
+                    pattern.replacingOccurrences(of: ".N.", with: ".\(layer)."))
+                guard let dot = name.lastIndex(of: "."),
+                    quantizationLeaves.contains(name[name.index(after: dot)...])
+                else { return parameters.contains(name) }
+                // The tiny model isn't quantized; the module that would hold them is enough.
+                return modules.contains(String(name[..<dot]))
+            }
+        }
+        #expect(unplaced.isEmpty)
     }
 
     @Test("Loading never reads the bundled draft or other roots")
@@ -922,6 +1194,22 @@ struct Inkling2VisionTests {
                 oMLXCheckpoint(oQ, oQ.configuration.text), into: makeInkling2VLM(seed: 99),
                 quantization: oQQuantization(oQ.configuration.text, expertBits: 3))
             #expect(maxDifference(try logits(fromOMLX, input), try logits(oQ, input)) == 0)
+        }
+    }
+
+    @Test("An mlx-vlm conversion loads its quantized vision tower exactly")
+    func mlxVLMVisionLoads() throws {
+        try onCPU {
+            let input = imageInput(height: 8, width: 12, seed: 2)
+            let model = try makeInkling2VLM()
+            let quantization = quantizeLikeMLXVLM(model, expertBits: 3)
+            let reloaded = try loaded(
+                mlxVLMCheckpoint(model), into: makeInkling2VLM(seed: 99),
+                quantization: quantization)
+            #expect(maxDifference(try logits(reloaded, input), try logits(model, input)) == 0)
+            let names = Set(reloaded.parameters().flattened().map(\.0))
+            #expect(names.contains("model.vision_tower.layers.0.mlp.fc1.scales"))
+            #expect(names.contains("model.vision_tower.merger.linear_1.scales"))
         }
     }
 

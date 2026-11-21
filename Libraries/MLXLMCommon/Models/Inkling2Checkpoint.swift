@@ -9,6 +9,9 @@
 // - oMLX's oQ checkpoints (`model.layers.N.attn.*`): the inverse of oMLX's
 //   `omlx/patches/inkling2/loader.py` (jundot/omlx, Apache-2.0), which fuses some
 //   projections and stores the loop controllers and convolutions in its own shapes.
+// - mlx-vlm conversions (`language_model.model.*`, `vision_tower.*`): the inverse of the
+//   names `Model.sanitize` writes in `mlx_vlm/models/inkling2/inkling2.py`
+//   (Neywa-Labs/mlx-vlm@434a1bedd1, MIT), which splits the experts' gate and up rows.
 // - mlx-lm conversions (`model.language_model.*`), which already use this layout.
 
 import Foundation
@@ -18,12 +21,14 @@ package enum Inkling2Checkpoint {
     package enum Layout: Equatable {
         case native
         case oMLX
+        case mlxVLM
         case mlxLM
     }
 
     package static func layout(of names: some Collection<String>) -> Layout {
         if names.contains(where: { $0.hasPrefix("model.llm.") }) { return .native }
         if names.contains(where: { $0.hasPrefix("model.layers.") }) { return .oMLX }
+        if names.contains(where: { $0.hasPrefix("language_model.model.") }) { return .mlxVLM }
         return .mlxLM
     }
 
@@ -41,6 +46,11 @@ package enum Inkling2Checkpoint {
             checkpoint.weights = try oMLXWeights(checkpoint.weights, text: text)
             checkpoint.perLayerQuantization = checkpoint.perLayerQuantization.map {
                 oMLXQuantization($0, text: text)
+            }
+        case .mlxVLM:
+            checkpoint.weights = try mlxVLMWeights(checkpoint.weights)
+            checkpoint.perLayerQuantization = try checkpoint.perLayerQuantization.map {
+                try mlxVLMQuantization($0)
             }
         case .mlxLM:
             break
@@ -185,8 +195,14 @@ package enum Inkling2Checkpoint {
             // Layer 0 has no attention input, so query i belongs to layer i + 1.
             return "model.language_model.layers.\(index + 1).attention_input.query"
         }
+        return renamed(name, nativeRenames)
+    }
+
+    private static func renamed(_ name: String, _ rules: [(NSRegularExpression, String)])
+        -> String
+    {
         var name = name
-        for (regex, template) in nativeRenames {
+        for (regex, template) in rules {
             name = regex.stringByReplacingMatches(
                 in: name, range: NSRange(name.startIndex..., in: name), withTemplate: template)
         }
@@ -255,7 +271,8 @@ package enum Inkling2Checkpoint {
 
     // MARK: - oMLX
 
-    private static let oMLXLayer = try! NSRegularExpression(pattern: #"^model\.layers\.(\d+)\.(.+)$"#)
+    private static let oMLXLayer = try! NSRegularExpression(
+        pattern: #"^model\.layers\.(\d+)\.(.+)$"#)
 
     private struct Splits {
         let names: [String]
@@ -337,7 +354,9 @@ package enum Inkling2Checkpoint {
         let prefix = "model.language_model.layers.\(parts[0])."
         for (source, target) in oMLXRenames {
             if rest == source { return prefix + target }
-            if rest.hasPrefix(source + ".") { return prefix + target + rest.dropFirst(source.count) }
+            if rest.hasPrefix(source + ".") {
+                return prefix + target + rest.dropFirst(source.count)
+            }
         }
         return nil
     }
@@ -446,6 +465,111 @@ package enum Inkling2Checkpoint {
             } else if let target = oMLXName(path) {
                 settings[target] = option
             }
+        }
+        return .init(quantization: quantization.quantization, perLayerQuantization: settings)
+    }
+
+    // MARK: - mlx-vlm
+
+    /// Renames for tensor and module paths alike, so a rule ends at a `.` or the end.
+    private static let mlxVLMRenames: [(NSRegularExpression, String)] = [
+        (#"^language_model\.lm_head(?=\.|$)"#, "lm_head"),
+        (#"^language_model\.model\.message_queries$"#, "model.language_model.message_input.query"),
+        (#"^language_model\.model(?=\.)"#, "model.language_model"),
+        (#"\.controllers\.attn\."#, ".q_message_gate."),
+        (#"\.controllers\.(k|v|mlp)\."#, ".$1_message_gate."),
+        (#"_message_gate\.down_weight$"#, "_message_gate.down_proj.weight"),
+        (#"_message_gate\.forget_weight$"#, "_message_gate.forget_gate_proj.weight"),
+        (#"_message_gate\.gain_weight$"#, "_message_gate.message_gate_proj.weight"),
+        (#"\.attn_sconv\.conv(?=\.|$)"#, ".post_attention_convolution.conv1d"),
+        (#"\.mlp_sconv\.conv(?=\.|$)"#, ".post_mlp_convolution.conv1d"),
+        (#"sconv\.conv(?=\.|$)"#, "sconv.conv1d"),
+        (#"\.self_attn\.q_scale$"#, ".self_attn.q_l2_clip.scale"),
+        (#"\.self_attn\.rel_scale$"#, ".self_attn.rel_l2_clip.scale"),
+        (#"\.self_attn\.rel_proj$"#, ".self_attn.rel_logits_proj.proj"),
+        (#"\.mlp\.gate_weight$"#, ".mlp.gate.weight"),
+        (#"\.mlp\.e_score_correction_bias$"#, ".mlp.gate.e_score_correction_bias"),
+        (#"\.mlp\.switch_mlp\.(gate|up)_proj(?=\.|$)"#, ".mlp.experts.gate_up_proj"),
+        (#"\.mlp\.switch_mlp\.down_proj(?=\.|$)"#, ".mlp.experts.down_proj"),
+        (#"\.weight_scale_2$"#, ".global_scale"),
+        (#"^vision_tower\.proj_in(?=\.|$)"#, "model.vision_tower.merger.linear_1"),
+        (#"^vision_tower\.proj_out(?=\.|$)"#, "model.vision_tower.merger.linear_2"),
+        (#"^vision_tower(?=\.)"#, "model.vision_tower"),
+        (#"embeddings\.position_embedding$"#, "embeddings.position_embedding.weight"),
+    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
+
+    private static let mlxVLMGateUp = try! NSRegularExpression(
+        pattern: #"^(.+\.mlp\.switch_mlp)\.(gate|up)_proj\.(\w+)$"#)
+
+    /// The model's name for an mlx-vlm tensor or module path. The experts' gate and up
+    /// halves both name the fused projection.
+    package static func mlxVLMName(_ name: String) -> String {
+        renamed(name, mlxVLMRenames)
+    }
+
+    /// mlx-vlm keeps an NVFP4 expert's outer factor, `amax / denominator`; the model's
+    /// global scale is that factor times 448 · 6.
+    private static func mlxVLMGlobalScale(_ factor: MLXArray) -> MLXArray {
+        factor.asType(.float32) * Inkling2ScaledSwitchLinear.unitScale
+    }
+
+    private static func mlxVLMWeights(_ weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        var result = [String: MLXArray]()
+        // The gate and up halves of each fused expert tensor, under the fused name.
+        var halves = [String: [String: MLXArray]]()
+        for (name, value) in weights {
+            if let parts = groups(mlxVLMGateUp, name) {
+                halves[mlxVLMName("\(parts[0]).gate_proj.\(parts[2])"), default: [:]][parts[1]] =
+                    value
+                continue
+            }
+            let target = mlxVLMName(name)
+            result[target] = target.hasSuffix(".global_scale") ? mlxVLMGlobalScale(value) : value
+        }
+        for (target, parts) in halves {
+            guard let gate = parts["gate"], let up = parts["up"], gate.shape == up.shape else {
+                throw ModelFactoryError.invalidConfiguration(
+                    "Inkling 2 tensor \(target) needs gate and up halves of one shape")
+            }
+            if target.hasSuffix(".global_scale") {
+                // The fused projection scales both halves of an expert by one factor.
+                guard arrayEqual(gate, up).item(Bool.self) else {
+                    throw ModelFactoryError.invalidConfiguration(
+                        "Inkling 2 experts \(target) scale their gate and up halves differently")
+                }
+                result[target] = mlxVLMGlobalScale(gate)
+            } else {
+                // The model reads gate and up from alternating rows.
+                var shape = gate.shape
+                shape[shape.count - 2] *= 2
+                result[target] = contiguous(stacked([gate, up], axis: -2).reshaped(shape))
+            }
+        }
+        return result
+    }
+
+    /// The quantization settings under the model's names. The experts' gate and up halves
+    /// become one projection, so their settings must agree.
+    private static func mlxVLMQuantization(
+        _ quantization: BaseConfiguration.PerLayerQuantization
+    ) throws -> BaseConfiguration.PerLayerQuantization {
+        func same(
+            _ a: BaseConfiguration.QuantizationOption, _ b: BaseConfiguration.QuantizationOption
+        ) -> Bool {
+            switch (a, b) {
+            case (.skip, .skip): true
+            case (.quantize(let a), .quantize(let b)): a == b
+            default: false
+            }
+        }
+        var settings = [String: BaseConfiguration.QuantizationOption]()
+        for (path, option) in quantization.perLayerQuantization {
+            let target = mlxVLMName(path)
+            if let existing = settings[target], !same(existing, option) {
+                throw ModelFactoryError.invalidConfiguration(
+                    "Inkling 2 experts \(target) quantize their gate and up halves differently")
+            }
+            settings[target] = option
         }
         return .init(quantization: quantization.quantization, perLayerQuantization: settings)
     }
