@@ -366,7 +366,9 @@ final class Inkling2Router: Module {
                 order: .descending)
             return (indices, weights * routeScale)
         }
-        let indices = argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        // The choice of experts has no gradient; the weights of the chosen ones do.
+        let indices = stopGradient(
+            argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK])
         var weights = takeAlong(scores, indices, axis: -1)
         weights = weights / (weights.sum(axis: -1, keepDims: true) + routerScoreEpsilon)
         return (indices, weights * routeScale)
@@ -594,7 +596,8 @@ final class Inkling2Attention: Module {
             outputs.append(
                 referenceAttention(
                     queries: queries[0..., 0..., start ..< end], keys: keys, values: values,
-                    positionBias: positionBias[0..., start ..< end], sinks: sinks[0..., start ..< end],
+                    positionBias: positionBias[0..., start ..< end],
+                    sinks: sinks[0..., start ..< end],
                     queryPositions: queryPositions[0..., start ..< end],
                     storedKeyPositions: storedKeyPositions))
             start = end
@@ -922,8 +925,9 @@ public final class Inkling2TextModel: Module {
             (h, blocks) = run(0 ..< configuration.hiddenLayers, embeddings, nil)
         }
 
-        h = finalInput(blocks: blocks, partial: inkling2UnitRMS(h.asType(.float32)))[
-            .ellipsis, 0, 0...]
+        h =
+            finalInput(blocks: blocks, partial: inkling2UnitRMS(h.asType(.float32)))[
+                .ellipsis, 0, 0...]
         return norm(h).asType(dtype)
     }
 

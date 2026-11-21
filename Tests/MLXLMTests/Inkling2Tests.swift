@@ -424,6 +424,27 @@ struct Inkling2Tests {
         }
     }
 
+    @Test("Training reaches the router through the chosen experts' weights")
+    func trainingGradients() throws {
+        try onCPU {
+            let model = try makeInkling2(loop: true)
+            model.train()
+            let lossAndGradient = valueAndGrad(model: model) { model, tokens, _ in
+                model(tokens, cache: nil).square().mean()
+            }
+            let gradients = try withError {
+                let (loss, gradients) = lossAndGradient(model, tokens([2, 12]), MLXArray(0))
+                let flat = gradients.flattened()
+                eval([loss] + flat.map(\.1))
+                return flat
+            }
+            #expect(gradients.allSatisfy { all(isFinite($0.1)).item(Bool.self) })
+            let router = gradients.filter { $0.0.hasSuffix("mlp.gate.weight") }
+            #expect(!router.isEmpty)
+            #expect(router.allSatisfy { abs($0.1).max().item(Float.self) > 0 })
+        }
+    }
+
     @Test("A prompt cache saves and restores")
     func promptCacheRoundTrip() throws {
         try onCPU {
@@ -439,7 +460,8 @@ struct Inkling2Tests {
             let (restored, _) = try loadPromptCache(url: url)
             #expect(
                 maxDifference(
-                    model(input[0..., 12...], cache: restored), model(input[0..., 12...], cache: cache))
+                    model(input[0..., 12...], cache: restored),
+                    model(input[0..., 12...], cache: cache))
                     == 0)
         }
     }
