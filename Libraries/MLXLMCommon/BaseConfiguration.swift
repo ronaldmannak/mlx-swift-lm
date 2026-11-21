@@ -30,6 +30,14 @@ public struct BaseConfiguration: Codable, Sendable {
             self.bits = bits
         }
 
+        /// Initializes a quantization configuration in `mode`. Affine stores no mode, as a
+        /// decoded configuration without one does, so the two compare equal.
+        public init(groupSize: Int, bits: Int, mode: QuantizationMode) {
+            self.groupSize = groupSize
+            self.bits = bits
+            self._mode = mode == .affine ? nil : mode
+        }
+
         /// The size of the quantization group.
         public let groupSize: Int
 
