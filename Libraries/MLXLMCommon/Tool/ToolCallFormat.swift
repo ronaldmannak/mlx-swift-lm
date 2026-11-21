@@ -125,6 +125,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<atem:function_calls><atem:invoke name="f">...</atem:invoke></atem:function_calls>`
     case atem
 
+    /// Inkling 2's messages: a tool name, `<|content_invoke_tool_json|>` and a JSON call,
+    /// framed by `<|message_model|>` and `<|end_message|>`.
+    /// Example: `<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{}}<|end_message|>`
+    case inkling
+
     /// Mistral V11+ format with [TOOL_CALLS] and [ARGS] delimiters.
     /// Example: `[TOOL_CALLS]get_weather [ARGS]{"location": "Tokyo"}`
     case mistral
@@ -174,6 +179,9 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return MiniCPM5ToolCallParser()
         case .atem:
             return ATEMToolCallParser()
+        case .inkling:
+            // Inkling's framed protocol parses its own calls from the token stream.
+            return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .mistral:
             return MistralToolCallParser()
         case .llama3:
@@ -233,6 +241,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
                 toolCallPolicy: toolCallPolicy)
 
+        case .inkling:
+            return InklingStreamAdapter(
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                toolCallPolicy: toolCallPolicy)
+
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .miniCPM5, .mistral, .llama3:
             return nil
@@ -255,6 +268,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return HarmonyToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
+        case .inkling:
+            return []
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
             .miniCPM5, .mistral,
             .llama3:
@@ -271,7 +286,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             messages.count {
                 $0.role == .assistant && $0.tool?.calls?.isEmpty == false
             }
-        case .atem:
+        case .atem, .inkling:
+            // Every call renders as its own message.
             messages.reduce(into: 0) { count, message in
                 if message.role == .assistant {
                     count += message.tool?.calls?.count ?? 0
