@@ -11,8 +11,16 @@ import XCTest
 
 @testable import MLXLLM
 @testable import MLXLMCommon
+@testable import MLXVLM
 
-private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8) -> String {
+private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8, vision: Bool = false) -> String {
+    let visionConfig =
+        vision
+        ? """
+        "vision_config": {"hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "native_patch_size": 2, "adapter_merge_size": 2, "posemb_grid_size": 4,
+            "projection_hidden_dim": 48},
+        """ : ""
     let loopConfig =
         loop
         ? """
@@ -22,7 +30,7 @@ private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8) -> String {
     return """
         {
             "model_type": "\(loop ? "inkling2_loop" : "inkling2")",
-            "image_token_id": 127,
+            "image_token_id": 127, \(visionConfig)
             "text_config": {
                 "hidden_size": 64, "num_hidden_layers": 8, "vocab_size": 128,
                 "unpadded_vocab_size": 120, "num_attention_heads": 4,
@@ -42,23 +50,22 @@ private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8) -> String {
 
 private let unpaddedVocabulary = 120
 
-private func inkling2Configuration(loop: Bool, gateRank: Int = 8) throws
+private func inkling2Configuration(loop: Bool, gateRank: Int = 8, vision: Bool = false) throws
     -> Inkling2Configuration
 {
     try JSONDecoder().decode(
         Inkling2Configuration.self,
-        from: Data(inkling2ConfigJSON(loop: loop, gateRank: gateRank).utf8))
+        from: Data(inkling2ConfigJSON(loop: loop, gateRank: gateRank, vision: vision).utf8))
 }
 
-/// A seeded model whose weights are random at the reference's scale: norms and clip scales
-/// near one, other weights normal over the square root of their fan-in.
-private func makeInkling2(loop: Bool = false, gateRank: Int = 8, seed: UInt64 = 0) throws
-    -> Inkling2Model
-{
+/// Random weights at the reference's scale: norms, clip and layer scales near one, other
+/// weights normal over the square root of their fan-in.
+private func randomize(_ model: Module, seed: UInt64) {
     MLXRandom.seed(seed)
-    let model = Inkling2Model(try inkling2Configuration(loop: loop, gateRank: gateRank))
     let weights = model.parameters().flattened().map { name, value -> (String, MLXArray) in
-        if name.hasSuffix("norm.weight") || name.hasSuffix("l2_clip.scale") {
+        if name.hasSuffix("norm.weight") || name.hasSuffix("l2_clip.scale")
+            || name.hasSuffix("lambda_1") || name.hasSuffix("lambda_2")
+        {
             return (name, 1 + 0.1 * MLXRandom.normal(value.shape))
         }
         let fanIn = value.ndim > 1 ? value.dim(-1) : 16
@@ -66,12 +73,27 @@ private func makeInkling2(loop: Bool = false, gateRank: Int = 8, seed: UInt64 = 
     }
     model.update(parameters: ModuleParameters.unflattened(weights))
     eval(model)
+}
+
+/// A seeded text model with random weights.
+private func makeInkling2(loop: Bool = false, gateRank: Int = 8, seed: UInt64 = 0) throws
+    -> Inkling2Model
+{
+    let model = Inkling2Model(try inkling2Configuration(loop: loop, gateRank: gateRank))
+    randomize(model, seed: seed)
+    return model
+}
+
+/// A seeded model with a vision tower and random weights.
+private func makeInkling2VLM(loop: Bool = true, seed: UInt64 = 0) throws -> Inkling2VLM {
+    let model = Inkling2VLM(try inkling2Configuration(loop: loop, vision: true))
+    randomize(model, seed: seed)
     return model
 }
 
 /// NVFP4 experts with random global scales, and MXFP8 experts in the last layer, as in
 /// Thinking Machines' checkpoint.
-private func quantizeExpertsNatively(_ model: Inkling2Model) {
+private func quantizeExpertsNatively(_ model: Module) {
     quantize(model: model) { path, _ in
         guard path.contains(".mlp.experts.") else { return nil }
         return path.contains(".layers.7.") ? (32, 8, .mxfp8) : (16, 4, .nvfp4)
@@ -85,10 +107,12 @@ private func quantizeExpertsNatively(_ model: Inkling2Model) {
 }
 
 /// Affine experts and 8-bit attention, embeddings and head, as in oMLX's oQ builds.
-private func quantizeLikeOQ(_ model: Inkling2Model, expertBits: Int) {
+private func quantizeLikeOQ(_ model: Module, expertBits: Int) {
     quantize(model: model) { path, module in
         if path.contains(".mlp.experts.") { return (64, expertBits, .affine) }
         if path.contains("_message_gate.") { return nil }
+        // oQ keeps the vision tower in bf16.
+        if path.hasPrefix("model.vision_tower.") { return nil }
         if path.contains(".self_attn.") || path.hasSuffix("embed_tokens") || path == "lm_head" {
             return module is Quantizable ? (64, 8, .affine) : nil
         }
@@ -166,8 +190,22 @@ private let nativeNames: [(String, String)] = [
     (#"\.mlp\.gate\.e_score_correction_bias$"#, ".mlp.gate.bias"),
 ]
 
+/// The reverse of the native vision renames. Vision names keep `self_attn.q_proj`.
+private let nativeVisionNames: [(String, String)] = [
+    (#"^model\.vision_tower\.pre_layernorm\."#, "model.visual.backbone.ln_pre."),
+    (#"^model\.vision_tower\.merger\.linear_1\."#, "model.visual.proj_in."),
+    (#"^model\.vision_tower\.merger\.linear_2\."#, "model.visual.proj_out."),
+    (#"^model\.vision_tower\."#, "model.visual.backbone."),
+    (#"position_embedding\.weight$"#, "position_embedding"),
+    (#"\.layernorm_before\."#, ".ln_1."),
+    (#"\.layernorm_after\."#, ".ln_2."),
+    (#"\.mlp\.fc1\."#, ".mlp.c_fc."),
+    (#"\.mlp\.fc2\."#, ".mlp.c_proj."),
+    (#"\.lambda_(\d)$"#, ".ls_$1.gamma"),
+]
+
 /// Thinking Machines' layout of `model`, after `checkpoint()` in `test_inkling2.py`.
-private func nativeCheckpoint(_ model: Inkling2Model) -> [String: MLXArray] {
+private func nativeCheckpoint(_ model: Module) -> [String: MLXArray] {
     let expert = try! NSRegularExpression(
         pattern: #"^(.+\.mlp\.experts)\.(gate_up|down)_proj\.(\w+)$"#)
     let attentionQuery = try! NSRegularExpression(
@@ -177,6 +215,10 @@ private func nativeCheckpoint(_ model: Inkling2Model) -> [String: MLXArray] {
     var checkpoint = [String: MLXArray]()
     for (name, value) in model.parameters().flattened() {
         let range = NSRange(name.startIndex..., in: name)
+        if name.hasPrefix("model.vision_tower.") {
+            checkpoint[rename(name, nativeVisionNames)] = value
+            continue
+        }
         if name.hasSuffix(".message_input.query") {
             let q = concatenated([value[0..., ..<1], value[0..., 3...]], axis: 1)
             checkpoint["model.llm.middle_cycle_cross_pass_queries"] = q.reshaped(-1, value.dim(-1))
@@ -211,12 +253,19 @@ private func nativeCheckpoint(_ model: Inkling2Model) -> [String: MLXArray] {
 
 /// oMLX's layout of `model`: what `omlx/patches/inkling2/loader.py` writes, with fused
 /// projections, [C, K] convolutions, [Q, D] queries and its loop controller shapes.
-private func oMLXCheckpoint(_ model: Inkling2Model) -> [String: MLXArray] {
-    let args = model.configuration.text
+private func oMLXCheckpoint(_ model: Module, _ args: Inkling2TextConfiguration) -> [String:
+    MLXArray]
+{
     let hidden = args.hiddenSize
     let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
     var checkpoint = [String: MLXArray]()
-    for (name, value) in parameters where !name.contains(".layers.") {
+    // oMLX keeps the native vision names under `vision_tower.`.
+    for (name, value) in parameters where name.hasPrefix("model.vision_tower.") {
+        let native = rename(name, nativeVisionNames)
+        checkpoint["vision_tower." + native.dropFirst("model.visual.".count)] = value
+    }
+    for (name, value) in parameters
+    where !name.contains(".layers.") && !name.hasPrefix("model.vision_tower.") {
         let target =
             name
             .replacingOccurrences(of: "model.language_model.embed_tokens.", with: "model.embed.")
@@ -315,16 +364,16 @@ private func oMLXCheckpoint(_ model: Inkling2Model) -> [String: MLXArray] {
 }
 
 /// oQ's settings for `quantizeLikeOQ`, under oMLX's module names.
-private func oQQuantization(_ model: Inkling2Model, expertBits: Int)
+private func oQQuantization(_ args: Inkling2TextConfiguration, expertBits: Int)
     -> BaseConfiguration.PerLayerQuantization
 {
     let eight = BaseConfiguration.QuantizationOption.quantize(.init(groupSize: 64, bits: 8))
     var settings: [String: BaseConfiguration.QuantizationOption] = [
         "model.embed": eight, "lm_head": eight,
     ]
-    for layer in 0 ..< model.configuration.text.hiddenLayers {
+    for layer in 0 ..< args.hiddenLayers {
         let modules =
-            model.configuration.text.isSliding(layer)
+            args.isSliding(layer)
             ? ["attn.in_proj", "attn.o_proj"]
             : ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj"]
         for module in modules {
@@ -335,19 +384,28 @@ private func oQQuantization(_ model: Inkling2Model, expertBits: Int)
         quantization: .init(groupSize: 64, bits: expertBits), perLayerQuantization: settings)
 }
 
-/// A fresh model of the same configuration loaded from `weights` written to a directory.
-private func loaded(
-    _ weights: [String: MLXArray], loop: Bool, gateRank: Int = 8,
+/// `model`, with other random weights, then loaded from `weights` written to a directory.
+private func loaded<Model: BaseLanguageModel>(
+    _ weights: [String: MLXArray], into model: Model,
     quantization: BaseConfiguration.PerLayerQuantization? = nil
-) throws -> Inkling2Model {
+) throws -> Model {
     let directory = FileManager.default.temporaryDirectory.appending(
         path: "inkling2-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     try save(arrays: weights, url: directory.appending(path: "model.safetensors"))
-    let model = try makeInkling2(loop: loop, gateRank: gateRank, seed: 99)
     try loadWeights(modelDirectory: directory, model: model, perLayerQuantization: quantization)
     return model
+}
+
+/// A fresh text model of the same configuration loaded from `weights`.
+private func loaded(
+    _ weights: [String: MLXArray], loop: Bool, gateRank: Int = 8,
+    quantization: BaseConfiguration.PerLayerQuantization? = nil
+) throws -> Inkling2Model {
+    try loaded(
+        weights, into: makeInkling2(loop: loop, gateRank: gateRank, seed: 99),
+        quantization: quantization)
 }
 
 // MARK: - Tests
@@ -439,7 +497,8 @@ struct Inkling2Tests {
             let (restored, _) = try loadPromptCache(url: url)
             #expect(
                 maxDifference(
-                    model(input[0..., 12...], cache: restored), model(input[0..., 12...], cache: cache))
+                    model(input[0..., 12...], cache: restored),
+                    model(input[0..., 12...], cache: cache))
                     == 0)
         }
     }
@@ -488,8 +547,8 @@ struct Inkling2Tests {
             let model = try makeInkling2(loop: loop)
             quantizeLikeOQ(model, expertBits: expertBits)
             let reloaded = try loaded(
-                oMLXCheckpoint(model), loop: loop,
-                quantization: oQQuantization(model, expertBits: expertBits))
+                oMLXCheckpoint(model, model.configuration.text), loop: loop,
+                quantization: oQQuantization(model.configuration.text, expertBits: expertBits))
             let input = tokens([1, 10])
             #expect(maxDifference(reloaded(input, cache: nil), model(input, cache: nil)) < 1e-5)
         }
@@ -510,7 +569,7 @@ struct Inkling2Tests {
     @Test("Loading never reads the bundled draft or other roots")
     func dropsForeignTensors() throws {
         let model = try makeInkling2()
-        var weights = oMLXCheckpoint(model)
+        var weights = oMLXCheckpoint(model, model.configuration.text)
         weights["layers.0.self_attn.q_proj.weight"] = MLXArray.zeros([4, 4])
         let prepared = try Inkling2Checkpoint.prepare(
             .init(weights: weights), configuration: model.configuration, includeVision: false)
@@ -704,5 +763,138 @@ struct InklingProtocolTests {
             tokenizer: t)
         #expect(reasons(cutOff) == [.incompleteOutput])
         #expect(calls(malformed + cutOff).isEmpty)
+    }
+}
+
+// MARK: - Vision
+
+private final class InklingImageTokenizer: Tokenizer, @unchecked Sendable {
+    let imageToken = 127
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? {
+        token == "<|unused_200054|>" ? imageToken : nil
+    }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [1, imageToken, 2] }
+}
+
+@Suite(.serialized)
+struct Inkling2VisionTests {
+    /// Two tokens, one image token per 4x4-pixel merge block, two tokens.
+    private func imageInput(height: Int, width: Int, seed: UInt64, imageTokens: Int? = nil)
+        -> LMInput
+    {
+        MLXRandom.seed(seed)
+        let count = imageTokens ?? (height / 4) * (width / 4)
+        let tokens = [1, 2] + Array(repeating: 127, count: count) + [3, 4]
+        let pixels = MLXRandom.uniform(Float(-1) ..< 1, [3, height, width])
+        return LMInput(
+            text: .init(tokens: MLXArray(tokens.map { Int32($0) }).reshaped(1, -1)),
+            image: .init(pixels: pixels.reshaped(-1), frames: [THW(1, height, width)]))
+    }
+
+    private func logits(_ model: Inkling2VLM, _ input: LMInput) throws -> MLXArray {
+        let cache = try model.newCache(parameters: nil)
+        guard
+            case .logits(let output) = try model.prepare(
+                input, cache: cache, state: nil, prefill: .init())
+        else {
+            Issue.record("prepare returned tokens")
+            return MLXArray(0)
+        }
+        return output.logits
+    }
+
+    @Test("The vision tower gives one text-width row per merge block")
+    func visionRows() throws {
+        try onCPU {
+            let model = try makeInkling2VLM()
+            let tower = try #require(model.model.visionTower)
+            let pixels = MLXRandom.normal([3, 8, 12])
+            let rows: MLXArray = try tower(pixels)
+            #expect(rows.shape == [6, 64])
+        }
+    }
+
+    @Test("A text prompt gives what the text model gives")
+    func textMatchesTextModel() throws {
+        try onCPU {
+            let vlm = try makeInkling2VLM()
+            let weights = Dictionary(uniqueKeysWithValues: vlm.parameters().flattened())
+            let text = try loaded(weights, loop: true)
+            let input = tokens([1, 12])
+            #expect(maxDifference(vlm(input, cache: nil), text(input, cache: nil)) == 0)
+        }
+    }
+
+    @Test("Each image's rows reach its tokens, and the counts must agree")
+    func imageRowsReachTheirTokens() throws {
+        try onCPU {
+            let model = try makeInkling2VLM()
+            let first = try logits(model, imageInput(height: 8, width: 12, seed: 2))
+            let again = try logits(model, imageInput(height: 8, width: 12, seed: 2))
+            let second = try logits(model, imageInput(height: 8, width: 12, seed: 3))
+            #expect(first.dim(-1) == unpaddedVocabulary)
+            // The prompt's last token sees the image.
+            #expect(maxDifference(first, again) == 0)
+            #expect(maxDifference(first, second) > 0)
+            #expect(throws: (any Error).self) {
+                _ = try logits(model, imageInput(height: 8, width: 12, seed: 2, imageTokens: 5))
+            }
+        }
+    }
+
+    @Test("Thinking Machines' and oMLX's layouts load the vision tower exactly")
+    func visionCheckpointsLoad() throws {
+        try onCPU {
+            let input = imageInput(height: 8, width: 12, seed: 2)
+            let native = try makeInkling2VLM()
+            quantizeExpertsNatively(native)
+            let fromNative = try loaded(nativeCheckpoint(native), into: makeInkling2VLM(seed: 99))
+            #expect(maxDifference(try logits(fromNative, input), try logits(native, input)) == 0)
+
+            let oQ = try makeInkling2VLM()
+            quantizeLikeOQ(oQ, expertBits: 3)
+            let fromOMLX = try loaded(
+                oMLXCheckpoint(oQ, oQ.configuration.text), into: makeInkling2VLM(seed: 99),
+                quantization: oQQuantization(oQ.configuration.text, expertBits: 3))
+            #expect(maxDifference(try logits(fromOMLX, input), try logits(oQ, input)) == 0)
+        }
+    }
+
+    @Test("The processor pads each image to whole 40-pixel blocks")
+    func processorPads() async throws {
+        let config = try JSONDecoder().decode(
+            Inkling2ProcessorConfiguration.self,
+            from: Data(
+                #"{"image_token": "<|unused_200054|>", "processor_class": "Inkling2Processor"}"#
+                    .utf8))
+        let tokenizer = InklingImageTokenizer()
+        let processor = Inkling2Processor(config, tokenizer: tokenizer)
+        let image = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 90, height: 50))
+        let input = try await processor.prepare(
+            input: UserInput(prompt: "Describe it.", images: [.ciImage(image)]))
+
+        let frames = try #require(input.image?.frames)
+        #expect(frames.map { [$0.t, $0.h, $0.w] } == [[1, 80, 120]])
+        // Two rows and three columns of blocks.
+        let tokens = input.text.tokens.asArray(Int.self)
+        #expect(tokens.filter { $0 == tokenizer.imageToken }.count == 6)
+        #expect(tokens.first == 1 && tokens.last == 2)
+
+        let pixels = try #require(input.image?.pixels).reshaped(3, 80, 120)
+        // Red in the image; -1 on the 0-255 scale in the padding.
+        #expect(
+            abs(pixels[0..., 10, 10] - MLXArray([Float(1), -1, -1])).max().item(Float.self) < 1e-2)
+        let fill = (-1 / 255 - 0.5) / Float(0.5)
+        #expect(abs(pixels[0..., 79, 119] - fill).max().item(Float.self) < 1e-5)
     }
 }

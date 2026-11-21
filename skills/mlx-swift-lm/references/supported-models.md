@@ -181,6 +181,7 @@ VLMRegistry.paligemma3bMix448_8bit // mlx-community/paligemma-3b-mix-448-8bit
 | `mistral3` | Mistral 3 VLM |
 | `lfm2_vl`, `lfm2-vl` | LFM2 VL |
 | `muse_glimmer` | Meta Muse Glimmer (text, image, reasoning, and ATEM tool calls) |
+| `inkling2`, `inkling2_loop` | Thinking Machines Inkling 2 and Inkling 2 Mini (text, image, reasoning, and Inkling tool calls) |
 
 ## Loading Any Model
 
