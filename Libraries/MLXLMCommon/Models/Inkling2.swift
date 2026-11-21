@@ -224,13 +224,14 @@ final class Inkling2DynamicConvolution: Module {
 
 /// Attention of learned queries over the depth sources of each token: the completed
 /// blocks and the current partial block, all unit-RMS float32 `[B, L, D]`.
-/// Returns `[B, L, Q, D]`.
+/// Returns `[B, L, Q, D]`. The kernel has no gradient, so training passes
+/// `useKernel: false`.
 func inkling2DepthAttention(
-    blocks: MLXArray?, partial: MLXArray, query: MLXArray
+    blocks: MLXArray?, partial: MLXArray, query: MLXArray, useKernel: Bool = true
 ) -> MLXArray {
     let query = query.asType(.float32).reshaped(-1, partial.dim(-1))
     let scale = pow(Float(partial.dim(-1)), -0.5)
-    if inkling2UsesKernels(), let blocks, blocks.dim(0) > 0 {
+    if useKernel, inkling2UsesKernels(), let blocks, blocks.dim(0) > 0 {
         return inkling2DepthAttentionKernel(
             blocks: blocks, partial: partial, query: query, scale: scale)
     }
@@ -255,7 +256,8 @@ final class Inkling2DepthQuery: Module {
     }
 
     func callAsFunction(blocks: MLXArray?, partial: MLXArray) -> MLXArray {
-        inkling2DepthAttention(blocks: blocks, partial: partial, query: query)
+        inkling2DepthAttention(
+            blocks: blocks, partial: partial, query: query, useKernel: !training)
     }
 }
 
@@ -299,7 +301,7 @@ final class Inkling2MessageInput: Module {
         // A slice, not an index: an index gathers.
         inkling2DepthAttention(
             blocks: bank.blocks, partial: bank.partial,
-            query: query[loopedLayer ..< loopedLayer + 1].squeezed(axis: 0))
+            query: query[loopedLayer ..< loopedLayer + 1].squeezed(axis: 0), useKernel: !training)
     }
 }
 
@@ -423,7 +425,9 @@ final class Inkling2Router: Module {
                 order: .descending)
             return (indices, weights * routeScale)
         }
-        let indices = argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        // The choice of experts has no gradient; the weights of the chosen ones do.
+        let indices = stopGradient(
+            argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK])
         var weights = takeAlong(scores, indices, axis: -1)
         weights = weights / (weights.sum(axis: -1, keepDims: true) + routerScoreEpsilon)
         return (indices, weights * routeScale)
@@ -649,7 +653,9 @@ final class Inkling2Attention: Module {
             queries: queries.transposed(0, 2, 1, 3), keys: keys, values: values,
             positionBias: relativeLogits(relative), sinks: projected.sinks,
             queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
-            keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true)
+            keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true,
+            // The prefill kernel has no gradient.
+            forceReference: training)
         return (
             self.output(output, gate: projected.gate), projected.keyState, projected.valueState
         )

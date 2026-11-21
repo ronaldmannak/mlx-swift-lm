@@ -31,49 +31,6 @@ private func textConfiguration(
             """.utf8))
 }
 
-/// A looped bfloat16 model whose router, depth queries and experts stay float32, as in the
-/// checkpoints. Its window of 16 and bias extent of 32 are short, so a few dozen tokens pass
-/// both.
-private func makeModel(experts: Int = 2, topK: Int = 2) throws -> Inkling2Model {
-    MLXRandom.seed(0)
-    let model = Inkling2Model(
-        try JSONDecoder().decode(
-            Inkling2Configuration.self,
-            from: Data(
-                """
-                {"model_type": "inkling2_loop", "text_config": {
-                    "hidden_size": 256, "num_hidden_layers": 8, "vocab_size": 128,
-                    "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 64,
-                    "swa_num_attention_heads": 4, "swa_num_key_value_heads": 2,
-                    "swa_head_dim": 64, "sliding_window_size": 16,
-                    "local_layer_ids": [0, 1, 2, 3, 4, 6], "d_rel": 8, "rel_extent": 32,
-                    "log_scaling_n_floor": 16, "log_scaling_alpha": 0.1,
-                    "rms_norm_eps": 1e-6, "qk_l2_clip_threshold": 3.0,
-                    "rel_l2_clip_threshold": 2.0, "sconv_kernel_size": 4,
-                    "n_layers_per_attn_res_block": 3, "n_routed_experts": \(experts),
-                    "num_experts_per_tok": \(topK), "intermediate_size": 128,
-                    "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0, "route_scale": 2.0,
-                    "final_logit_softcapping": 30.0,
-                    "loop_config": {"core_start": 3, "core_end": 6, "num_passes": 3,
-                        "gate_rank": 8}}}
-                """.utf8)))
-    let weights = model.parameters().flattened().map { name, value -> (String, MLXArray) in
-        if name.hasSuffix("norm.weight") || name.hasSuffix("l2_clip.scale") {
-            return (name, (1 + 0.1 * MLXRandom.normal(value.shape)).asType(.bfloat16))
-        }
-        let fanIn = value.ndim > 1 ? value.dim(-1) : 16
-        let random = MLXRandom.normal(value.shape) * pow(Float(fanIn), -0.5)
-        // The CPU's gathered matmul takes float32 experts only.
-        let keepsFloat32 =
-            name.contains("mlp.gate.") || name.contains(".mlp.experts.")
-            || name.hasSuffix(".query")
-        return (name, keepsFloat32 ? random : random.asType(.bfloat16))
-    }
-    model.update(parameters: ModuleParameters.unflattened(weights))
-    eval(model)
-    return model
-}
-
 /// Whether `a` and `b` hold the same bits.
 private func sameBits(_ a: MLXArray, _ b: MLXArray) -> Bool {
     guard a.dtype == b.dtype, a.shape == b.shape else { return false }
@@ -148,9 +105,52 @@ struct Inkling2KernelTests {
         #expect(maxDifference(kernel, reference) < 2e-2)
     }
 
+    /// A small bfloat16 Inkling 2 Mini whose looped layers complete depth blocks, with the
+    /// router, depth queries and experts in float32 as the checkpoints keep them.
+    private func bfloat16Model(experts: Int = 2, topK: Int = 2) throws -> Inkling2Model {
+        let model = Inkling2Model(
+            try JSONDecoder().decode(
+                Inkling2Configuration.self,
+                from: Data(
+                    """
+                    {"model_type": "inkling2_loop", "text_config": {
+                        "hidden_size": 256, "num_hidden_layers": 8, "vocab_size": 128,
+                        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 64,
+                        "swa_num_attention_heads": 4, "swa_num_key_value_heads": 2,
+                        "swa_head_dim": 64, "sliding_window_size": 16,
+                        "local_layer_ids": [0, 1, 2, 3, 4, 6], "d_rel": 8, "rel_extent": 32,
+                        "log_scaling_n_floor": 16, "log_scaling_alpha": 0.1,
+                        "rms_norm_eps": 1e-6, "qk_l2_clip_threshold": 3.0,
+                        "rel_l2_clip_threshold": 2.0, "sconv_kernel_size": 4,
+                        "n_layers_per_attn_res_block": 3, "n_routed_experts": \(experts),
+                        "num_experts_per_tok": \(topK), "intermediate_size": 128,
+                        "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0, "route_scale": 2.0,
+                        "final_logit_softcapping": 30.0,
+                        "loop_config": {"core_start": 3, "core_end": 6, "num_passes": 3,
+                            "gate_rank": 8}}}
+                    """.utf8)))
+        let weights = model.parameters().flattened().map { name, value -> (String, MLXArray) in
+            if name.hasSuffix("norm.weight") || name.hasSuffix("l2_clip.scale") {
+                return (name, (1 + 0.1 * MLXRandom.normal(value.shape)).asType(.bfloat16))
+            }
+            let fanIn = value.ndim > 1 ? value.dim(-1) : 16
+            let random = MLXRandom.normal(value.shape) * pow(Float(fanIn), -0.5)
+            // The router and the depth queries stay float32, as in the checkpoints, and so do
+            // the experts: the CPU's gathered matmul takes float32 only.
+            let keepsFloat32 =
+                name.contains("mlp.gate.") || name.contains(".mlp.experts.")
+                || name.hasSuffix(".query")
+            return (name, keepsFloat32 ? random : random.asType(.bfloat16))
+        }
+        model.update(parameters: ModuleParameters.unflattened(weights))
+        eval(model)
+        return model
+    }
+
     @Test("A bfloat16 model prefills through the kernels as through the reference path")
     func modelPrefill() throws {
-        let model = try makeModel()
+        MLXRandom.seed(0)
+        let model = try bfloat16Model()
         let tokens = MLXRandom.randInt(Int32(0) ..< 120, [2, 48])
 
         func prefill() throws -> [MLXArray] {
@@ -302,7 +302,8 @@ struct Inkling2KernelTests {
     /// path. One token per row is valid, so the mask hides nothing.
     @Test("Compiled decode steps give the general path's bits", arguments: [1, 2])
     func compiledDecode(batch: Int) throws {
-        let model = try makeModel(experts: 8, topK: 2)
+        MLXRandom.seed(0)
+        let model = try bfloat16Model(experts: 8, topK: 2)
         let tokens = MLXRandom.randInt(Int32(0) ..< 120, [batch, 60])
         func decode(general: Bool) throws -> [MLXArray] {
             let cache = try model.newCache(parameters: nil)
@@ -323,5 +324,29 @@ struct Inkling2KernelTests {
         for (a, b) in zip(compiled, general) {
             #expect(sameBits(a, b))
         }
+    }
+
+    @Test("Training takes the reference paths, so gradients flow through attention")
+    func trainingGradients() throws {
+        MLXRandom.seed(0)
+        let model = try bfloat16Model()
+        // On the GPU, a bfloat16 prefill would take both kernels, which have no gradient.
+        let tokens = MLXRandom.randInt(Int32(0) ..< 120, [2, 24])
+        model.train()
+        let lossAndGradient = valueAndGrad(model: model) { model, tokens, _ in
+            model(tokens, cache: nil).asType(.float32).square().mean()
+        }
+        let (loss, gradients) = try withError {
+            let (loss, gradients) = lossAndGradient(model, tokens, MLXArray(0))
+            let flat = gradients.flattened()
+            eval([loss] + flat.map(\.1))
+            return (loss, flat)
+        }
+        #expect(loss.item(Float.self).isFinite)
+        #expect(gradients.allSatisfy { all(isFinite($0.1)).item(Bool.self) })
+        // The depth queries only reach the loss through depth attention.
+        let depthQueries = gradients.filter { $0.0.hasSuffix(".query") }
+        #expect(!depthQueries.isEmpty)
+        #expect(depthQueries.contains { abs($0.1).max().item(Float.self) > 0 })
     }
 }
