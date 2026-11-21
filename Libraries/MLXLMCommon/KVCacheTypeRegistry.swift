@@ -38,6 +38,7 @@ final class KVCacheTypeRegistry: @unchecked Sendable {
         try! register(ArraysCache.self)
         try! register(MambaCache.self)
         try! register(RewindableConvolutionCache.self)
+        try! register(Inkling2ConvolutionCache.self)
         try! register(TurboQuantKVCache.self)
         try! register(CacheList.self)
     }

@@ -1988,7 +1988,10 @@ public class MambaCache: ArraysCache {
 /// chat-template rewinds possible without keeping the full prompt activation
 /// history. Trims larger than the retained window fail atomically and callers
 /// can rebuild from the common prefix.
-public final class RewindableConvolutionCache: MambaCache {
+///
+/// Not `final`, so that Inkling 2's `Inkling2ConvolutionCache` can add the auxiliary role a
+/// staged speculative round needs.
+public class RewindableConvolutionCache: MambaCache {
     public override class var serializedClassName: String? { "RewindableConvolutionCache" }
 
     public override class func restore(

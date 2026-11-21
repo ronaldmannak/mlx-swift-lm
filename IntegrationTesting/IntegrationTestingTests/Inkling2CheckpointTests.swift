@@ -218,4 +218,71 @@ final class Inkling2CheckpointTests: XCTestCase {
         XCTAssertTrue(text.lowercased().contains("red"))
         XCTAssertTrue(text.lowercased().contains("blue"))
     }
+
+    /// Greedy decoding through the bundled DSpark draft against the target alone, at several
+    /// block sizes: how many proposals the target accepts, decode speed, and how long the
+    /// two token streams agree.
+    func testDSparkSpeculativeDecoding() async throws {
+        let directory = try directory()
+        guard
+            FileManager.default.fileExists(
+                atPath: directory.appending(path: "mtp.safetensors").path)
+        else { throw XCTSkip("This checkpoint bundles no DSpark draft") }
+        let target = try await LLMModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        await Inkling2DSparkRegistration.register()
+        let draft = try await MTPDrafterModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        let maxTokens = 160
+
+        func decode(_ iterator: inout some TokenIteratorProtocol) -> (
+            tokens: [Int], seconds: Double
+        ) {
+            Stream.defaultStream(.gpu).synchronize()
+            let start = Date.timeIntervalSinceReferenceDate
+            var tokens = [Int]()
+            while let token = iterator.next(), token != Self.endSampling { tokens.append(token) }
+            Stream.defaultStream(.gpu).synchronize()
+            return (tokens, Date.timeIntervalSinceReferenceDate - start)
+        }
+        func speculative(_ input: LMInput, blockSize: Int, maxTokens: Int) throws
+            -> MTPSpeculativeTokenIterator
+        {
+            var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+            parameters.kvCache = KVCacheConfiguration(rewind: try .init(maxTokens: blockSize))
+            return try MTPSpeculativeTokenIterator(
+                input: input, mainModel: target.model, drafter: draft.model,
+                parameters: parameters, blockSize: blockSize)
+        }
+
+        let prompts = [
+            "Write a Python function that returns the n-th Fibonacci number, with a docstring.",
+            "Explain why the sky is blue in one short paragraph.",
+        ]
+        for (index, text) in prompts.enumerated() {
+            let input = LMInput(tokens: MLXArray(try Self.prompt(text, context: target)))
+            // Warm up the kernels, and the draft's fold of the vocabulary head.
+            var warmup = try speculative(input, blockSize: 4, maxTokens: 8)
+            _ = decode(&warmup)
+            var plain = try TokenIterator(
+                input: input, model: target.model,
+                parameters: GenerateParameters(maxTokens: maxTokens, temperature: 0))
+            let baseline = decode(&plain)
+            print(
+                "Inkling2 dspark prompt=\(index) baseline tokens=\(baseline.tokens.count) decode_tok_s=\(Double(baseline.tokens.count) / baseline.seconds)"
+            )
+            for blockSize in [2, 3, 4, 6, 8] {
+                var iterator = try speculative(input, blockSize: blockSize, maxTokens: maxTokens)
+                let run = decode(&iterator)
+                let shared = zip(run.tokens, baseline.tokens).prefix { $0 == $1 }.count
+                let rate = Double(run.tokens.count) / run.seconds
+                print(
+                    "Inkling2 dspark prompt=\(index) block=\(blockSize) accepted=\(iterator.acceptedCount)/\(iterator.proposedCount) tokens=\(run.tokens.count) shared_prefix=\(shared) decode_tok_s=\(rate) speedup=\(rate * baseline.seconds / Double(baseline.tokens.count))"
+                )
+                XCTAssertNil(iterator.passthroughReason)
+                XCTAssertGreaterThan(iterator.acceptedCount, 0)
+                XCTAssertGreaterThanOrEqual(shared, min(16, baseline.tokens.count))
+            }
+        }
+    }
 }
