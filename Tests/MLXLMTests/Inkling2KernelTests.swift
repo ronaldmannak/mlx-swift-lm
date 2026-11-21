@@ -272,28 +272,25 @@ struct Inkling2KernelTests {
         }
     }
 
-    @Test("The RMS norm kernel matches MLX's norm and casts", arguments: [16, 100, 128, 2304])
-    func rmsNorm(dimensions: Int) throws {
+    /// Hundreds of rows, since a rounding difference in one row's norm can be rare.
+    @Test("Norms without a ones weight, and with the weight after, give MLX's bits")
+    func rmsNorm() throws {
         MLXRandom.seed(17)
-        // Float32 inputs keep MLX's norm, with the weight applied after it.
-        let x32 = MLXRandom.normal([3, 2, dimensions]) * 3
-        for x in [x32, x32.asType(.bfloat16), x32.asType(.float16)] {
-            for dtype in [DType.float32, .bfloat16] {
-                #expect(
-                    sameBits(
-                        inkling2UnitRMS(x, dtype: dtype),
-                        MLXFast.rmsNorm(x.asType(.float32), weight: nil, eps: 1e-6)
-                            .asType(dtype)))
-                for weightType in [DType.bfloat16, .float32] {
-                    let norm = RMSNorm(dimensions: dimensions, eps: 1e-6)
-                    norm.update(
-                        parameters: ModuleParameters.unflattened([
-                            "weight": (1 + 0.1 * MLXRandom.normal([dimensions]))
-                                .asType(weightType)
-                        ]))
-                    #expect(
-                        sameBits(inkling2Normed(norm, x, dtype: dtype), norm(x).asType(dtype)))
-                }
+        for dimensions in [16, 128, 2304] {
+            let x = MLXRandom.normal([1, 512, dimensions]) * 3
+            #expect(
+                sameBits(
+                    inkling2UnitRMS(x),
+                    MLXFast.rmsNorm(x, weight: MLXArray.ones([dimensions]), eps: 1e-6)))
+            for (weightType, dtype) in [
+                (DType.bfloat16, DType.bfloat16), (.bfloat16, .float32), (.float32, .bfloat16),
+            ] {
+                let norm = RMSNorm(dimensions: dimensions, eps: 1e-6)
+                norm.update(
+                    parameters: ModuleParameters.unflattened([
+                        "weight": (1 + 0.1 * MLXRandom.normal([dimensions])).asType(weightType)
+                    ]))
+                #expect(sameBits(inkling2Normed(norm, x, dtype: dtype), norm(x).asType(dtype)))
             }
         }
     }

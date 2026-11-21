@@ -370,63 +370,6 @@ private let expertCombineSource = """
         out[size_t(row) * D + d] = static_cast<OutT>(total);
     """
 
-// MLX's `rms_single_row` with the casts around it: the input widens to the compute type,
-// and the output narrows to `OutT`. The thread layout matches MLX's, so the sums match. The
-// squares of half-precision inputs are exact in float32, so fusing them into the sums
-// changes no bits.
-private let rmsNormSource = """
-        constexpr int N_READS = 4;
-        const uint row = threadgroup_position_in_grid.x;
-        const uint lid = thread_position_in_threadgroup.x;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        threadgroup float inv_mean[1];
-        threadgroup float sums[32];
-
-        float acc = 0;
-        float xs[N_READS];
-        const device auto* xp = x + size_t(row) * D + lid * N_READS;
-        if (lid * N_READS + N_READS <= D) {
-            for (int i = 0; i < N_READS; i++) {
-                xs[i] = static_cast<float>(static_cast<T>(xp[i]));
-                acc += xs[i] * xs[i];
-            }
-        } else {
-            for (int i = 0; i < N_READS; i++) {
-                xs[i] = (lid * N_READS + i < D) ? static_cast<float>(static_cast<T>(xp[i])) : 0;
-                acc += xs[i] * xs[i];
-            }
-        }
-        acc = simd_sum(acc);
-        if (sg == 0) {
-            sums[lane] = 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) {
-            sums[sg] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            acc = simd_sum(sums[lane]);
-            if (lane == 0) {
-                // A constant divisor would become an inexact reciprocal; MLX divides by
-                // a runtime size.
-                inv_mean[0] = metal::precise::rsqrt(acc / float(x_shape[x_ndim - 1]) + eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        device OutT* op = out + size_t(row) * D + lid * N_READS;
-        for (int i = 0; i < N_READS; i++) {
-            const int c = lid * N_READS + i;
-            if (c < D) {
-                const T normed = static_cast<T>(xs[i] * inv_mean[0]);
-                op[i] = static_cast<OutT>(
-                    HAS_WEIGHT ? static_cast<T>(weight[c]) * normed : normed);
-            }
-        }
-    """
-
 // One simdgroup per row: the scaled float32 states, their squared norm summed as MLX sums a
 // row (one thread in order up to 64 values; otherwise runs of four per lane and a simd sum,
 // MLX's looped reduce for fewer than 32 rows), then the clip.
@@ -486,7 +429,6 @@ private final class Inkling2Kernels: Sendable {
     let decodeMask: MLXFast.MLXFastKernel
     let router: MLXFast.MLXFastKernel
     let expertCombine: MLXFast.MLXFastKernel
-    let rmsNorm: MLXFast.MLXFastKernel
     let l2Clip: MLXFast.MLXFastKernel
 
     private init() {
@@ -521,11 +463,6 @@ private final class Inkling2Kernels: Sendable {
             inputNames: ["outputs", "weights"],
             outputNames: ["out"],
             source: expertCombineSource)
-        rmsNorm = MLXFast.metalKernel(
-            name: "inkling2_rms_norm",
-            inputNames: ["x", "weight", "eps"],
-            outputNames: ["out"],
-            source: rmsNormSource)
         l2Clip = MLXFast.metalKernel(
             name: "inkling2_l2_clip",
             inputNames: ["x", "scale", "threshold"],
@@ -658,25 +595,6 @@ func inkling2ExpertCombineKernel(
         grid: (D, outputs.size / (k * D), 1),
         threadGroup: (min(D, 256), 1, 1),
         outputShapes: [Array(outputs.shape.dropLast(2)) + [D]],
-        outputDTypes: [dtype])[0]
-}
-
-/// `MLXFast.rmsNorm(x, weight:, eps:)` on `x` widened to `compute`, as `dtype`, in one
-/// kernel. `compute` is the norm's own dtype: `x`'s promoted with the weight's. `x` is
-/// bfloat16 or float16.
-func inkling2RMSNormKernel(
-    _ x: MLXArray, weight: MLXArray?, eps: Float, compute: DType, dtype: DType
-) -> MLXArray {
-    let D = x.dim(-1)
-    let threads = (D + 4 * 32 - 1) / (4 * 32) * 32
-    return Inkling2Kernels.shared.rmsNorm(
-        [x, weight ?? x, MLXArray(eps)],
-        template: [
-            ("D", D), ("T", compute), ("OutT", dtype), ("HAS_WEIGHT", weight != nil),
-        ],
-        grid: (x.size / D * threads, 1, 1),
-        threadGroup: (threads, 1, 1),
-        outputShapes: [x.shape],
         outputDTypes: [dtype])[0]
 }
 

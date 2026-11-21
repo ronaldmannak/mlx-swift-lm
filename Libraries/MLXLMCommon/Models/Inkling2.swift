@@ -19,32 +19,14 @@ import MLXNN
 
 private let routerScoreEpsilon: Float = 1e-20
 
-/// Whether the RMS norm kernel takes `x`: half precision, whose squares are exact.
-private func inkling2NormKernelTakes(_ x: MLXArray) -> Bool {
-    inkling2UsesKernels() && (x.dtype == .bfloat16 || x.dtype == .float16) && x.dim(-1) <= 4096
-}
-
 /// `rms_norm` without a weight on `x` in float32, as `mx.fast.rms_norm(x, None, eps)`,
-/// returned as `dtype`. The kernels have no gradient, so training passes `useKernel: false`.
-func inkling2UnitRMS(
-    _ x: MLXArray, eps: Float = 1e-6, dtype: DType = .float32, useKernel: Bool = true
-) -> MLXArray {
-    if useKernel, inkling2NormKernelTakes(x) {
-        return inkling2RMSNormKernel(x, weight: nil, eps: eps, compute: .float32, dtype: dtype)
-    }
-    return MLXFast.rmsNorm(x.asType(.float32), weight: nil, eps: eps).asType(dtype)
+/// returned as `dtype`.
+func inkling2UnitRMS(_ x: MLXArray, eps: Float = 1e-6, dtype: DType = .float32) -> MLXArray {
+    MLXFast.rmsNorm(x.asType(.float32), weight: nil, eps: eps).asType(dtype)
 }
 
 /// `norm(x).asType(dtype)`.
-func inkling2Normed(
-    _ norm: RMSNorm, _ x: MLXArray, dtype: DType, useKernel: Bool = true
-) -> MLXArray {
-    if useKernel, inkling2NormKernelTakes(x) {
-        // MLX's norm runs in `x`'s dtype promoted with the weight's.
-        let compute = norm.weight.dtype == x.dtype ? x.dtype : .float32
-        return inkling2RMSNormKernel(
-            x, weight: norm.weight, eps: norm.eps, compute: compute, dtype: dtype)
-    }
+func inkling2Normed(_ norm: RMSNorm, _ x: MLXArray, dtype: DType) -> MLXArray {
     if inkling2UsesKernels(), x.dtype == .float32 {
         // MLX's float32 norm multiplies by the weight last, so applying it after the
         // unweighted norm gives the same bits, and the casts fuse into a compiled multiply.
@@ -283,7 +265,7 @@ final class Inkling2MessageGate: Module {
     ) -> MLXArray {
         let message = messages.raw[.ellipsis, gate, 0...]
         var states = concatenated(
-            [inkling2UnitRMS(x, useKernel: !training), messages.normed[.ellipsis, gate, 0...]],
+            [inkling2UnitRMS(x), messages.normed[.ellipsis, gate, 0...]],
             axis: -1)
         let dtype =
             (downProjection as? QuantizedLinear)?.scales.dtype ?? downProjection.weight.dtype
@@ -591,7 +573,7 @@ final class Inkling2Attention: Module {
             useKernel: !training)
         let headValues = values.reshaped(B, L, kvHeads, -1)
         let normedValues = inkling2UnitRMS(
-            headValues, eps: eps, dtype: headValues.dtype, useKernel: !training)
+            headValues, eps: eps, dtype: headValues.dtype)
         return (
             queries, relative, clippedKeys.transposed(0, 2, 1, 3),
             normedValues.transposed(0, 2, 1, 3), gateProjection(query), sinkProjection(query),
@@ -900,7 +882,7 @@ package final class Inkling2DecoderLayer: Module {
         if isSliding {
             let h = depth?[.ellipsis, 0, 0...] ?? x
             if messages == nil, let inputNorm {
-                let normed = inkling2Normed(inputNorm, h, dtype: dtype, useKernel: !training)
+                let normed = inkling2Normed(inputNorm, h, dtype: dtype)
                 return (normed, normed, normed)
             }
             inputs = (h, h, h)
@@ -920,15 +902,15 @@ package final class Inkling2DecoderLayer: Module {
         }
         if let inputNorm {
             return (
-                inkling2Normed(inputNorm, inputs.0, dtype: dtype, useKernel: !training),
-                inkling2Normed(inputNorm, inputs.1, dtype: dtype, useKernel: !training),
-                inkling2Normed(inputNorm, inputs.2, dtype: dtype, useKernel: !training)
+                inkling2Normed(inputNorm, inputs.0, dtype: dtype),
+                inkling2Normed(inputNorm, inputs.1, dtype: dtype),
+                inkling2Normed(inputNorm, inputs.2, dtype: dtype)
             )
         }
         return (
-            inkling2Normed(queryInputNorm!, inputs.0, dtype: dtype, useKernel: !training),
-            inkling2Normed(keyInputNorm!, inputs.1, dtype: dtype, useKernel: !training),
-            inkling2Normed(valueInputNorm!, inputs.2, dtype: dtype, useKernel: !training)
+            inkling2Normed(queryInputNorm!, inputs.0, dtype: dtype),
+            inkling2Normed(keyInputNorm!, inputs.1, dtype: dtype),
+            inkling2Normed(valueInputNorm!, inputs.2, dtype: dtype)
         )
     }
 
@@ -937,14 +919,14 @@ package final class Inkling2DecoderLayer: Module {
         _ x: MLXArray, blocks: MLXArray?, cache: Inkling2VisitCache?, mask: MLXArray?,
         messages: MLXArray?
     ) -> (MLXArray, MLXArray?) {
-        let messages = messages.map { ($0, inkling2UnitRMS($0, useKernel: !training)) }
+        let messages = messages.map { ($0, inkling2UnitRMS($0)) }
         if let step = decode(x, blocks: blocks, cache: cache, mask: mask, messages: messages) {
             return step
         }
         let convolution = cache?.convolution
         let lengths = convolution?.currentLengths
 
-        let normedInput = inkling2UnitRMS(x, useKernel: !training)
+        let normedInput = inkling2UnitRMS(x)
         let depth = attentionInput?(blocks: blocks, partial: normedInput)
         let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
         let (h, keyState, valueState) = attention(
@@ -983,13 +965,13 @@ package final class Inkling2DecoderLayer: Module {
             residual = x.asType(.float32) + residual
         }
 
-        var m = mlpInput(blocks: blocks, partial: inkling2UnitRMS(residual, useKernel: !training))[
+        var m = mlpInput(blocks: blocks, partial: inkling2UnitRMS(residual))[
             .ellipsis, 0, 0...]
         if let messages {
             m = mlpMessageGate!(m, messages: messages, gate: 3)
         }
         let (out, mlpState) = postMLPConvolution(
-            mlp(inkling2Normed(postAttentionNorm, m, dtype: dtype, useKernel: !training)),
+            mlp(inkling2Normed(postAttentionNorm, m, dtype: dtype)),
             state: states.1, mask: mask,
             lengths: lengths)
         return ((residual + out.asType(.float32)).asType(dtype), blocks, attentionState, mlpState)
@@ -1026,7 +1008,7 @@ package final class Inkling2DecoderLayer: Module {
     private func decodeInput(_ arguments: [MLXArray]) -> [MLXArray] {
         let (x, positions) = (arguments[0], arguments[3])
         let (blocks, messages) = extras(arguments, after: 4)
-        let normedInput = inkling2UnitRMS(x, useKernel: !training)
+        let normedInput = inkling2UnitRMS(x)
         let depth = attentionInput?(blocks: blocks, partial: normedInput)
         let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
         let projected = attention.project(
@@ -1182,7 +1164,7 @@ public final class Inkling2TextModel: Module {
                 if pass > 0 {
                     let completed = blocks.map { $0[(preludeBlocks + 1)...] }
                     bank = Inkling2MessageBank(
-                        blocks: completed, partial: inkling2UnitRMS(h, useKernel: !training))
+                        blocks: completed, partial: inkling2UnitRMS(h))
                     (h, blocks) = prelude
                 }
                 (h, blocks) = run(loop.core, h, blocks, bank: bank)
@@ -1193,9 +1175,9 @@ public final class Inkling2TextModel: Module {
         }
 
         h =
-            finalInput(blocks: blocks, partial: inkling2UnitRMS(h, useKernel: !training))[
+            finalInput(blocks: blocks, partial: inkling2UnitRMS(h))[
                 .ellipsis, 0, 0...]
-        return inkling2Normed(norm, h, dtype: dtype, useKernel: !training)
+        return inkling2Normed(norm, h, dtype: dtype)
     }
 
     private static func visitCaches(_ cache: [KVCache]) -> [Inkling2VisitCache] {
