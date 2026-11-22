@@ -252,6 +252,53 @@ struct Inkling2DSparkTests {
         }
     }
 
+    @Test("A rewind window leaves a global layer's capacity window and pinned prefix")
+    func rewindKeepsGlobalCapacity() throws {
+        try onCPU {
+            let target = try makeTarget()
+            let tokens = prompt(24).text.tokens[.newAxis]
+            // A capacity of the sliding window, so global layers rotate too and keep their
+            // first four positions.
+            func cache(rewind: Int?) throws -> [KVCache] {
+                var parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+                parameters.kvCache = KVCacheConfiguration(
+                    capacity: try .init(maxTokens: 8),
+                    rewind: try rewind.map { try .init(maxTokens: $0) })
+                return try target.newCache(parameters: parameters)
+            }
+            let (plain, rewindable) = (try cache(rewind: nil), try cache(rewind: 4))
+            // A prompt, a write in place, then one position at a time past every cache's end.
+            for range in [0 ..< 10, 10 ..< 13] + (13 ..< 24).map({ $0 ..< $0 + 1 }) {
+                let chunk = tokens[0..., range]
+                let difference = maxDifference(
+                    target(chunk, cache: plain), target(chunk, cache: rewindable))
+                #expect(difference < 1e-4, "positions \(range)")
+            }
+        }
+    }
+
+    @Test("The estimate counts what a rewind window's rings and convolution states hold")
+    func estimateCountsRewindCaches() throws {
+        let target = try makeTarget()
+        let parameters = try speculative(maxTokens: 1)
+        let estimate = try target.estimator(parameters: parameters).cache
+        // A prompt, then a write as wide as the rewind window, as a round's verify makes: 256
+        // positions, one allocation step of the global layers' caches. Every ring has wrapped,
+        // and every convolution state holds its widest call.
+        let tokens = 256
+        let input = prompt(tokens).text.tokens[.newAxis]
+        let cache = try target.newCache(parameters: parameters)
+        _ = target(input[0..., ..<(tokens - 4)], cache: cache)
+        _ = target(input[0..., (tokens - 4)...], cache: cache)
+        eval(cache)
+        let leaves = KVCacheTree.leaves(in: cache, includingAuxiliary: true)
+        #expect(estimate.layers.map(\.path) == leaves.map(\.path))
+        for (layer, leaf) in zip(estimate.layers, leaves) {
+            let actual = leaf.cache.innerState().reduce(0) { $0 + $1.nbytes }
+            #expect(layer.bytes(tokens: tokens) == actual, "layer \(layer.path)")
+        }
+    }
+
     @Test("A rewindable convolution state steps back within its last call")
     func rewindableCacheTrimsLastCall() throws {
         let rows = MLXArray(0 ..< 30).asType(.float32).reshaped(1, 15, 2)
