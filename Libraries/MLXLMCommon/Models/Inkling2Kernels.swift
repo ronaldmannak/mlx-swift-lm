@@ -289,28 +289,36 @@ private let shortConvolutionSource = """
         }
     """
 
-// One query per row: one thread per head and key. Masked keys get -inf; visible keys the
-// bias at their distance, or zero past the profile.
+// `L` queries per row: one thread per head, key and query (`z` is the row's query `b * L +
+// l`). Masked keys get -inf; visible keys the bias at their distance, or zero past the profile.
+// With SINK_SLOT, the last key, a zero key, gets the query's sink.
 private let decodeMaskSource = """
         const int S = stored_shape[1];
+        const int L = positions_shape[1];
         const int H = bias_shape[2];
         const int s = int(thread_position_in_grid.x);
         const int h = int(thread_position_in_grid.y);
-        const int b = int(thread_position_in_grid.z);
+        const int z = int(thread_position_in_grid.z);
         if (s >= S) {
             return;
         }
-        const float stored_position = stored[size_t(b) * S + s];
-        const float d = positions[b] - (stored_position - 1.0f);
-        const bool visible = d >= 0.0f && stored_position > 0.0f
-            && (WINDOW == 0 || d < float(WINDOW));
+        const int b = z / L;
+        const int l = z - b * L;
         T value = static_cast<T>(-INFINITY);
-        if (visible) {
-            value = d < float(R)
-                ? bias[(size_t(b) * H + h) * R + int(metal::clamp(d, 0.0f, float(R - 1)))]
-                : static_cast<T>(0.0f);
+        if (SINK_SLOT && s == S - 1) {
+            value = static_cast<T>(sinks[size_t(z) * H + h]);
+        } else {
+            const float stored_position = stored[size_t(b) * S + s];
+            const float d = positions[z] - (stored_position - 1.0f);
+            const bool visible = d >= 0.0f && stored_position > 0.0f
+                && (WINDOW == 0 || d < float(WINDOW));
+            if (visible) {
+                value = d < float(R)
+                    ? bias[(size_t(z) * H + h) * R + int(metal::clamp(d, 0.0f, float(R - 1)))]
+                    : static_cast<T>(0.0f);
+            }
         }
-        out[(size_t(b) * H + h) * S + s] = value;
+        out[((size_t(b) * H + h) * L + l) * S + s] = value;
     """
 
 // One threadgroup per row, one thread per expert: MLX's sigmoid, the correction bias, then
@@ -450,7 +458,7 @@ private final class Inkling2Kernels: Sendable {
             source: shortConvolutionSource)
         decodeMask = MLXFast.metalKernel(
             name: "inkling2_decode_mask",
-            inputNames: ["bias", "positions", "stored"],
+            inputNames: ["bias", "positions", "stored", "sinks"],
             outputNames: ["out"],
             source: decodeMaskSource)
         router = MLXFast.metalKernel(
@@ -547,21 +555,26 @@ func inkling2ShortConvolutionKernel(
     return (out[0], out[1])
 }
 
-/// The additive mask of one query per row: the relative-position bias of each visible key
-/// and -inf elsewhere. `positionBias` `[B, 1, H, R]`; `queryPositions` `[B, 1]` and
-/// `storedKeyPositions` `[B, S]` float32. Returns `[B, H, 1, S]` in `positionBias`'s dtype.
+/// The additive mask of `L` queries per row: the relative-position bias of each visible key
+/// and -inf elsewhere. `positionBias` `[B, L, H, R]`; `queryPositions` `[B, L]` and
+/// `storedKeyPositions` `[B, S]` float32. With `sinks` `[B, L, H]`, the last key, which must be
+/// a zero key, gets each query's sink instead. Returns `[B, H, L, S]` in `positionBias`'s dtype.
 func inkling2DecodeMaskKernel(
     positionBias: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray,
-    window: Int
+    window: Int, sinks: MLXArray? = nil
 ) -> MLXArray {
-    let (B, H, R) = (positionBias.dim(0), positionBias.dim(2), positionBias.dim(3))
+    let (B, L, H, R) = (
+        positionBias.dim(0), positionBias.dim(1), positionBias.dim(2), positionBias.dim(3)
+    )
     let S = storedKeyPositions.dim(1)
     return Inkling2Kernels.shared.decodeMask(
-        [positionBias, queryPositions, storedKeyPositions],
-        template: [("T", positionBias.dtype), ("R", R), ("WINDOW", window)],
-        grid: (S, H, B),
+        [positionBias, queryPositions, storedKeyPositions, sinks ?? queryPositions],
+        template: [
+            ("T", positionBias.dtype), ("R", R), ("WINDOW", window), ("SINK_SLOT", sinks != nil),
+        ],
+        grid: (S, H, B * L),
         threadGroup: (min(S, 256), 1, 1),
-        outputShapes: [[B, H, 1, S]],
+        outputShapes: [[B, H, L, S]],
         outputDTypes: [positionBias.dtype])[0]
 }
 

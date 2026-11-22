@@ -562,6 +562,187 @@ extension RewindableConvolutionCache {
     }
 }
 
+/// A sliding layer's keys and values, or their positions, for a cache with a rewind window: a
+/// ring of `window + reserve` slots, position `p` in slot `p % capacity`, then one slot of
+/// zeros.
+///
+/// A write of up to `reserve + 1` positions, such as a speculative round's verify, goes in
+/// place. Once the ring has wrapped, the call reads the whole ring in ring order: the stored
+/// positions say where each key belongs, and the zero slot takes each query's sink (see
+/// ``Inkling2Attention/ringAttention``). Before that, the slots up to the offset are in order
+/// and the call reads them. A wrapped rotating cache returns its keys in temporal order
+/// instead, which copies the window on every call, and a staged round copies it again to
+/// append the staged keys. Longer writes, prompts, return the last `window - 1` positions in
+/// temporal order and then the new ones, for the prefill kernel.
+///
+/// A trim of up to `reserve` positions only moves the offset. What the trimmed write left is
+/// ahead of every later query, so masked, until a write replaces it, and what it overwrote is
+/// older than any later query's window. A speculative round writes through this auxiliary
+/// entry and trims it back, as mlx-vlm's rounds write their rotating caches and roll back.
+final class Inkling2RingCache: BaseKVCache, AuxiliaryKVCache {
+    override class var serializedClassName: String? { "Inkling2RingCache" }
+
+    let window: Int
+    let reserve: Int
+    private var keys: MLXArray?
+    private var values: MLXArray?
+    /// The furthest offset written. A trim reaches at most `reserve` back from it.
+    private var furthest = 0
+
+    init(window: Int, reserve: Int) {
+        precondition(window > 0 && reserve > 0)
+        self.window = window
+        self.reserve = reserve
+        super.init()
+    }
+
+    var capacity: Int { window + reserve }
+
+    override var maxSize: Int? { window }
+
+    override var evictedTokenCount: Int { Swift.max(0, offset - capacity) }
+
+    /// Whether a write of `count` positions goes in place, so that its call reads the ring.
+    func writesInPlace(_ count: Int) -> Bool { count <= reserve + 1 }
+
+    override func innerState() -> [MLXArray] { [keys, values].compactMap { $0 } }
+
+    override func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (
+        MLXArray, MLXArray
+    ) {
+        let count = newKeys.dim(2)
+        if keys == nil {
+            func zeros(_ x: MLXArray) -> MLXArray {
+                MLXArray.zeros([x.dim(0), x.dim(1), capacity + 1, x.dim(3)], dtype: x.dtype)
+            }
+            (keys, values) = (zeros(newKeys), zeros(newValues))
+        }
+        var presented: (MLXArray, MLXArray)?
+        if !writesInPlace(count) {
+            let previous = Swift.min(offset, window - 1)
+            presented = (
+                concatenated([recent(keys!, previous), newKeys], axis: 2),
+                concatenated([recent(values!, previous), newValues], axis: 2)
+            )
+        }
+        // The last `capacity` positions of a long write fill the ring.
+        let written = Swift.min(count, capacity)
+        for (slots, rows) in runs(from: offset + count - written, count: written) {
+            let rows = (count - written + rows.lowerBound) ..< (count - written + rows.upperBound)
+            keys![.ellipsis, slots, 0...] = newKeys[.ellipsis, rows, 0...]
+            values![.ellipsis, slots, 0...] = newValues[.ellipsis, rows, 0...]
+        }
+        offset += count
+        furthest = Swift.max(furthest, offset)
+        if let presented {
+            return presented
+        }
+        // Until the ring wraps, its slots hold the positions in order.
+        if furthest <= capacity {
+            return (keys![.ellipsis, ..<offset, 0...], values![.ellipsis, ..<offset, 0...])
+        }
+        return (keys!, values!)
+    }
+
+    /// Whether the write of `count` positions just made returned the ring in ring order: an
+    /// in-place write once the ring has wrapped.
+    func returnedRing(writing count: Int) -> Bool {
+        writesInPlace(count) && furthest > capacity
+    }
+
+    /// The slots of `count` positions from `start`, and their rows among those positions, as
+    /// at most two runs.
+    private func runs(from start: Int, count: Int) -> [(slots: Range<Int>, rows: Range<Int>)] {
+        guard count > 0 else { return [] }
+        let first = start % capacity
+        let head = Swift.min(count, capacity - first)
+        var runs = [(slots: first ..< first + head, rows: 0 ..< head)]
+        if head < count {
+            runs.append((slots: 0 ..< count - head, rows: head ..< count))
+        }
+        return runs
+    }
+
+    /// The last `count` positions before the offset, in temporal order.
+    private func recent(_ ring: MLXArray, _ count: Int) -> MLXArray {
+        let parts = runs(from: offset - count, count: count).map {
+            ring[.ellipsis, $0.slots, 0...]
+        }
+        return switch parts.count {
+        case 0: ring[.ellipsis, ..<0, 0...]
+        case 1: parts[0]
+        default: concatenated(parts, axis: 2)
+        }
+    }
+
+    override var isTrimmable: Bool { true }
+
+    override func isTrimmable(after positions: Int) -> Bool {
+        positions >= 0 && positions <= reserve
+    }
+
+    override var maxTrimCount: Int {
+        Swift.max(0, Swift.min(offset, reserve - (furthest - offset)))
+    }
+
+    @discardableResult
+    override func trim(_ n: Int) -> Int {
+        guard n > 0, n <= maxTrimCount else { return 0 }
+        offset -= n
+        return n
+    }
+
+    override func copy() -> any KVCache {
+        let copy = Inkling2RingCache(window: window, reserve: reserve)
+        // New array objects: a write assigns through a subscript, which would reach a shared one.
+        copy.keys = keys.map { $0[.ellipsis] }
+        copy.values = values.map { $0[.ellipsis] }
+        copy.offset = offset
+        copy.furthest = furthest
+        return copy
+    }
+
+    override var state: [MLXArray] {
+        get { innerState() }
+        set {
+            precondition(newValue.isEmpty || newValue.count == 2, "a ring holds keys and values")
+            keys = newValue.first
+            values = newValue.count == 2 ? newValue[1] : nil
+        }
+    }
+
+    override var metaState: [String] {
+        get { ["\(offset)", "\(furthest)", "\(window)", "\(reserve)"] }
+        set {
+            assertionFailure(
+                "Inkling2RingCache.metaState cannot be set directly; restore through prompt-cache loading."
+            )
+        }
+    }
+
+    override class func restore(state: [MLXArray], metaState: [String]) throws -> any KVCache {
+        let numbers = metaState.compactMap { Int($0) }
+        guard metaState.count == 4, numbers.count == 4 else {
+            throw KVCacheError(message: "Corrupt prompt cache: invalid Inkling2RingCache metadata.")
+        }
+        let (offset, furthest, window, reserve) = (numbers[0], numbers[1], numbers[2], numbers[3])
+        guard window > 0, reserve > 0, offset >= 0, furthest >= offset,
+            furthest - offset <= reserve,
+            state.isEmpty
+                ? offset == 0
+                : state.count == 2
+                    && state.allSatisfy({ $0.ndim == 4 && $0.dim(2) == window + reserve + 1 })
+        else {
+            throw KVCacheError(message: "Corrupt prompt cache: invalid Inkling2RingCache state.")
+        }
+        let cache = Inkling2RingCache(window: window, reserve: reserve)
+        cache.state = state
+        cache.offset = offset
+        cache.furthest = furthest
+        return cache
+    }
+}
+
 final class Inkling2Attention: Module {
     let isSliding: Bool
     var heads: Int
@@ -743,7 +924,7 @@ final class Inkling2Attention: Module {
             queries: queries.transposed(0, 2, 1, 3), keys: keys, values: values,
             positionBias: relativeLogits(relative), sinks: projected.sinks,
             queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
-            keysInOrder: cache.map { Self.keysInOrder($0.keyValues) } ?? true,
+            keyOrder: cache.map { Self.keyOrder($0.keyValues, writing: L) } ?? .temporal,
             // The prefill kernel has no gradient.
             forceReference: training)
         return (
@@ -768,28 +949,38 @@ final class Inkling2Attention: Module {
         }
     }
 
-    /// Whether a multi-token write returns every key in temporal order, ending at the new
-    /// ones. A pinned prefix breaks that order.
-    fileprivate static func keysInOrder(_ cache: KVCache) -> Bool {
+    /// The order of the keys a cache write returns.
+    enum KeyOrder {
+        /// Temporal, ending at the new keys, as the prefill kernel requires.
+        case temporal
+        /// An ``Inkling2RingCache``'s ring order, ending at a slot of zeros.
+        case ring
+        /// Anything else, such as a ring with a pinned prefix.
+        case other
+    }
+
+    /// The order of the keys the write of `count` positions to `cache` just made returned.
+    fileprivate static func keyOrder(_ cache: KVCache, writing count: Int) -> KeyOrder {
         switch cache {
-        case let cache as RotatingKVCache: cache.keepCount == 0
+        case let cache as Inkling2RingCache: cache.returnedRing(writing: count) ? .ring : .temporal
+        case let cache as RotatingKVCache: cache.keepCount == 0 ? .temporal : .other
         // A speculative round's view of a ring: its window, then the staged keys.
-        case let cache as RotatingStagedKVCache: cache.live.keepCount == 0
-        case is KVCacheSimple, is BatchKVCache, is BatchRotatingKVCache: true
-        default: false
+        case let cache as RotatingStagedKVCache: cache.live.keepCount == 0 ? .temporal : .other
+        case is KVCacheSimple, is BatchKVCache, is BatchRotatingKVCache: .temporal
+        default: .other
         }
     }
 
     /// Attention with the relative-position bias and a sink per query and head.
-    /// `queries` `[B, H, L, D]`; returns `[B, L, H, D]`. `keysInOrder` says the keys are in
-    /// temporal order and end at the queries, which the prefill kernel requires.
+    /// `queries` `[B, H, L, D]`; returns `[B, L, H, D]`. The prefill kernel requires
+    /// `keyOrder` ``KeyOrder/temporal``.
     func attention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, positionBias: MLXArray,
         sinks: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray,
-        keysInOrder: Bool = true, forceReference: Bool = false
+        keyOrder: KeyOrder = .temporal, forceReference: Bool = false
     ) -> MLXArray {
         let (B, L) = (queries.dim(0), queries.dim(2))
-        if !forceReference, L > 1, keysInOrder, inkling2UsesKernels(), headDim % 8 == 0,
+        if !forceReference, L > 1, keyOrder == .temporal, inkling2UsesKernels(), headDim % 8 == 0,
             [queries.dtype, keys.dtype, values.dtype].allSatisfy({ $0 == .bfloat16 })
         {
             // Each row's keys before its first position are padding.
@@ -802,6 +993,12 @@ final class Inkling2Attention: Module {
         }
         if !forceReference, B == 1 && L == 1 {
             return singleTokenAttention(
+                queries: queries, keys: keys, values: values, positionBias: positionBias,
+                sinks: sinks, queryPositions: queryPositions,
+                storedKeyPositions: storedKeyPositions)
+        }
+        if !forceReference, L > 1, keyOrder == .ring, inkling2UsesKernels() {
+            return ringAttention(
                 queries: queries, keys: keys, values: values, positionBias: positionBias,
                 sinks: sinks, queryPositions: queryPositions,
                 storedKeyPositions: storedKeyPositions)
@@ -883,6 +1080,25 @@ final class Inkling2Attention: Module {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale,
             mask: mask.asType(queries.dtype), sinks: sinks[0, 0].asType(queries.dtype))
+        return output.transposed(0, 2, 1, 3)
+    }
+
+    /// A few queries per row over an ``Inkling2RingCache``'s keys, in ring order.
+    ///
+    /// The fused attention takes one sink per head, and Inkling 2's sinks vary by query. So the
+    /// mask kernel gives each visible key its bias and the ring's last slot, whose key and
+    /// value are zeros, each query's sink. That slot's score is then exactly the sink, and it
+    /// adds nothing to the output, as a sink column does.
+    func ringAttention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, positionBias: MLXArray,
+        sinks: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray
+    ) -> MLXArray {
+        let mask = inkling2DecodeMaskKernel(
+            positionBias: positionBias, queryPositions: queryPositions,
+            storedKeyPositions: storedKeyPositions, window: window, sinks: sinks)
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale,
+            mask: mask.asType(queries.dtype))
         return output.transposed(0, 2, 1, 3)
     }
 
@@ -1171,7 +1387,7 @@ package final class Inkling2DecoderLayer: Module {
         let attended = attention.attention(
             queries: input[1], keys: keys, values: values, positionBias: input[4],
             sinks: input[5], queryPositions: positions, storedKeyPositions: stored,
-            keysInOrder: Inkling2Attention.keysInOrder(cache.keyValues))
+            keyOrder: Inkling2Attention.keyOrder(cache.keyValues, writing: L))
         let output = outputTrace(
             self, [x, input[0], attended, input[6], states[2], states[3]] + extras)
 
@@ -1332,8 +1548,9 @@ public final class Inkling2TextModel: Module {
     }
 
     /// Per layer visit: keys and values (rotating for sliding layers), their positions in a
-    /// cache of the same kind, and the four convolution states, in one cache or, with a
-    /// rewind window, in an ``Inkling2ConvolutionCache`` each.
+    /// cache of the same kind, and the four convolution states, in one cache. With a rewind
+    /// window, sliding layers' keys and positions take an ``Inkling2RingCache`` each and the
+    /// convolution states an ``Inkling2ConvolutionCache`` each.
     package func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         if let strategy = try parameters?.resolvedKVCacheConfiguration()?.strategy,
             strategy != .fullPrecision
@@ -1343,9 +1560,18 @@ public final class Inkling2TextModel: Module {
         let rewind = parameters?.kvCache?.rewind?.maxTokens
         return try layerVisits.flatMap { index -> [KVCache] in
             func attentionCache() throws -> KVCache {
-                try makeHybridAttentionKVCache(
+                let cache = try makeHybridAttentionKVCache(
                     parameters: parameters, slidingWindow: configuration.slidingWindow,
                     usesSlidingWindow: configuration.isSliding(index))
+                // A sliding layer with a rewind window writes in place, unless a smaller
+                // `maxKVSize` shortens its window, which a rotating cache keeps.
+                if let rotating = cache as? RotatingKVCache, rotating.rewindCapacity > 0,
+                    rotating.maxSize == configuration.slidingWindow
+                {
+                    return Inkling2RingCache(
+                        window: configuration.slidingWindow, reserve: rotating.rewindCapacity)
+                }
+                return cache
             }
             let convolutions: [KVCache] =
                 rewind.map { rewind in
