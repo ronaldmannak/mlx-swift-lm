@@ -204,7 +204,9 @@ extension GenerationEstimator.Cache {
             } else {
                 [[Int]: Measurement]()
             }
-        self.init(layers: leaves.map { $0.estimatedLayer(compressed: compressed[$0.path]) })
+        // Cache policy skips auxiliary entries, but what they hold is memory too.
+        let layers = KVCacheTree.leaves(in: cache, includingAuxiliary: true)
+        self.init(layers: layers.map { $0.estimatedLayer(compressed: compressed[$0.path]) })
     }
 
     struct Measurement {
@@ -361,6 +363,13 @@ extension KVCacheLeaf {
             return .init(
                 path: path, kind: kind, strategy: nil, bytesPerToken: 0,
                 fixedBytes: fixedBytes, capacity: nil)
+        }
+        // Any other auxiliary entry is taken at the size the probe left it, as an Inkling 2
+        // ring, which allocates every slot on its first write, stays.
+        if cache is any AuxiliaryKVCache {
+            return .init(
+                path: path, kind: kind, strategy: nil, bytesPerToken: 0,
+                fixedBytes: state.reduce(0) { $0 + $1.nbytes }, capacity: cache.maxSize)
         }
 
         let capacity =

@@ -252,6 +252,53 @@ struct Inkling2DSparkTests {
         }
     }
 
+    @Test("A rewind window leaves a global layer's capacity window and pinned prefix")
+    func rewindKeepsGlobalCapacity() throws {
+        try onCPU {
+            let target = try makeTarget()
+            let tokens = prompt(24).text.tokens[.newAxis]
+            // A capacity of the sliding window, so global layers rotate too and keep their
+            // first four positions.
+            func cache(rewind: Int?) throws -> [KVCache] {
+                var parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+                parameters.kvCache = KVCacheConfiguration(
+                    capacity: try .init(maxTokens: 8),
+                    rewind: try rewind.map { try .init(maxTokens: $0) })
+                return try target.newCache(parameters: parameters)
+            }
+            let (plain, rewindable) = (try cache(rewind: nil), try cache(rewind: 4))
+            // A prompt, a write in place, then one position at a time past every cache's end.
+            for range in [0 ..< 10, 10 ..< 13] + (13 ..< 24).map({ $0 ..< $0 + 1 }) {
+                let chunk = tokens[0..., range]
+                let difference = maxDifference(
+                    target(chunk, cache: plain), target(chunk, cache: rewindable))
+                #expect(difference < 1e-4, "positions \(range)")
+            }
+        }
+    }
+
+    @Test("The estimate counts what a rewind window's rings and convolution states hold")
+    func estimateCountsRewindCaches() throws {
+        let target = try makeTarget()
+        let parameters = try speculative(maxTokens: 1)
+        let estimate = try target.estimator(parameters: parameters).cache
+        // A prompt, then a write as wide as the rewind window, as a round's verify makes: 256
+        // positions, one allocation step of the global layers' caches. Every ring has wrapped,
+        // and every convolution state holds its widest call.
+        let tokens = 256
+        let input = prompt(tokens).text.tokens[.newAxis]
+        let cache = try target.newCache(parameters: parameters)
+        _ = target(input[0..., ..<(tokens - 4)], cache: cache)
+        _ = target(input[0..., (tokens - 4)...], cache: cache)
+        eval(cache)
+        let leaves = KVCacheTree.leaves(in: cache, includingAuxiliary: true)
+        #expect(estimate.layers.map(\.path) == leaves.map(\.path))
+        for (layer, leaf) in zip(estimate.layers, leaves) {
+            let actual = leaf.cache.innerState().reduce(0) { $0 + $1.nbytes }
+            #expect(layer.bytes(tokens: tokens) == actual, "layer \(layer.path)")
+        }
+    }
+
     @Test("A rewindable convolution state steps back within its last call")
     func rewindableCacheTrimsLastCall() throws {
         let rows = MLXArray(0 ..< 30).asType(.float32).reshaped(1, 15, 2)
@@ -273,6 +320,64 @@ struct Inkling2DSparkTests {
         #expect(cache.trim(1) == 1)
         #expect(maxDifference(cache[0]!, rows[0..., 6 ..< 9]) == 0)
         #expect(cache.maxTrimCount == 0)
+    }
+
+    @Test("A ring of keys writes in place, returns long writes in order and steps back")
+    func ringCache() throws {
+        // A window of 4 and a reserve of 2: six slots, then the zero slot. Each row holds its
+        // position plus one, plus `tag`, so a rewrite can be told apart.
+        let cache = Inkling2RingCache(window: 4, reserve: 2)
+        func rows(_ positions: Range<Int>, tag: Float = 0) -> MLXArray {
+            MLXArray(positions.map { Float($0 + 1) + tag }).reshaped(1, 1, -1, 1)
+        }
+        func flat(_ x: MLXArray) -> [Float] { x.reshaped(-1).asArray(Float.self) }
+
+        // Until the ring wraps, in-place writes return the slots up to the offset, in order.
+        let fresh = Inkling2RingCache(window: 4, reserve: 2)
+        #expect(flat(fresh.update(keys: rows(0 ..< 2), values: rows(0 ..< 2)).0) == [1, 2])
+        #expect(!fresh.returnedRing(writing: 2))
+        #expect(flat(fresh.update(keys: rows(2 ..< 4), values: rows(2 ..< 4)).0) == [1, 2, 3, 4])
+        #expect(fresh.trim(1) == 1)
+        let rewritten = fresh.update(keys: rows(3 ..< 5, tag: 100), values: rows(3 ..< 5)).0
+        #expect(flat(rewritten) == [1, 2, 3, 104, 105])
+
+        // A 5-position prompt is longer than an in-place write, so it comes back in order.
+        var (keys, values) = cache.update(keys: rows(0 ..< 5), values: rows(0 ..< 5) * 10)
+        #expect(flat(keys) == [1, 2, 3, 4, 5])
+        #expect(flat(values) == [10, 20, 30, 40, 50])
+        // Three positions go in place, wrapping, and the call reads the ring.
+        (keys, values) = cache.update(keys: rows(5 ..< 8), values: rows(5 ..< 8) * 10)
+        #expect(cache.returnedRing(writing: 3))
+        #expect(flat(keys) == [7, 8, 3, 4, 5, 6, 0])
+        #expect(flat(values) == [70, 80, 30, 40, 50, 60, 0])
+        #expect(cache.offset == 8)
+        #expect(cache.maxTrimCount == 2)
+        #expect(cache.isTrimmable(after: 2))
+        #expect(!cache.isTrimmable(after: 3))
+
+        // Stepping back moves only the offset, and no further than the reserve.
+        #expect(cache.trim(2) == 2)
+        #expect(cache.offset == 6)
+        #expect(cache.maxTrimCount == 0)
+        #expect(cache.trim(1) == 0)
+        let copy = cache.copy() as! Inkling2RingCache
+        (keys, _) = cache.update(keys: rows(6 ..< 7, tag: 100), values: rows(6 ..< 7))
+        #expect(flat(keys) == [107, 8, 3, 4, 5, 6, 0])
+        #expect(cache.maxTrimCount == 1)
+        #expect(flat(copy.state[0]) == [7, 8, 3, 4, 5, 6, 0])
+
+        // A long write returns the last window - 1 positions, then its own.
+        (keys, _) = cache.update(keys: rows(7 ..< 11, tag: 200), values: rows(7 ..< 11))
+        #expect(flat(keys) == [5, 6, 107, 208, 209, 210, 211])
+        (keys, _) = cache.update(keys: rows(11 ..< 12, tag: 300), values: rows(11 ..< 12))
+        #expect(flat(keys) == [107, 208, 209, 210, 211, 312, 0])
+        #expect(cache.offset == 12)
+
+        let restored = try Inkling2RingCache.restore(
+            state: cache.state, metaState: cache.metaState)
+        #expect(restored.offset == 12)
+        #expect(restored.maxTrimCount == 2)
+        #expect(flat(restored.state[0]) == [107, 208, 209, 210, 211, 312, 0])
     }
 
     @Test("Rewindable convolution states save, restore and copy as themselves")

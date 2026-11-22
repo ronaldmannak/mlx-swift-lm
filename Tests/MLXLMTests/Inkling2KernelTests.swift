@@ -105,6 +105,56 @@ struct Inkling2KernelTests {
         #expect(maxDifference(kernel, reference) < 2e-2)
     }
 
+    /// `L` queries over keys in ring order, as an `Inkling2RingCache` holds them: each
+    /// position at its slot, stale keys ahead of the queries, two empty slots and keys past
+    /// the window, then the zero slot, against the reference path, which needs no zero slot.
+    @Test("Ring attention matches the reference", arguments: [1, 2, 5, 8, 9])
+    func ringAttention(L: Int) throws {
+        MLXRandom.seed(13)
+        let (Hq, Hkv, D, R, window) = (8, 2, 128, 24, 16)
+        let capacity = window + 9
+        let args = try textConfiguration(Hq: Hq, Hkv: Hkv, D: D, R: R, window: window)
+        let attention = Inkling2Attention(args, sliding: true)
+        attention.train(false)
+        func clipped(_ shape: [Int]) -> MLXArray {
+            let x = MLXRandom.normal(shape)
+            return (x / sqrt((x * x).sum(axis: -1, keepDims: true)) * 3).asType(.bfloat16)
+        }
+        let zeroSlot = MLXArray.zeros([1, Hkv, 1, D], dtype: .bfloat16)
+        let queries = clipped([1, Hq, L, D])
+        let keys = concatenated([clipped([1, Hkv, capacity, D]), zeroSlot], axis: 2)
+        let values = concatenated(
+            [
+                inkling2UnitRMS(MLXRandom.normal([1, Hkv, capacity, D])).asType(.bfloat16),
+                zeroSlot,
+            ],
+            axis: 2)
+        let bias = (MLXRandom.normal([1, L, Hq, R]) * 0.5).asType(.bfloat16)
+        let sinks = (MLXRandom.normal([1, L, Hq]) * 0.5).asType(.bfloat16)
+        // Queries at 40 ..< 40 + L; the ring was last written three positions past them.
+        let queryPositions = (MLXArray(0 ..< L).asType(.float32) + 40).reshaped(1, L)
+        var stored = [Float](repeating: 0, count: capacity + 1)
+        let newest = 40 + L - 1 + 3
+        for position in (newest - capacity + 1) ... newest {
+            stored[position % capacity] = Float(position + 1)
+        }
+        stored[(newest - 4) % capacity] = 0
+        stored[(newest - 11) % capacity] = 0
+        let storedKeyPositions = MLXArray(stored).reshaped(1, -1)
+
+        let ring = attention.ringAttention(
+            queries: queries, keys: keys, values: values, positionBias: bias, sinks: sinks,
+            queryPositions: queryPositions, storedKeyPositions: storedKeyPositions)
+        let reference = Device.withDefaultDevice(.cpu) {
+            attention.attention(
+                queries: queries, keys: keys, values: values, positionBias: bias, sinks: sinks,
+                queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
+                keyOrder: .other, forceReference: true)
+        }
+        #expect(ring.shape == [1, L, Hq, D])
+        #expect(maxDifference(ring, reference) < 2e-2)
+    }
+
     /// A small bfloat16 Inkling 2 Mini whose looped layers complete depth blocks, with the
     /// router, depth queries and experts in float32 as the checkpoints keep them.
     private func bfloat16Model(experts: Int = 2, topK: Int = 2) throws -> Inkling2Model {
