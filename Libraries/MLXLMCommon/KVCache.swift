@@ -240,12 +240,14 @@ public protocol KVCacheAttentionProtocol: KVCache {
     ) -> MLXArray
 }
 
-/// A cache entry that holds no attention state, such as a record of the tokens processed so far.
+/// A cache entry that cache policy skips, such as a record of the tokens processed so far, or
+/// state a model lays out itself.
 ///
-/// Cache policy skips these entries: capacity and compression settings, offset alignment
-/// checks, and ``KVCacheStatus`` layers ignore them. Generation still trims, copies, and saves
-/// them with the other entries, so an auxiliary cache must be trimmable to keep pace, and it
-/// needs a ``KVCache/serializedClassName`` to be saved to a prompt cache file.
+/// Capacity and compression settings, offset alignment checks, and ``KVCacheStatus`` layers
+/// ignore these entries; ``GenerationEstimator`` counts the memory they hold. Generation still
+/// trims, copies, and saves them with the other entries, so an auxiliary cache must be
+/// trimmable to keep pace, and it needs a ``KVCache/serializedClassName`` to be saved to a
+/// prompt cache file.
 ///
 /// Staged speculative rounds (MTP) write through an auxiliary entry and trim it back to the
 /// accepted positions, so it must stay trimmable after the round's width.
