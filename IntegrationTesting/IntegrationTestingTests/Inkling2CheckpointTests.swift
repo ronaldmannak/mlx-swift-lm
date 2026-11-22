@@ -255,9 +255,16 @@ final class Inkling2CheckpointTests: XCTestCase {
                 parameters: parameters, blockSize: blockSize)
         }
 
+        // The third prompt, about 4,000 tokens, runs past the sliding window, so each verify
+        // reads a wrapped ring.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .appending(path: "../../Libraries/MLXLMCommon/Models/Inkling2Configuration.swift"),
+            encoding: .utf8)
         let prompts = [
             "Write a Python function that returns the n-th Fibonacci number, with a docstring.",
             "Explain why the sky is blue in one short paragraph.",
+            "Write Swift Testing tests for the configuration decoding in this file.\n\n```swift\n\(source)\n```",
         ]
         for (index, text) in prompts.enumerated() {
             let input = LMInput(tokens: MLXArray(try Self.prompt(text, context: target)))
@@ -269,7 +276,7 @@ final class Inkling2CheckpointTests: XCTestCase {
                 parameters: GenerateParameters(maxTokens: maxTokens, temperature: 0))
             let baseline = decode(&plain)
             print(
-                "Inkling2 dspark prompt=\(index) baseline tokens=\(baseline.tokens.count) decode_tok_s=\(Double(baseline.tokens.count) / baseline.seconds)"
+                "Inkling2 dspark prompt=\(index) prompt_tokens=\(input.text.tokens.size) baseline tokens=\(baseline.tokens.count) decode_tok_s=\(Double(baseline.tokens.count) / baseline.seconds)"
             )
             for blockSize in [2, 3, 4, 6, 8] {
                 var iterator = try speculative(input, blockSize: blockSize, maxTokens: maxTokens)
