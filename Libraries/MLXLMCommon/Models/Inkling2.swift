@@ -471,14 +471,15 @@ final class Inkling2SparseMoE: Module {
 /// The four convolution states, of the key, value, post-attention and post-MLP
 /// convolutions, are the slots of one `ArraysCache`. When generation asks for a rewind window
 /// (``KVCacheConfiguration/Rewind``), each convolution has an ``Inkling2ConvolutionCache``
-/// instead, which also keeps its recent inputs, so a speculative round can step back over
-/// the positions it rejects.
+/// instead, which also keeps its last call's inputs, so a speculative round can step back
+/// over the positions it rejects.
 struct Inkling2VisitCache {
     let keyValues: KVCache
     let positions: KVCache
     let convolutions: [ArraysCache]
 
-    /// Whether the convolutions keep their recent inputs. Their calls then return windows.
+    /// Whether the convolutions keep their last call's inputs. Their calls then return
+    /// windows.
     var rewinds: Bool { convolutions.count > 1 }
 
     /// Each row's valid length during a ragged prefill.
@@ -501,20 +502,22 @@ struct Inkling2VisitCache {
         }
         precondition(lengths == nil, "A rewindable Inkling 2 cache holds one unpadded row")
         for (cache, window) in zip(convolutions, results) {
-            let count = window.dim(1) - length
-            (cache as! RewindableConvolutionCache).record(
-                input: window[0..., count...], initialState: window[0..., ..<count],
-                currentState: contiguous(window[0..., length...]))
+            (cache as! Inkling2ConvolutionCache).record(window: window, length: length)
         }
     }
 }
 
-/// One convolution's state and recent inputs, for a cache with a rewind window.
+/// One convolution's state and its last call's inputs, for a cache with a rewind window.
 ///
 /// A staged speculative round writes through an auxiliary entry and trims it back to the
 /// accepted positions, so this cache joins rounds whose sliding layers stage their keys.
 /// (LFM2 rewinds its `RewindableConvolutionCache`s in place instead, which a wrapped ring
 /// cannot.)
+///
+/// A round's trim steps back within its one verify call, so, as in mlx-vlm, the cache keeps
+/// only that call's window, and the state and a trim are views of it. The base class's rolling
+/// history copies on every call and trim instead: Inkling 2 Mini's 192 convolutions record
+/// every step, and those copies cost about 3 ms of each.
 final class Inkling2ConvolutionCache: RewindableConvolutionCache, AuxiliaryKVCache {
     override class var serializedClassName: String? { "Inkling2ConvolutionCache" }
 
@@ -524,6 +527,29 @@ final class Inkling2ConvolutionCache: RewindableConvolutionCache, AuxiliaryKVCac
     }
 
     override func copy() -> any KVCache { converted() }
+
+    /// Records a call's window: the previous state, then `length` inputs, in float32. Its end
+    /// is the next state, and the history a trim steps back over.
+    func record(window: MLXArray, length: Int) {
+        // A prompt keeps only what a trim can step back over, as a copy that frees the rest.
+        let history =
+            length > rollbackCapacity
+            ? contiguous(window[0..., (length - rollbackCapacity)...]) : window
+        self[0] = history[0..., (history.dim(1) - stateLength)...]
+        self[1] = history
+        offset += length
+        advance(length)
+    }
+
+    @discardableResult
+    override func trim(_ n: Int) -> Int {
+        guard n > 0, n <= maxTrimCount, let history = self[1] else { return 0 }
+        let retained = history[0..., ..<(history.dim(1) - n)]
+        self[0] = retained[0..., (retained.dim(1) - stateLength)...]
+        self[1] = retained
+        offset -= n
+        return n
+    }
 }
 
 extension RewindableConvolutionCache {
@@ -744,7 +770,7 @@ final class Inkling2Attention: Module {
 
     /// Whether a multi-token write returns every key in temporal order, ending at the new
     /// ones. A pinned prefix breaks that order.
-    private static func keysInOrder(_ cache: KVCache) -> Bool {
+    fileprivate static func keysInOrder(_ cache: KVCache) -> Bool {
         switch cache {
         case let cache as RotatingKVCache: cache.keepCount == 0
         // A speculative round's view of a ring: its window, then the staged keys.
@@ -1056,12 +1082,19 @@ package final class Inkling2DecoderLayer: Module {
     // offsets move every token. Arguments: `[x, key state, value state, positions]` and
     // `[x, normed input, attention, gate, post-attention state, post-MLP state]`, each
     // followed by the blocks (every layer but the first) and the loop messages and their
-    // unit RMS, if any.
+    // unit RMS, if any. A cache with a rewind window takes the second pair, whose
+    // convolutions return their windows.
     private let compiledDecodeInput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
-        layer.decodeInput(arguments)
+        layer.decodeInput(arguments, keepWindows: false)
     }
     private let compiledDecodeOutput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
-        layer.decodeOutput(arguments)
+        layer.decodeOutput(arguments, keepWindows: false)
+    }
+    private let compiledWindowInput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+        layer.decodeInput(arguments, keepWindows: true)
+    }
+    private let compiledWindowOutput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+        layer.decodeOutput(arguments, keepWindows: true)
     }
 
     /// The blocks and messages after `count` leading arguments.
@@ -1077,8 +1110,8 @@ package final class Inkling2DecoderLayer: Module {
     }
 
     /// Returns `[normed input, queries, keys, values, position bias, sinks, gate, stored
-    /// position, key state, value state]`.
-    private func decodeInput(_ arguments: [MLXArray]) -> [MLXArray] {
+    /// positions, key state, value state]`, the states being windows with `keepWindows`.
+    private func decodeInput(_ arguments: [MLXArray], keepWindows: Bool) -> [MLXArray] {
         let (x, positions) = (arguments[0], arguments[3])
         let (blocks, messages) = extras(arguments, after: 4)
         let normedInput = inkling2UnitRMS(x)
@@ -1086,61 +1119,63 @@ package final class Inkling2DecoderLayer: Module {
         let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
         let projected = attention.project(
             query: q, key: k, value: v, states: (arguments[1], arguments[2]), mask: nil,
-            lengths: nil)
+            lengths: nil, keepWindows: keepWindows)
         let (queries, relative) = attention.lengthScaled(
             queries: projected.queries, relative: projected.relative, positions: positions)
         return [
             normedInput, queries.transposed(0, 2, 1, 3), projected.keys, projected.values,
             attention.relativeLogits(relative), projected.sinks, projected.gate,
-            (positions + 1).reshaped(x.dim(0), 1, 1, 1), projected.keyState,
+            (positions + 1).reshaped(x.dim(0), 1, x.dim(1), 1), projected.keyState,
             projected.valueState,
         ]
     }
 
-    /// Returns `[output, blocks, post-attention state, post-MLP state]`.
-    private func decodeOutput(_ arguments: [MLXArray]) -> [MLXArray] {
+    /// Returns `[output, blocks, post-attention state, post-MLP state]`, the states being
+    /// windows with `keepWindows`.
+    private func decodeOutput(_ arguments: [MLXArray], keepWindows: Bool) -> [MLXArray] {
         let (blocks, messages) = extras(arguments, after: 6)
         let (out, newBlocks, attentionState, mlpState) = feedForward(
             arguments[0], normedInput: arguments[1],
             attention: attention.output(arguments[2], gate: arguments[3]), blocks: blocks,
-            messages: messages, states: (arguments[4], arguments[5]), mask: nil, lengths: nil)
+            messages: messages, states: (arguments[4], arguments[5]), mask: nil, lengths: nil,
+            keepWindows: keepWindows)
         return [out, newBlocks!, attentionState, mlpState]
     }
 
-    /// One token per row on the GPU, through the compiled traces; nil where the general path
-    /// must run: prompts, padding, training, a sharded layer, or no convolution states yet.
+    /// Runs on the GPU through the compiled traces: one token per row, or with a rewind
+    /// window up to 16, a speculative round's verify. Nil where the general path must run:
+    /// prompts, padding, training, a sharded layer, or no convolution states yet.
     private func decode(
         _ x: MLXArray, blocks: MLXArray?, cache: Inkling2VisitCache?, mask: MLXArray?,
         messages: Inkling2Messages?
     ) -> (MLXArray, MLXArray?)? {
-        guard x.dim(1) == 1, mask == nil, let cache, cache.lengths == nil,
-            inkling2UsesKernels(), !training, mlp.shardingGroup == nil,
+        let (B, L) = (x.dim(0), x.dim(1))
+        guard let cache, L == 1 || (cache.rewinds && L <= 16), mask == nil,
+            cache.lengths == nil, inkling2UsesKernels(), !training, mlp.shardingGroup == nil,
             (blocks != nil) == (index > 0)
         else { return nil }
         let states = (0 ..< 4).compactMap { cache.state($0) }
         guard states.count == 4 else { return nil }
-        let B = x.dim(0)
         let extras = [blocks, messages?.raw, messages?.normed].compactMap { $0 }
+        let (inputTrace, outputTrace) =
+            cache.rewinds
+            ? (compiledWindowInput, compiledWindowOutput)
+            : (compiledDecodeInput, compiledDecodeOutput)
 
-        // Each row writes one token, so the next positions are the query positions.
+        // No row is padded, so the next positions are the query positions.
         let positions = Inkling2Attention.queryPositions(
-            cache.keyValues, batch: B, length: 1, written: false)
-        let input = compiledDecodeInput(self, [x, states[0], states[1], positions] + extras)
+            cache.keyValues, batch: B, length: L, written: false)
+        let input = inputTrace(self, [x, states[0], states[1], positions] + extras)
         let (keys, values) = cache.keyValues.update(keys: input[2], values: input[3])
         let stored = cache.positions.update(keys: input[7], values: input[7]).0.reshaped(B, -1)
         let attended = attention.attention(
             queries: input[1], keys: keys, values: values, positionBias: input[4],
-            sinks: input[5], queryPositions: positions, storedKeyPositions: stored)
-        let output = compiledDecodeOutput(
+            sinks: input[5], queryPositions: positions, storedKeyPositions: stored,
+            keysInOrder: Inkling2Attention.keysInOrder(cache.keyValues))
+        let output = outputTrace(
             self, [x, input[0], attended, input[6], states[2], states[3]] + extras)
 
-        var next = [input[8], input[9], output[2], output[3]]
-        if cache.rewinds {
-            // One position's window: the previous state, then the one input, which ends the
-            // next state.
-            next = zip(states, next).map { concatenated([$0[0..., ..<1], $1], axis: 1) }
-        }
-        cache.commit(next, length: 1)
+        cache.commit([input[8], input[9], output[2], output[3]], length: L)
         return (output[0], output[1])
     }
 }

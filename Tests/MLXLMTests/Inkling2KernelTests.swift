@@ -329,6 +329,36 @@ struct Inkling2KernelTests {
         }
     }
 
+    /// A rewind window sends a few tokens of one row through the compiled traces, as a
+    /// speculative round's verify does. The same attention caches with plain convolution
+    /// states send them down the general path.
+    @Test("Compiled verify passes give the general path's bits")
+    func compiledVerify() throws {
+        MLXRandom.seed(0)
+        let model = try bfloat16Model(experts: 8, topK: 2)
+        model.train(false)
+        let tokens = MLXRandom.randInt(Int32(0) ..< 120, [1, 96])
+        var parameters = GenerateParameters(temperature: 0)
+        parameters.kvCache = KVCacheConfiguration(rewind: try .init(maxTokens: 16))
+        let rewindable = try model.newCache(parameters: parameters)
+        #expect(rewindable[2] is Inkling2ConvolutionCache)
+        let reference = try model.newCache(parameters: parameters)
+        let plain = stride(from: 0, to: reference.count, by: 6).flatMap {
+            [reference[$0], reference[$0 + 1], ArraysCache(size: 4)]
+        }
+        // Past the sliding window and the bias extent, through the loop.
+        var start = 0
+        for length in [20, 2, 9, 1, 3, 16, 5, 8, 1, 7, 4, 6, 9, 5] {
+            let chunk = tokens[0..., start ..< start + length]
+            let a = model(chunk, cache: rewindable)
+            let b = model(chunk, cache: plain)
+            eval(a, b)
+            #expect(sameBits(a, b), "\(length) tokens at \(start)")
+            start += length
+        }
+        #expect(start == tokens.dim(1))
+    }
+
     @Test("Training takes the reference paths, so gradients flow through attention")
     func trainingGradients() throws {
         MLXRandom.seed(0)
