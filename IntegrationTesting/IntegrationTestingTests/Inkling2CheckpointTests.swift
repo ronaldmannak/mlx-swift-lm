@@ -356,4 +356,95 @@ final class Inkling2CheckpointTests: XCTestCase {
             }
         }
     }
+
+    /// A tool declared, called, answered and used. The chat template renders the declaration,
+    /// an earlier call and its result in Inkling 2's framing, with compact JSON in key order;
+    /// the model calls the tool, `.inkling` parses the call, and the model answers from the
+    /// result.
+    func testToolCallRoundTrip() async throws {
+        let container = try await loadText()
+        let tool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "city": ["type": "string", "description": "City name"],
+                        "unit": ["type": "string", "enum": ["celsius", "fahrenheit"]],
+                    ] as [String: any Sendable],
+                    "required": ["city"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+        let question = "What's the weather in Paris right now?"
+        let result = #"{"temperature": 18, "condition": "sunny"}"#
+
+        let rendered = try await container.perform { context in
+            // Arguments out of key order, which the template sorts.
+            let call = ToolCall(
+                function: .init(
+                    name: "get_weather",
+                    arguments: ["unit": .string("celsius"), "city": .string("Paris")]))
+            let messages = DefaultMessageGenerator().generate(messages: [
+                .user(question), .assistant("", toolCalls: [call]),
+                .tool(result, name: "get_weather"),
+            ])
+            let tokens = try context.tokenizer.applyChatTemplate(
+                messages: messages, tools: [tool], additionalContext: ["reasoning_effort": "none"])
+            return context.tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+        }
+        print("Inkling2 tools rendered=\(rendered.debugDescription)")
+        XCTAssertTrue(
+            rendered.hasPrefix(
+                #"<|message_system|>tool_declare<|content_xml|>[{"description":"Get the current weather for a city.","name":"get_weather","parameters":{"properties":{"city":{"description":"City name","type":"string"},"unit":{"enum":["celsius","fahrenheit"],"type":"string"}},"required":["city"],"type":"object"},"type":"function"}]<|end_message|>"#
+            ))
+        XCTAssertTrue(
+            rendered.contains(
+                #"<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Paris","unit":"celsius"}}<|end_message|><|content_model_end_sampling|>"#
+            ))
+        XCTAssertTrue(
+            rendered.hasSuffix(
+                "<|message_tool|>get_weather<|content_text|>\(result)<|end_message|>"))
+
+        func answer(_ chat: [Chat.Message]) async throws -> (calls: [ToolCall], text: String) {
+            try await container.perform { context in
+                let input = try await context.processor.prepare(
+                    input: UserInput(
+                        chat: chat, tools: [tool], additionalContext: ["reasoning_effort": "none"]))
+                var calls = [ToolCall]()
+                var text = ""
+                for await event in try generate(
+                    input: input, parameters: GenerateParameters(maxTokens: 512, temperature: 0),
+                    context: context)
+                {
+                    switch event {
+                    case .toolCall(let call): calls.append(call)
+                    case .rejectedToolCall(let rejected):
+                        print("Inkling2 tools rejected=\(rejected)")
+                    case .chunk(let chunk): text += chunk
+                    default: break
+                    }
+                }
+                return (calls, text)
+            }
+        }
+        let first = try await answer([.user(question)])
+        print(
+            "Inkling2 tools call=\(first.calls.map { "\($0.function.name) \($0.function.arguments)" }) text=\(first.text.debugDescription)"
+        )
+        XCTAssertEqual(first.calls.count, 1)
+        XCTAssertEqual(first.calls.first?.function.name, "get_weather")
+        XCTAssertEqual(first.calls.first?.function.arguments["city"], .string("Paris"))
+
+        let second = try await answer([
+            .user(question), .assistant("", toolCalls: first.calls),
+            .tool(result, name: "get_weather"),
+        ])
+        print("Inkling2 tools answer=\(second.text.debugDescription)")
+        XCTAssertTrue(second.calls.isEmpty)
+        XCTAssertTrue(second.text.contains("18"))
+        XCTAssertFalse(second.text.contains("<|"))
+    }
 }
