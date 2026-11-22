@@ -1564,9 +1564,11 @@ public final class Inkling2TextModel: Module {
                     parameters: parameters, slidingWindow: configuration.slidingWindow,
                     usesSlidingWindow: configuration.isSliding(index))
                 // A sliding layer with a rewind window writes in place, unless a smaller
-                // `maxKVSize` shortens its window, which a rotating cache keeps.
-                if let rotating = cache as? RotatingKVCache, rotating.rewindCapacity > 0,
-                    rotating.maxSize == configuration.slidingWindow
+                // `maxKVSize` shortens its window, which a rotating cache keeps. A global
+                // layer keeps the rotating cache that a requested capacity gives it, with its
+                // pinned prefix and no reserve in view.
+                if configuration.isSliding(index), let rotating = cache as? RotatingKVCache,
+                    rotating.rewindCapacity > 0, rotating.maxSize == configuration.slidingWindow
                 {
                     return Inkling2RingCache(
                         window: configuration.slidingWindow, reserve: rotating.rewindCapacity)
