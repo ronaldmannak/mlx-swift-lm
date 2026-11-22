@@ -335,7 +335,14 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel,
     public var maximumBlockSize: Int? { configuration.draft.blockSize }
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
+    /// Sampling keeps the target's distribution. The draft proposes its most likely tokens at
+    /// any temperature, and the iterator samples each verified position from the target and
+    /// keeps a proposal only where the sample matches it. For a proposal the draft makes for
+    /// certain, that is speculative sampling's acceptance, min(1, p/q) with q one: the token is
+    /// kept with the target's probability for it, and otherwise the target's own sample stands
+    /// in. The draft draws nothing from the request's random stream either, so a seeded request
+    /// samples what plain decoding samples.
+    public let requiresGreedySampling = false
     public var targetLayerIds: [Int]? { configuration.draft.targetLayers }
 
     public var additionalWeightFiles: [String] { ["mtp.safetensors"] }
@@ -437,13 +444,19 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel,
         var proposals = [MLXArray]()
         let cap = configuration.target.text.finalLogitSoftcap
         let vocabulary = configuration.target.text.unpaddedVocabularySize
+        // The most likely proposal, past any suppressed tokens, whatever the request samples
+        // with (see ``requiresGreedySampling``).
+        let proposer: any LogitSampler =
+            (sampler as? SuppressTokensSampler).map {
+                SuppressTokensSampler(base: ArgMaxSampler(), suppressor: $0.suppressor)
+            } ?? ArgMaxSampler()
         for i in 0 ..< count {
             let (next, bias) = markovHead.step(
                 state: recurrent, previous: previous, context: context[0..., i], fold: folded)
             recurrent = next
             var logits = base[0..., i] + bias
             logits = (cap * tanh(logits.asType(.float32) / cap)).asType(x.dtype)
-            previous = sampler.sample(logits: logits[0..., ..<vocabulary]).reshaped(-1)
+            previous = proposer.sample(logits: logits[0..., ..<vocabulary]).reshaped(-1)
             proposals.append(expandedDimensions(previous, axis: 1))
         }
         return concatenated(proposals, axis: 1).asType(.int32)

@@ -91,6 +91,21 @@ private func speculative(maxTokens: Int, rewind: Int = 4) throws -> GeneratePara
     return parameters
 }
 
+/// What plain decoding samples at `temperature`, seeded, and the same parameters with a
+/// rewind window for a speculative run.
+private func sampled(
+    _ model: any LanguageModel, _ input: LMInput, maxTokens: Int, temperature: Float,
+    topP: Float = 1
+) throws -> (tokens: [Int], speculative: GenerateParameters) {
+    var parameters = GenerateParameters(maxTokens: maxTokens, temperature: temperature, topP: topP)
+    parameters.seed = 7
+    var iterator = try TokenIterator(input: input, model: model, parameters: parameters)
+    var tokens = [Int]()
+    while let token = iterator.next() { tokens.append(token) }
+    parameters.kvCache = KVCacheConfiguration(rewind: try .init(maxTokens: 4))
+    return (tokens, parameters)
+}
+
 private func greedy(_ model: any LanguageModel, _ input: LMInput, maxTokens: Int) throws -> [Int] {
     var iterator = try TokenIterator(
         input: input, model: model,
@@ -104,8 +119,9 @@ private func onCPU<R>(_ body: () throws -> R) rethrows -> R {
     try Device.withDefaultDevice(.cpu, body)
 }
 
-/// Proposes the target's own greedy continuation, right for a scripted number of proposals
-/// per round and wrong after, so rounds keep every count from none to all.
+/// Proposes the target's own continuation, right for a scripted number of proposals per round
+/// and wrong after, so rounds keep every count from none to all. It draws nothing from the
+/// request's random stream, so it also runs with a temperature.
 private final class ScriptedDrafter: Module, MTPDrafterModel {
     let expected: [Int]
     let promptLength: Int
@@ -119,7 +135,7 @@ private final class ScriptedDrafter: Module, MTPDrafterModel {
     }
 
     var requiresSharedTargetKV: Bool { false }
-    var requiresGreedySampling: Bool { true }
+    var requiresGreedySampling: Bool { false }
 
     func validateCompatibility(with target: any LanguageModel) throws {}
 
@@ -165,6 +181,51 @@ struct Inkling2DSparkTests {
             #expect(iterator.passthroughReason == nil)
             #expect(iterator.acceptedCount > 0)
             #expect(iterator.acceptedCount < iterator.proposedCount)
+        }
+    }
+
+    @Test(
+        "With a temperature, rounds that keep none to all of their proposals sample plain decoding's tokens",
+        arguments: [5, 21])
+    func sampledRoundsRewindExactly(promptLength: Int) throws {
+        try onCPU {
+            let target = try makeTarget()
+            let input = prompt(promptLength)
+            let (expected, parameters) = try sampled(
+                target, input, maxTokens: 24, temperature: 0.8)
+            let drafter = ScriptedDrafter(
+                expected: expected, promptLength: promptLength, rightProposals: [0, 3, 1, 2])
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: input, mainModel: target, drafter: drafter, parameters: parameters,
+                blockSize: 4)
+            var output = [Int]()
+            while let token = iterator.next() { output.append(token) }
+
+            #expect(output == expected)
+            #expect(iterator.passthroughReason == nil)
+            #expect(iterator.acceptedCount > 0)
+            #expect(iterator.acceptedCount < iterator.proposedCount)
+        }
+    }
+
+    @Test(
+        "With a temperature, the bundled draft samples plain decoding's tokens",
+        arguments: [(Float(1.0), Float(1.0), 2), (0.7, 0.9, 4)])
+    func draftKeepsSampledTokens(temperature: Float, topP: Float, blockSize: Int) throws {
+        try onCPU {
+            let target = try makeTarget()
+            let input = prompt(13)
+            let (expected, parameters) = try sampled(
+                target, input, maxTokens: 20, temperature: temperature, topP: topP)
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: input, mainModel: target, drafter: try makeDraft(),
+                parameters: parameters, blockSize: blockSize)
+            var output = [Int]()
+            while let token = iterator.next() { output.append(token) }
+
+            #expect(output == expected)
+            #expect(iterator.passthroughReason == nil)
+            #expect(iterator.proposedCount > 0)
         }
     }
 
