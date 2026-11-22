@@ -252,6 +252,29 @@ struct Inkling2DSparkTests {
         }
     }
 
+    @Test("A rewindable convolution state steps back within its last call")
+    func rewindableCacheTrimsLastCall() throws {
+        let rows = MLXArray(0 ..< 30).asType(.float32).reshaped(1, 15, 2)
+        let cache = Inkling2ConvolutionCache(stateLength: 3, rollbackCapacity: 4)
+        // A prompt of 6 positions, longer than the rewind window, after a zero state.
+        cache.record(window: rows[0..., ..<9], length: 6)
+        #expect(cache.offset == 6)
+        #expect(cache.maxTrimCount == 4)
+        #expect(maxDifference(cache[0]!, rows[0..., 6 ..< 9]) == 0)
+        // A verify of 3 positions after that state.
+        cache.record(window: rows[0..., 6 ..< 12], length: 3)
+        #expect(cache.offset == 9)
+        #expect(cache.maxTrimCount == 3)
+        #expect(cache.isTrimmable(after: 4))
+        #expect(cache.trim(2) == 2)
+        #expect(cache.offset == 7)
+        #expect(maxDifference(cache[0]!, rows[0..., 7 ..< 10]) == 0)
+        #expect(cache.trim(2) == 0)
+        #expect(cache.trim(1) == 1)
+        #expect(maxDifference(cache[0]!, rows[0..., 6 ..< 9]) == 0)
+        #expect(cache.maxTrimCount == 0)
+    }
+
     @Test("Rewindable convolution states save, restore and copy as themselves")
     func rewindableCacheRoundTrip() throws {
         try onCPU {
