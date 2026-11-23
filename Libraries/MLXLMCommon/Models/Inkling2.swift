@@ -408,6 +408,12 @@ final class Inkling2Router: Module {
     ) -> (indices: MLXArray, weights: MLXArray) {
         let logits = matmul(x.asType(.float32), weight.asType(.float32).T)
         if !forceReference, !training, usesGPU(), supportsFusedRouterTopK(logits, k: topK) {
+            if let routed = inkling2SIMDRouterKernel(
+                logits: logits, bias: correctionBias.asType(.float32), k: topK,
+                routeScale: routeScale)
+            {
+                return routed
+            }
             return inkling2RouterKernel(
                 logits: logits, bias: correctionBias.asType(.float32), k: topK,
                 routeScale: routeScale)
@@ -838,6 +844,12 @@ final class Inkling2Attention: Module {
         queries: MLXArray, relative: MLXArray, keys: MLXArray, values: MLXArray,
         gate: MLXArray, sinks: MLXArray, keyState: MLXArray, valueState: MLXArray
     ) {
+        if let fused = fusedDecodePrologue(
+            query: query, key: key, value: value, states: states, mask: mask, lengths: lengths,
+            keepWindows: keepWindows)
+        {
+            return fused
+        }
         let (B, L) = (query.dim(0), query.dim(1))
         let (keys, keyState) = convolve(
             keyConvolution, kProjection(key), input: key, state: states.0, mask: mask,
@@ -1268,25 +1280,56 @@ package final class Inkling2DecoderLayer: Module {
         lengths: MLXArray?, keepWindows: Bool = false
     ) -> (MLXArray, MLXArray?, MLXArray, MLXArray) {
         let dtype = x.dtype
-        let (h, attentionState) = postAttentionConvolution(
-            h, state: states.0, mask: mask, lengths: lengths, keepWindow: keepWindows)
-
         var blocks = blocks
-        var residual = h.asType(.float32)
         if isBlockBoundary {
             let block = normedInput[.newAxis]
             blocks = blocks.map { concatenated([$0, block], axis: 0) } ?? block
-        } else {
-            residual = x.asType(.float32) + residual
         }
 
-        var m = mlpInput(blocks: blocks, partial: inkling2UnitRMS(residual))[
-            .ellipsis, 0, 0...]
+        let residual: MLXArray
+        let attentionState: MLXArray
+        var m: MLXArray
+        let normalized: MLXArray?
+        if !training, !mlpInput.training, !postAttentionConvolution.training,
+            mlp.shardingGroup == nil, mask == nil, lengths == nil,
+            !keepWindows, dtype == .bfloat16, let blocks, let state = states.0,
+            postAttentionConvolution.kernelSize == 4,
+            let mix = inkling2FusedDepthMix(
+                blocks: blocks, base: isBlockBoundary ? nil : x,
+                convolution: (h, state, postAttentionConvolution.conv1d.weight),
+                query: mlpInput.query,
+                normWeight: messages == nil ? postAttentionNorm.weight : nil,
+                eps: postAttentionNorm.eps, outputType: dtype)
+        {
+            residual = mix.residual
+            attentionState = mix.state!
+            m = mix.readout[.ellipsis, 0, 0...]
+            normalized = mix.normalizedReadout.map { $0[.ellipsis, 0, 0...] }
+        } else {
+            normalized = nil
+            let convolved = postAttentionConvolution(
+                h, state: states.0, mask: mask, lengths: lengths, keepWindow: keepWindows)
+            attentionState = convolved.1
+            residual =
+                isBlockBoundary
+                ? convolved.0.asType(.float32) : x.asType(.float32) + convolved.0.asType(.float32)
+            m =
+                mlpInput(blocks: blocks, partial: inkling2UnitRMS(residual))[
+                    .ellipsis, 0, 0...]
+        }
         if let messages {
             m = mlpMessageGate!(m, messages: messages, gate: 3)
         }
+        let expertInput = normalized ?? inkling2Normed(postAttentionNorm, m, dtype: dtype)
+        if !training, mask == nil, lengths == nil,
+            let fused = mlp.fusedExpertDecode(
+                expertInput, residual: residual, state: states.1,
+                convolutionWeight: postMLPConvolution.conv1d.weight, keepWindow: keepWindows)
+        {
+            return (fused.0, blocks, attentionState, fused.1)
+        }
         let (out, mlpState) = postMLPConvolution(
-            mlp(inkling2Normed(postAttentionNorm, m, dtype: dtype)),
+            mlp(expertInput),
             state: states.1, mask: mask,
             lengths: lengths, keepWindow: keepWindows)
         return ((residual + out.asType(.float32)).asType(dtype), blocks, attentionState, mlpState)
@@ -1300,16 +1343,40 @@ package final class Inkling2DecoderLayer: Module {
     // followed by the blocks (every layer but the first) and the loop messages and their
     // unit RMS, if any. A cache with a rewind window takes the second pair, whose
     // convolutions return their windows.
-    private let compiledDecodeInput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+    private func decodeInputState() -> [Module] {
+        let optional: [Module?] = [
+            attentionInput, inputNorm, queryInputNorm, keyInputNorm, valueInputNorm,
+            queryMessageGate, keyMessageGate, valueMessageGate,
+        ]
+        return [attention] + optional.compactMap { $0 }
+    }
+
+    private func decodeOutputState() -> [Module] {
+        let state: [Module] = [
+            attention.oProjection, postAttentionConvolution, mlpInput, postAttentionNorm, mlp,
+            postMLPConvolution,
+        ]
+        return state + [mlpMessageGate].compactMap { $0 }
+    }
+
+    private let compiledDecodeInput = CompiledTrace<Inkling2DecoderLayer>(
+        state: { $0.decodeInputState() }
+    ) { layer, arguments in
         layer.decodeInput(arguments, keepWindows: false)
     }
-    private let compiledDecodeOutput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+    private let compiledDecodeOutput = CompiledTrace<Inkling2DecoderLayer>(
+        state: { $0.decodeOutputState() }
+    ) { layer, arguments in
         layer.decodeOutput(arguments, keepWindows: false)
     }
-    private let compiledWindowInput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+    private let compiledWindowInput = CompiledTrace<Inkling2DecoderLayer>(
+        state: { $0.decodeInputState() }
+    ) { layer, arguments in
         layer.decodeInput(arguments, keepWindows: true)
     }
-    private let compiledWindowOutput = CompiledTrace<Inkling2DecoderLayer> { layer, arguments in
+    private let compiledWindowOutput = CompiledTrace<Inkling2DecoderLayer>(
+        state: { $0.decodeOutputState() }
+    ) { layer, arguments in
         layer.decodeOutput(arguments, keepWindows: true)
     }
 
@@ -1330,9 +1397,38 @@ package final class Inkling2DecoderLayer: Module {
     private func decodeInput(_ arguments: [MLXArray], keepWindows: Bool) -> [MLXArray] {
         let (x, positions) = (arguments[0], arguments[3])
         let (blocks, messages) = extras(arguments, after: 4)
-        let normedInput = inkling2UnitRMS(x)
-        let depth = attentionInput?(blocks: blocks, partial: normedInput)
-        let (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
+        let normedInput: MLXArray
+        let q: MLXArray
+        let k: MLXArray
+        let v: MLXArray
+        let norms =
+            inputNorm.map { $0.weight.reshaped(1, -1) }
+            ?? stacked([queryInputNorm!.weight, keyInputNorm!.weight, valueInputNorm!.weight])
+        let normEpsilon = inputNorm?.eps ?? queryInputNorm!.eps
+        let sharedEpsilon =
+            inputNorm != nil
+            || (queryInputNorm!.eps == keyInputNorm!.eps
+                && queryInputNorm!.eps == valueInputNorm!.eps)
+        if !keepWindows, x.dtype == .bfloat16, let attentionInput, !attentionInput.training,
+            let blocks, messages != nil || sharedEpsilon,
+            let mix = inkling2FusedDepthMix(
+                blocks: blocks, base: x, convolution: nil, query: attentionInput.query,
+                normWeight: messages == nil ? norms : nil, eps: normEpsilon,
+                outputType: x.dtype)
+        {
+            normedInput = mix.normed
+            if let readout = mix.normalizedReadout {
+                q = readout[.ellipsis, 0, 0...]
+                k = isSliding ? q : readout[.ellipsis, 1, 0...]
+                v = isSliding ? q : readout[.ellipsis, 2, 0...]
+            } else {
+                (q, k, v) = attentionInputs(x, depth: mix.readout, messages: messages)
+            }
+        } else {
+            normedInput = inkling2UnitRMS(x)
+            let depth = attentionInput?(blocks: blocks, partial: normedInput)
+            (q, k, v) = attentionInputs(x, depth: depth, messages: messages)
+        }
         let projected = attention.project(
             query: q, key: k, value: v, states: (arguments[1], arguments[2]), mask: nil,
             lengths: nil, keepWindows: keepWindows)
@@ -1462,7 +1558,8 @@ public final class Inkling2TextModel: Module {
     /// hidden state entering that layer visit, the partial block, or for `layerVisits.count`
     /// the final normed state. A DSpark drafter reads these taps.
     package func hiddenStates(
-        embeddings: MLXArray, cache: [KVCache]?, capturing visits: [Int]
+        embeddings: MLXArray, cache: [KVCache]?, outputRows: Range<Int>? = nil,
+        capturing visits: [Int]
     ) -> (hidden: MLXArray, captured: [MLXArray]) {
         precondition(
             cache.map { [3, 6].map { $0 * layerVisits.count }.contains($0.count) } ?? true,
@@ -1486,11 +1583,16 @@ public final class Inkling2TextModel: Module {
             bank: Inkling2MessageBank? = nil
         ) -> (MLXArray, MLXArray?) {
             var (h, blocks) = (h, blocks)
+            // Decode reuses the same bank throughout a pass. Group its readouts once.
+            let passMessages = h.dim(1) == 1 ? bank.map { messageInput!.allMessages($0) } : nil
             for (i, index) in range.enumerated() {
                 if visits.contains(visit) {
                     taps[visit] = h
                 }
-                let messages = bank.map { messageInput!($0, loopedLayer: i) }
+                let messages =
+                    passMessages.map {
+                        $0[0..., 0..., i ..< i + 1, 0..., 0...].squeezed(axis: 2)
+                    } ?? bank.map { messageInput!($0, loopedLayer: i) }
                 (h, blocks) = layers[index](
                     h, blocks: blocks, cache: caches?[visit], mask: mask, messages: messages)
                 visit += 1
@@ -1522,6 +1624,10 @@ public final class Inkling2TextModel: Module {
             (h, blocks) = run(0 ..< configuration.hiddenLayers, embeddings, nil)
         }
 
+        if let outputRows {
+            h = h[0..., outputRows, 0...]
+            blocks = blocks.map { $0[0..., 0..., outputRows, 0...] }
+        }
         h =
             finalInput(blocks: blocks, partial: inkling2UnitRMS(h))[
                 .ellipsis, 0, 0...]
@@ -1613,14 +1719,17 @@ extension Inkling2LanguageModel {
     /// (``mtpEmitFlagKey``), the output state also holds the taps ``mtpTargetLayerIdsKey``
     /// names, concatenated in that order, under ``mtpLastHiddenStatesKey``.
     package func inkling2Output(
-        embeddings: MLXArray, cache: [KVCache]?, state: LMOutput.State?
+        embeddings: MLXArray, cache: [KVCache]?, state: LMOutput.State?,
+        outputRows: Range<Int>? = nil
     ) -> LMOutput {
         let emits = state?[mtpEmitFlagKey] ?? false
         let visits = emits ? (state?[mtpTargetLayerIdsKey] ?? []) : []
         let (hidden, taps) = inkling2TextModel.hiddenStates(
-            embeddings: embeddings, cache: cache, capturing: visits)
+            embeddings: embeddings, cache: cache, outputRows: emits ? nil : outputRows,
+            capturing: visits)
+        let readout = emits ? outputRows.map { hidden[0..., $0, 0...] } ?? hidden : hidden
         let logits = inkling2Logits(
-            hidden, lmHead: inkling2Head, configuration: inkling2TextModel.configuration)
+            readout, lmHead: inkling2Head, configuration: inkling2TextModel.configuration)
         guard emits else { return LMOutput(logits: logits) }
 
         var output = state ?? LMOutput.State()

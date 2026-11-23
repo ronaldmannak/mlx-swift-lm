@@ -51,6 +51,18 @@ public final class Inkling2Model: Module, LLMModel {
             embeddings: model.languageModel.embed(input.tokens), cache: cache, state: state)
     }
 
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let tokens = input.text.tokens
+        let batched = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
+        return try withPreparedCache(cache, lengths: input.text.sequenceLengths) {
+            try inkling2Prepare(
+                embeddings: model.languageModel.embed(batched), cache: cache, state: state,
+                prefill: prefill)
+        }
+    }
+
     /// The vision tower is never read.
     public var excludedCheckpointNamespaces: [String] {
         ["model.visual", "vision_tower", "model.vision_tower"]
@@ -91,8 +103,8 @@ extension Inkling2Model: TensorParallelModel {
     }
 }
 
-// The default `LLMModel` prefill, and no model state from the forward pass unless a DSpark
-// drafter asks for its hidden states.
+// Batched admission keeps the generic resumable chunk hooks. Normal prefill also collects
+// all hidden-state rows requested by a DSpark drafter.
 extension Inkling2Model: ResumablePrefillModel, BatchDecodableModel {}
 
 extension Inkling2Model: Inkling2LanguageModel {

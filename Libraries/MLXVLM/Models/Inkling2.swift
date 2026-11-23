@@ -326,19 +326,9 @@ public final class Inkling2VLM: Module, VLMModel {
         _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
         let embeddings = try inputEmbeddings(tokens: input.text.tokens, image: input.image)
-        // An image can add thousands of positions, so the prompt goes through in chunks.
-        let total = embeddings.dim(1)
-        let processed = try prefill.forEachChunk(total: total) { range in
-            _ = model.languageModel(embeddings: embeddings[0..., range, 0...], cache: cache)
-            asyncEval(cache)
-        }
-        if processed > 0 { eval(cache) }
-        // A drafter that asks for hidden states gets those of this last chunk, which is the
-        // whole prompt when prefill is unchunked.
-        let output = inkling2Output(
-            embeddings: embeddings[0..., processed..., 0...], cache: cache, state: state)
-        prefill.progress?(total, total)
-        return .logits(output)
+        return try inkling2Prepare(
+            embeddings: embeddings, cache: cache, state: state, prefill: prefill,
+            chunkShortPrompts: true)
     }
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
