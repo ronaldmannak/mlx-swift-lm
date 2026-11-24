@@ -226,7 +226,9 @@ public final class Inkling2VisionModel: Module {
         // The merge blocks in raster order, then the patches of each block.
         let patches = pixels.transposed(1, 2, 0).reshaped(rows, m, p, cols, m, p, C)
             .transposed(0, 3, 1, 4, 2, 5, 6).reshaped(-1, p * p * C)
-        let dtype = embeddings.patchEmbedding.weight.dtype
+        let dtype =
+            (embeddings.patchEmbedding as? QuantizedLinear)?.scales.dtype
+            ?? embeddings.patchEmbedding.weight.dtype
         var h = embeddings(patches.asType(dtype), gridHeight: rows * m, gridWidth: cols * m)
         h = preNorm(h)
 
