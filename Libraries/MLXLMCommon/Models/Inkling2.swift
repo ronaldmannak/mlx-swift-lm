@@ -1003,8 +1003,8 @@ final class Inkling2Attention: Module {
                 queries: queries, keys: keys, values: values, positionBias: positionBias,
                 sinks: sinks, keyStart: keyStart, scale: scale, window: window)
         }
-        if !forceReference, B == 1 && L == 1 {
-            return singleTokenAttention(
+        if !forceReference, L == 1 {
+            return decodeAttention(
                 queries: queries, keys: keys, values: values, positionBias: positionBias,
                 sinks: sinks, queryPositions: queryPositions,
                 storedKeyPositions: storedKeyPositions)
@@ -1080,19 +1080,23 @@ final class Inkling2Attention: Module {
         return output.reshaped(B, heads, L, -1).transposed(0, 2, 1, 3)
     }
 
-    /// One query of one row: the fused attention takes the bias as an additive mask and the
-    /// row's sinks.
-    private func singleTokenAttention(
+    /// One query per row: the fused attention takes the bias as an additive mask. It takes
+    /// one sink per head, so each row's heads become heads of a single row.
+    private func decodeAttention(
         queries: MLXArray, keys: MLXArray, values: MLXArray, positionBias: MLXArray,
         sinks: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray
     ) -> MLXArray {
+        let B = queries.dim(0)
         let mask = decodeMask(
             positionBias: positionBias, queryPositions: queryPositions,
             storedKeyPositions: storedKeyPositions)
         let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale,
-            mask: mask.asType(queries.dtype), sinks: sinks[0, 0].asType(queries.dtype))
-        return output.transposed(0, 2, 1, 3)
+            queries: queries.reshaped(1, B * heads, 1, -1),
+            keys: keys.reshaped(1, B * kvHeads, keys.dim(2), -1),
+            values: values.reshaped(1, B * kvHeads, values.dim(2), -1), scale: scale,
+            mask: mask.asType(queries.dtype).reshaped(1, B * heads, 1, -1),
+            sinks: sinks.reshaped(-1).asType(queries.dtype))
+        return output.reshaped(B, heads, 1, -1).transposed(0, 2, 1, 3)
     }
 
     /// A few queries per row over an ``Inkling2RingCache``'s keys, in ring order.
@@ -1114,7 +1118,7 @@ final class Inkling2Attention: Module {
         return output.transposed(0, 2, 1, 3)
     }
 
-    /// The additive mask of one query of one row, `[1, H, 1, S]` in `positionBias`'s dtype.
+    /// The additive mask of one query per row, `[B, H, 1, S]` in `positionBias`'s dtype.
     func decodeMask(
         positionBias: MLXArray, queryPositions: MLXArray, storedKeyPositions: MLXArray,
         forceReference: Bool = false
@@ -1124,15 +1128,15 @@ final class Inkling2Attention: Module {
                 positionBias: positionBias, queryPositions: queryPositions,
                 storedKeyPositions: storedKeyPositions, window: window)
         }
-        let R = positionBias.dim(-1)
+        let (B, R) = (positionBias.dim(0), positionBias.dim(-1))
         let (distance, visible) = distances(
             queryPositions: queryPositions, storedKeyPositions: storedKeyPositions)
-        let flatDistance = distance[0, 0]
-        var bias = take(
-            positionBias[0, 0], clip(flatDistance, min: 0, max: R - 1).asType(.int32), axis: -1)
-        bias = which(flatDistance .< Float(R), bias, MLXArray(Float(0)).asType(bias.dtype))
-        return which(visible[0, 0], bias, MLXArray(-Float.infinity).asType(bias.dtype))
-            .reshaped(1, heads, 1, -1)
+        let index = clip(distance, min: 0, max: R - 1).asType(.int32)
+        var bias = takeAlong(
+            positionBias[0..., 0], broadcast(index, to: [B, heads, distance.dim(2)]), axis: -1)
+        bias = which(distance .< Float(R), bias, MLXArray(Float(0)).asType(bias.dtype))
+        return which(visible, bias, MLXArray(-Float.infinity).asType(bias.dtype))
+            .reshaped(B, heads, 1, -1)
     }
 }
 

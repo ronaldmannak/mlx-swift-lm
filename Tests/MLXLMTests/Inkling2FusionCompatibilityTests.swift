@@ -273,6 +273,59 @@ struct Inkling2FusionCompatibilityTests {
         #expect(together == alone)
     }
 
+    @Test("Ragged sampled decoding preserves the surviving row after a batch shrinks")
+    func batchedSamplingSurvivingRow() throws {
+        let target = try fusionTarget(uniformHead: true)
+        let prompts = [[1, 2, 3], (0 ..< 21).map { ($0 * 7 + 3) % 16 }]
+        let limits = [9, 24]
+        let seeds: [UInt64] = [53, 59]
+        let parameters = zip(limits, seeds).map { limit, seed in
+            var parameters = GenerateParameters(maxTokens: limit, temperature: 0.8, topP: 0.9)
+            parameters.seed = seed
+            parameters.prefill = PrefillParameters(stepSize: 7)
+            return parameters
+        }
+        let alone = try prompts.enumerated().map { row, prompt in
+            try fusionTokens(
+                target, input: LMInput(tokens: MLXArray(prompt)), parameters: parameters[row])
+        }
+        var iterator = try BatchTokenIterator(model: target, parameters: parameters[1])
+        let ids = iterator.insert(
+            prompts: prompts, maxTokens: limits, samplers: parameters.map { $0.sampler() })
+        defer { iterator.remove(ids) }
+        var output = [Int: [Int]]()
+        var finished = Set<Int>()
+        var sawBothRows = false
+        var sawSurvivor = false
+        while let events = try iterator.next() {
+            let firstAlreadyFinished = finished.contains(ids[0])
+            var emitted = Set<Int>()
+            for event in events {
+                switch event {
+                case .token(let id, let token):
+                    output[id, default: []].append(token)
+                    emitted.insert(id)
+                    iterator.recordEmittedToken(id: id, token: token)
+                case .finished(let id, let reason, _):
+                    #expect(reason == .length)
+                    finished.insert(id)
+                case .failed(_, let error):
+                    throw error
+                case .prefill:
+                    break
+                }
+            }
+            sawBothRows = sawBothRows || (emitted.contains(ids[0]) && emitted.contains(ids[1]))
+            sawSurvivor = sawSurvivor || (firstAlreadyFinished && emitted.contains(ids[1]))
+        }
+        #expect(sawBothRows)
+        #expect(sawSurvivor)
+        #expect(finished == Set(ids))
+        let together = ids.map { output[$0] ?? [] }
+        #expect(together.map(\.count) == limits)
+        #expect(together == alone)
+    }
+
     @Test("Training after fused decode reaches controllers, depth queries and router")
     func trainingAfterDecode() throws {
         let target = try fusionTarget(quantized: false)
