@@ -7,7 +7,7 @@ import PackageDescription
 let package = Package(
     name: "mlx-swift-lm",
     platforms: [
-        .macOS(.v14),
+        .macOS(.v15),
         .iOS(.v17),
         .tvOS(.v17),
         .visionOS(.v1),
@@ -298,7 +298,7 @@ let package = Package(
         // Grammar-constrained ("guided") generation engine built on the
         // vendored xgrammar C++ via CXGrammar. Standalone: depends only on
         // CXGrammar + MLXLMCommon + MLX, with no FoundationModels coupling and
-        // no @available floor beyond the package's macOS 14 / iOS 17 minimum.
+        // no @available floor beyond the package's macOS 15 / iOS 17 minimum.
         .target(
             name: "MLXGuidedGeneration",
             dependencies: [
