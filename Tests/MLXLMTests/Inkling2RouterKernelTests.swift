@@ -1,12 +1,34 @@
 // Copyright © 2026 Apple Inc.
 
+import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
 
 @Suite(.serialized)
 struct Inkling2RouterKernelTests {
+    private func configuration(experts: Int, topK: Int) throws -> Inkling2TextConfiguration {
+        try JSONDecoder().decode(
+            Inkling2TextConfiguration.self,
+            from: Data(
+                """
+                {"hidden_size": 16, "num_hidden_layers": 1, "vocab_size": 32,
+                 "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+                 "swa_num_attention_heads": 2, "swa_num_key_value_heads": 1,
+                 "swa_head_dim": 8, "sliding_window_size": 16, "local_layer_ids": [],
+                 "d_rel": 4, "rel_extent": 16, "log_scaling_n_floor": 8,
+                 "log_scaling_alpha": 0.1, "rms_norm_eps": 1e-6,
+                 "qk_l2_clip_threshold": 3.0, "rel_l2_clip_threshold": 2.0,
+                 "sconv_kernel_size": 4, "n_layers_per_attn_res_block": 1,
+                 "n_routed_experts": \(experts), "num_experts_per_tok": \(topK),
+                 "intermediate_size": 16, "mlp_gate_softcap": 4.0,
+                 "mlp_up_softcap": 25.0, "route_scale": 2.0,
+                 "final_logit_softcapping": 30.0}
+                """.utf8))
+    }
+
     private func expectOriginal(logits: MLXArray, bias: MLXArray, scale: Float = 1) throws {
         let expected = inkling2RouterKernel(logits: logits, bias: bias, k: 8, routeScale: scale)
         let actual = try #require(
@@ -72,6 +94,69 @@ struct Inkling2RouterKernelTests {
         try expectOriginal(
             logits: MLXRandom.normal([2, 256])[0..., .stride(from: 0, by: 2)],
             bias: MLXRandom.normal([256])[.stride(from: 0, by: 2)])
+    }
+
+    @Test(
+        "Single-row GPU training differentiates normalized router weights",
+        arguments: [(128, 8), (16, 4)])
+    func singleRowTrainingGradients(experts: Int, topK: Int) throws {
+        try Device.withDefaultDevice(.gpu) {
+            let router = Inkling2Router(try configuration(experts: experts, topK: topK))
+            var weights = [Float](repeating: 0, count: experts * 16)
+            var bias = [Float](repeating: 0, count: experts)
+            let scores = (0 ..< topK).map { expert -> Float in
+                let logit = Float(expert + 1) * 0.1
+                weights[expert * 16] = logit
+                bias[expert] = 10
+                return 1 / (1 + exp(-logit))
+            }
+            router.update(
+                parameters: ModuleParameters.unflattened([
+                    ("weight", MLXArray(weights).reshaped(experts, 16)),
+                    ("e_score_correction_bias", MLXArray(bias)),
+                ]))
+            router.train()
+            let input = MLXArray([Float(1)] + [Float](repeating: 0, count: 15))
+                .reshaped(1, 1, 16)
+            let rewards = MLXArray((0 ..< experts).map { Float($0 + 1) })
+            #expect(supportsFusedRouterTopK(MLXArray.zeros([1, 1, experts]), k: topK))
+
+            let lossAndGradient = valueAndGrad(model: router) { router, input, rewards in
+                let routed = router(input)
+                return (routed.weights * take(rewards, routed.indices, axis: 0)).sum()
+            }
+            let (loss, gradients) = try withError {
+                let (loss, gradients) = lossAndGradient(router, input, rewards)
+                let flat = gradients.flattened()
+                eval([loss] + flat.map(\.1))
+                return (loss, flat)
+            }
+            let gradient = try #require(gradients.first { $0.0 == "weight" }?.1)
+            let scoreTotal = scores.reduce(0, +)
+            let weightedScore = scores.enumerated().reduce(Float(0)) {
+                $0 + $1.element * Float($1.offset + 1)
+            }
+            let weightedMean = weightedScore / scoreTotal
+            var expectedLogitGradient = [Float](repeating: 0, count: experts)
+            for expert in 0 ..< topK {
+                // Expert choices are fixed by the bias; selected sigmoid weights retain gradients.
+                let score = scores[expert]
+                expectedLogitGradient[expert] =
+                    router.routeScale * score * (1 - score) / scoreTotal
+                    * (Float(expert + 1) - weightedMean)
+            }
+            // Apply the analytical derivative through the same GPU outer product, including TF32.
+            let expectedGradient = matmul(
+                MLXArray(expectedLogitGradient).reshaped(experts, 1), input.reshaped(1, 16))
+            let maximumError = abs(gradient - expectedGradient).max().item(Float.self)
+            #expect(loss.item(Float.self).isFinite)
+            #expect(abs(loss.item(Float.self) - router.routeScale * weightedMean) < 1e-5)
+            #expect(all(isFinite(gradient)).item(Bool.self))
+            #expect(abs(gradient).max().item(Float.self) > 1e-3)
+            #expect(maximumError < 1e-5, "Router weight gradient maximum error: \(maximumError)")
+            let selected = router(input).indices.asType(.int32).asArray(Int32.self).map(Int.init)
+            #expect(Set(selected) == Set(0 ..< topK))
+        }
     }
 
     @Test("Unsupported expert counts, row counts, ranks, dtypes and CPU use the original path")
