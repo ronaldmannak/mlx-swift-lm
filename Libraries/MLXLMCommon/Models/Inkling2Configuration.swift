@@ -71,6 +71,13 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
     public var core: Range<Int> { coreStart ..< coreEnd }
 }
 
+/// Experimental attention-history storage for Inkling 2's repeated layers.
+public enum Inkling2RecurrentKVCacheMode: String, Codable, Sendable {
+    case perLoop = "per_loop"
+    /// Earlier passes read the final pass's history. Outputs can depend on prefill chunking.
+    case lastLoop = "last_loop"
+}
+
 public struct Inkling2TextConfiguration: Codable, Sendable {
     public let hiddenSize: Int
     public let hiddenLayers: Int
@@ -101,6 +108,7 @@ public struct Inkling2TextConfiguration: Codable, Sendable {
     public let routeScale: Float
     public let finalLogitSoftcap: Float
     public let loop: Inkling2LoopConfiguration?
+    public let recurrentKVCacheMode: Inkling2RecurrentKVCacheMode
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
@@ -132,6 +140,7 @@ public struct Inkling2TextConfiguration: Codable, Sendable {
         case routeScale = "route_scale"
         case finalLogitSoftcap = "final_logit_softcapping"
         case loop = "loop_config"
+        case recurrentKVCacheMode = "recurrent_kv_cache_mode"
     }
 
     public init(from decoder: Decoder) throws {
@@ -166,6 +175,9 @@ public struct Inkling2TextConfiguration: Codable, Sendable {
         routeScale = try c.decode(Float.self, forKey: .routeScale)
         finalLogitSoftcap = try c.decode(Float.self, forKey: .finalLogitSoftcap)
         loop = try c.decodeIfPresent(Inkling2LoopConfiguration.self, forKey: .loop)
+        recurrentKVCacheMode =
+            try c.decodeIfPresent(Inkling2RecurrentKVCacheMode.self, forKey: .recurrentKVCacheMode)
+            ?? .perLoop
 
         for (key, value) in [
             (CodingKeys.hiddenSize, hiddenSize), (.hiddenLayers, hiddenLayers),

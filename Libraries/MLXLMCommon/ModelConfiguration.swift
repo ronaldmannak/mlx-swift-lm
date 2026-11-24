@@ -168,6 +168,10 @@ public struct ModelConfiguration: Sendable {
     /// Sampling defaults supplied by the checkpoint's `generation_config.json`.
     public var generationConfig: GenerationConfigFile? = nil
 
+    /// Overrides Inkling 2's recurrent attention-history storage in memory when loading.
+    /// `nil` preserves the checkpoint setting. `lastLoop` is experimental and requires repeated layers.
+    public var inkling2RecurrentKVCacheMode: Inkling2RecurrentKVCacheMode? = nil
+
     public init(
         id: String, revision: String = "main", modelSubdirectory: String? = nil,
         tokenizerSource: TokenizerSource? = nil,
@@ -178,7 +182,8 @@ public struct ModelConfiguration: Sendable {
         toolCallFormat: ToolCallFormat? = nil,
         reasoningConfig: ReasoningConfig? = nil,
         messageGenerator: (any MessageGenerator)? = nil,
-        generationConfig: GenerationConfigFile? = nil
+        generationConfig: GenerationConfigFile? = nil,
+        inkling2RecurrentKVCacheMode: Inkling2RecurrentKVCacheMode? = nil
     ) {
         self.id = .id(id, revision: revision)
         self.modelSubdirectory = modelSubdirectory
@@ -191,6 +196,7 @@ public struct ModelConfiguration: Sendable {
         self.reasoningConfig = reasoningConfig
         self.messageGenerator = messageGenerator
         self.generationConfig = generationConfig
+        self.inkling2RecurrentKVCacheMode = inkling2RecurrentKVCacheMode
     }
 
     public init(
@@ -203,7 +209,8 @@ public struct ModelConfiguration: Sendable {
         toolCallFormat: ToolCallFormat? = nil,
         reasoningConfig: ReasoningConfig? = nil,
         messageGenerator: (any MessageGenerator)? = nil,
-        generationConfig: GenerationConfigFile? = nil
+        generationConfig: GenerationConfigFile? = nil,
+        inkling2RecurrentKVCacheMode: Inkling2RecurrentKVCacheMode? = nil
     ) {
         self.id = .directory(directory)
         self.modelSubdirectory = modelSubdirectory
@@ -216,6 +223,7 @@ public struct ModelConfiguration: Sendable {
         self.reasoningConfig = reasoningConfig
         self.messageGenerator = messageGenerator
         self.generationConfig = generationConfig
+        self.inkling2RecurrentKVCacheMode = inkling2RecurrentKVCacheMode
     }
 
     /// Maps this configuration's behavioral properties into a
@@ -240,7 +248,8 @@ public struct ModelConfiguration: Sendable {
             generationConfig: generationConfig,
             weightFileSelection: weightFileSelection,
             excludedComponents: excludedComponents,
-            tensorParallelGroup: tensorParallelGroup)
+            tensorParallelGroup: tensorParallelGroup,
+            inkling2RecurrentKVCacheMode: inkling2RecurrentKVCacheMode)
     }
 
     /// Validated, canonical repository-relative model directory.

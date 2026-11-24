@@ -435,8 +435,10 @@ public final class VLMModelFactory: GenericModelFactory {
 
         let model: LanguageModel
         do {
+            let modelConfigData = try configuration.applyingInkling2CacheMode(
+                to: configData, modelType: baseConfig.modelType)
             model = try await typeRegistry.createModel(
-                configuration: configData, modelType: baseConfig.modelType)
+                configuration: modelConfigData, modelType: baseConfig.modelType)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -551,7 +553,8 @@ public final class VLMModelFactory: GenericModelFactory {
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator,
-            generationConfig: mutableConfiguration.generationConfig)
+            generationConfig: mutableConfiguration.generationConfig,
+            inkling2RecurrentKVCacheMode: mutableConfiguration.inkling2RecurrentKVCacheMode)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

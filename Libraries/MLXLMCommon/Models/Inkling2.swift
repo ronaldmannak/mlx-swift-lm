@@ -1501,12 +1501,15 @@ package final class Inkling2DecoderLayer: Module {
 /// Why an Inkling 2 cache or model cannot be built.
 public enum Inkling2Error: LocalizedError {
     case unsupportedKVCacheStrategy
+    case unsupportedLastLoopRewind
 
     public var errorDescription: String? {
         switch self {
         case .unsupportedKVCacheStrategy:
             "Inkling 2 attention reads full-precision keys and values only; "
                 + "KV cache quantization and compression are not supported."
+        case .unsupportedLastLoopRewind:
+            "Inkling 2's experimental last_loop cache does not support rewind or speculative decoding."
         }
     }
 }
@@ -1514,12 +1517,13 @@ public enum Inkling2Error: LocalizedError {
 /// The Inkling 2 text model: token embedding, decoder layers (looped for Inkling 2 Mini),
 /// and the final depth attention and norm.
 ///
-/// The caller owns the caches from ``newCache(parameters:)``: per layer visit, keys and
-/// values, key positions, and convolution states. Positions come from the caches, so a
-/// sequence can be fed in chunks.
+/// The caller owns the caches from ``newCache(parameters:)``. Convolution states are
+/// per visit; attention history is per visit or per layer in experimental `last_loop` mode.
 public final class Inkling2TextModel: Module {
     package let configuration: Inkling2TextConfiguration
     package let layerVisits: [Int]
+    private let attentionOwners: [Int]
+    private let attentionCacheCount: Int
 
     @ModuleInfo(key: "embed_tokens") package var embedTokens: Embedding
     @ModuleInfo(key: "embed_norm") var embedNorm: RMSNorm
@@ -1531,6 +1535,16 @@ public final class Inkling2TextModel: Module {
     package init(_ args: Inkling2TextConfiguration) {
         configuration = args
         layerVisits = args.layerVisits
+        if args.recurrentKVCacheMode == .lastLoop {
+            let lastVisits = Dictionary(
+                args.layerVisits.enumerated().map { ($1, $0) },
+                uniquingKeysWith: { _, last in last })
+            attentionOwners = args.layerVisits.map { lastVisits[$0]! }
+            attentionCacheCount = 2 * lastVisits.count
+        } else {
+            attentionOwners = Array(args.layerVisits.indices)
+            attentionCacheCount = 2 * args.layerVisits.count
+        }
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
         _embedNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -1566,13 +1580,15 @@ public final class Inkling2TextModel: Module {
         capturing visits: [Int]
     ) -> (hidden: MLXArray, captured: [MLXArray]) {
         precondition(
-            cache.map { [3, 6].map { $0 * layerVisits.count }.contains($0.count) } ?? true,
+            cache.map {
+                [1, 4].map { attentionCacheCount + $0 * layerVisits.count }.contains($0.count)
+            } ?? true,
             "Inkling 2 requires the caches from newCache(parameters:)")
         precondition(
             visits.allSatisfy { (0 ... layerVisits.count).contains($0) },
             "Inkling 2 taps name layer visits 0 through \(layerVisits.count)")
         let dtype = embeddings.dtype
-        let caches = cache.map { Self.visitCaches($0, visits: layerVisits.count) }
+        let caches = cache.map { visitCaches($0) }
         let mask = caches?.first?.makeMask(N: embeddings.dim(1))
         var taps = [Int: MLXArray]()
         // A pass over a few positions, such as a speculative verify, costs mostly per-op
@@ -1597,8 +1613,17 @@ public final class Inkling2TextModel: Module {
                     passMessages.map {
                         $0[0..., 0..., i ..< i + 1, 0..., 0...].squeezed(axis: 2)
                     } ?? bank.map { messageInput!($0, loopedLayer: i) }
+                let visitCache = caches.map { caches -> Inkling2VisitCache in
+                    let stored = caches[visit]
+                    guard attentionOwners[visit] != visit else { return stored }
+                    // A temporary update reads final-pass history without changing it. Copy
+                    // only this visit's attention caches; convolution states stay pass-local.
+                    return Inkling2VisitCache(
+                        keyValues: stored.keyValues.copy(), positions: stored.positions.copy(),
+                        convolutions: stored.convolutions)
+                }
                 (h, blocks) = layers[index](
-                    h, blocks: blocks, cache: caches?[visit], mask: mask, messages: messages)
+                    h, blocks: blocks, cache: visitCache, mask: mask, messages: messages)
                 visit += 1
                 if pipelines, visit.isMultiple(of: 4) {
                     asyncEval(h)
@@ -1640,12 +1665,18 @@ public final class Inkling2TextModel: Module {
         return (hidden, visits.map { taps[$0]! })
     }
 
-    private static func visitCaches(_ cache: [KVCache], visits: Int) -> [Inkling2VisitCache] {
-        let count = cache.count / visits
-        return stride(from: 0, to: cache.count, by: count).map { i in
-            let convolutions = cache[(i + 2) ..< (i + count)].map { entry in
+    private func visitCaches(_ cache: [KVCache]) -> [Inkling2VisitCache] {
+        let convolutionCount = (cache.count - attentionCacheCount) / layerVisits.count
+        let sharesHistory = attentionCacheCount < 2 * layerVisits.count
+        return layerVisits.indices.map { visit in
+            let i = sharesHistory ? 2 * layerVisits[visit] : (2 + convolutionCount) * visit
+            let convolutionStart =
+                sharesHistory ? attentionCacheCount + convolutionCount * visit : i + 2
+            let convolutions = cache[convolutionStart ..< (convolutionStart + convolutionCount)].map
+            { entry in
                 guard let convolution = entry as? ArraysCache else {
-                    preconditionFailure("Inkling 2 cache \(i + 2) must hold convolution states")
+                    preconditionFailure(
+                        "Inkling 2 cache \(convolutionStart) must hold convolution states")
                 }
                 return convolution
             }
@@ -1657,8 +1688,9 @@ public final class Inkling2TextModel: Module {
         }
     }
 
-    /// Per layer visit: keys and values (rotating for sliding layers), their positions in a
-    /// cache of the same kind, and the four convolution states, in one cache. With a rewind
+    /// Each visit stores its four convolution states. In `last_loop`, all physical layers'
+    /// attention pairs precede the visits' convolution entries. Otherwise they interleave.
+    /// With a rewind
     /// window, sliding layers' keys and positions take an ``Inkling2RingCache`` each and the
     /// convolution states an ``Inkling2ConvolutionCache`` each.
     package func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
@@ -1668,7 +1700,12 @@ public final class Inkling2TextModel: Module {
             throw Inkling2Error.unsupportedKVCacheStrategy
         }
         let rewind = parameters?.kvCache?.rewind?.maxTokens
-        return try layerVisits.flatMap { index -> [KVCache] in
+        if rewind != nil, attentionCacheCount < 2 * layerVisits.count {
+            throw Inkling2Error.unsupportedLastLoopRewind
+        }
+        let sharesHistory = attentionCacheCount < 2 * layerVisits.count
+        let attentionLayers = sharesHistory ? Array(0 ..< configuration.hiddenLayers) : layerVisits
+        let attentions = try attentionLayers.map { index -> [KVCache] in
             func attentionCache() throws -> KVCache {
                 let cache = try makeHybridAttentionKVCache(
                     parameters: parameters, slidingWindow: configuration.slidingWindow,
@@ -1685,16 +1722,21 @@ public final class Inkling2TextModel: Module {
                 }
                 return cache
             }
-            let convolutions: [KVCache] =
-                rewind.map { rewind in
-                    (0 ..< 4).map { _ in
-                        Inkling2ConvolutionCache(
-                            stateLength: configuration.convKernelSize - 1,
-                            rollbackCapacity: rewind)
-                    }
-                } ?? [ArraysCache(size: 4)]
-            return [try attentionCache(), try attentionCache()] + convolutions
+            return [try attentionCache(), try attentionCache()]
         }
+        let convolutions: [[KVCache]] = layerVisits.map { _ in
+            rewind.map { rewind in
+                (0 ..< 4).map { _ in
+                    Inkling2ConvolutionCache(
+                        stateLength: configuration.convKernelSize - 1,
+                        rollbackCapacity: rewind)
+                }
+            } ?? [ArraysCache(size: 4)]
+        }
+        if sharesHistory {
+            return attentions.flatMap { $0 } + convolutions.flatMap { $0 }
+        }
+        return zip(attentions, convolutions).flatMap { $0 + $1 }
     }
 }
 

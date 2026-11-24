@@ -502,6 +502,9 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel,
         guard let target = target as? any Inkling2LanguageModel else { return false }
         let ours = configuration.target.text
         let theirs = target.inkling2TextModel.configuration
+        if theirs.recurrentKVCacheMode == .lastLoop, let loop = theirs.loop, loop.passes > 1 {
+            return false
+        }
         return theirs.hiddenSize == ours.hiddenSize
             && theirs.vocabularySize == ours.vocabularySize
             && theirs.hiddenLayers == ours.hiddenLayers

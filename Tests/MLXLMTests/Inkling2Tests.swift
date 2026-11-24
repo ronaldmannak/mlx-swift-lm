@@ -13,7 +13,10 @@ import XCTest
 @testable import MLXLMCommon
 @testable import MLXVLM
 
-private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8, vision: Bool = false) -> String {
+private func inkling2ConfigJSON(
+    loop: Bool, gateRank: Int = 8, vision: Bool = false, cacheMode: String? = nil,
+    loopStart: Int = 3
+) -> String {
     let visionConfig =
         vision
         ? """
@@ -24,9 +27,10 @@ private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8, vision: Bool = fa
     let loopConfig =
         loop
         ? """
-        , "loop_config": {"core_start": 3, "core_end": 6, "num_passes": 3,
+        , "loop_config": {"core_start": \(loopStart), "core_end": \(loopStart + 3), "num_passes": 3,
             "gate_rank": \(gateRank), "is_varloop": false}
         """ : ""
+    let cacheConfig = cacheMode.map { ", \"recurrent_kv_cache_mode\": \"\($0)\"" } ?? ""
     return """
         {
             "model_type": "\(loop ? "inkling2_loop" : "inkling2")",
@@ -42,7 +46,7 @@ private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8, vision: Bool = fa
                 "sconv_kernel_size": 4, "n_layers_per_attn_res_block": 3,
                 "n_routed_experts": 4, "num_experts_per_tok": 2, "intermediate_size": 64,
                 "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0, "route_scale": 2.0,
-                "final_logit_softcapping": 30.0\(loopConfig)
+                "final_logit_softcapping": 30.0\(loopConfig)\(cacheConfig)
             }
         }
         """
@@ -50,12 +54,19 @@ private func inkling2ConfigJSON(loop: Bool, gateRank: Int = 8, vision: Bool = fa
 
 private let unpaddedVocabulary = 120
 
-private func inkling2Configuration(loop: Bool, gateRank: Int = 8, vision: Bool = false) throws
+private func inkling2Configuration(
+    loop: Bool, gateRank: Int = 8, vision: Bool = false,
+    cacheMode: Inkling2RecurrentKVCacheMode? = nil, loopStart: Int = 3
+) throws
     -> Inkling2Configuration
 {
     try JSONDecoder().decode(
         Inkling2Configuration.self,
-        from: Data(inkling2ConfigJSON(loop: loop, gateRank: gateRank, vision: vision).utf8))
+        from: Data(
+            inkling2ConfigJSON(
+                loop: loop, gateRank: gateRank, vision: vision, cacheMode: cacheMode?.rawValue,
+                loopStart: loopStart
+            ).utf8))
 }
 
 /// Random weights at the reference's scale: norms, clip and layer scales near one, other
@@ -76,10 +87,15 @@ private func randomize(_ model: Module, seed: UInt64) {
 }
 
 /// A seeded text model with random weights.
-private func makeInkling2(loop: Bool = false, gateRank: Int = 8, seed: UInt64 = 0) throws
+private func makeInkling2(
+    loop: Bool = false, gateRank: Int = 8, seed: UInt64 = 0,
+    cacheMode: Inkling2RecurrentKVCacheMode? = nil, loopStart: Int = 3
+) throws
     -> Inkling2Model
 {
-    let model = Inkling2Model(try inkling2Configuration(loop: loop, gateRank: gateRank))
+    let model = Inkling2Model(
+        try inkling2Configuration(
+            loop: loop, gateRank: gateRank, cacheMode: cacheMode, loopStart: loopStart))
     randomize(model, seed: seed)
     return model
 }
@@ -661,10 +677,141 @@ struct Inkling2Tests {
         #expect(try model.newCache(parameters: nil).count == 3 * 14)
     }
 
-    @Test("Ragged prompts decoded together match each decoded alone")
-    func batchMatchesSingle() throws {
+    @Test("Recurrent cache mode defaults to per-loop and rejects unknown modes")
+    func recurrentCacheModeConfiguration() throws {
+        #expect(try inkling2Configuration(loop: true).text.recurrentKVCacheMode == .perLoop)
+        let lastLoop = try inkling2Configuration(loop: true, cacheMode: .lastLoop)
+        #expect(lastLoop.text.recurrentKVCacheMode == .lastLoop)
+        let encoded = try JSONEncoder().encode(lastLoop)
+        let restored = try JSONDecoder().decode(Inkling2Configuration.self, from: encoded)
+        #expect(restored.text.recurrentKVCacheMode == .lastLoop)
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder().decode(
+                Inkling2Configuration.self,
+                from: Data(inkling2ConfigJSON(loop: true, cacheMode: "unknown").utf8))
+        }
+    }
+
+    @Test("Last-loop caches retain each visit's convolution state and fewer attention bytes")
+    func lastLoopCacheFootprint() throws {
         try onCPU {
-            let model = try makeInkling2(loop: true)
+            let perLoop = try makeInkling2(loop: true)
+            let lastLoop = try makeInkling2(loop: true, cacheMode: .lastLoop)
+            let full = try perLoop.newCache(parameters: nil)
+            let compact = try lastLoop.newCache(parameters: nil)
+            #expect(compact.count == 2 * 8 + 14)
+            #expect(full.count == 3 * 14)
+            let convolutions = compact.compactMap { $0 as? ArraysCache }
+            #expect(convolutions.count == 14)
+            #expect(Set(convolutions.map { ObjectIdentifier($0) }).count == 14)
+            let input = tokens([1, 12])
+            _ = perLoop(input, cache: full)
+            _ = lastLoop(input, cache: compact)
+            eval(full, compact)
+            let fullBytes = full.flatMap(\.state).reduce(0) { $0 + $1.nbytes }
+            let compactBytes = compact.flatMap(\.state).reduce(0) { $0 + $1.nbytes }
+            #expect(compactBytes < fullBytes)
+            #expect(convolutions.allSatisfy { $0.state.count == 4 })
+        }
+    }
+
+    @Test("The first last-loop forward matches per-loop", arguments: [false, true])
+    func lastLoopInitialForward(loop: Bool) throws {
+        try onCPU {
+            let perLoop = try makeInkling2(loop: loop)
+            let lastLoop = try makeInkling2(loop: loop, cacheMode: .lastLoop)
+            let input = tokens([1, 11])
+            let expected = perLoop(input, cache: try perLoop.newCache(parameters: nil))
+            let actual = lastLoop(input, cache: try lastLoop.newCache(parameters: nil))
+            #expect(maxDifference(actual, expected) < 1e-4)
+            if !loop {
+                #expect(try lastLoop.newCache(parameters: nil).count == 3 * 8)
+            }
+        }
+    }
+
+    @Test(
+        "Last-loop decode reads the final pass's history, including a loop starting at layer zero",
+        arguments: [(false, 3), (true, 3), (false, 0), (true, 0)])
+    func lastLoopMatchesHistoryReference(bounded: Bool, loopStart: Int) throws {
+        try onCPU {
+            let reference = try makeInkling2(loop: true, loopStart: loopStart)
+            let compact = try makeInkling2(
+                loop: true, cacheMode: .lastLoop, loopStart: loopStart)
+            let parameters = GenerateParameters(maxKVSize: bounded ? 5 : nil)
+            var referenceCache = try reference.newCache(parameters: parameters)
+            let compactCache = try compact.newCache(parameters: parameters)
+            #expect(!(compactCache[0] is ArraysCache))
+            #expect(compactCache[0].offset == 0)
+            let visits = reference.configuration.text.layerVisits
+            let lastVisit = Dictionary(
+                visits.enumerated().map { ($0.element, $0.offset) },
+                uniquingKeysWith: { _, last in last })
+            let input = tokens([1, 20])
+            // This oracle keeps the existing per-visit layout. At each chunk boundary,
+            // replace only earlier passes' attention history, preserving their convolutions.
+            for range in [0 ..< 4, 4 ..< 9, 9 ..< 12, 12 ..< 13, 13 ..< 14, 14 ..< 19, 19 ..< 20] {
+                for (visit, layer) in visits.enumerated() {
+                    let source = lastVisit[layer]!
+                    guard visit != source else { continue }
+                    referenceCache[3 * visit] = referenceCache[3 * source].copy()
+                    referenceCache[3 * visit + 1] = referenceCache[3 * source + 1].copy()
+                }
+                let expected = reference(input[0..., range], cache: referenceCache)
+                let actual = compact(input[0..., range], cache: compactCache)
+                #expect(maxDifference(actual, expected) < 1e-4)
+                #expect(compactCache[0].offset == range.upperBound)
+                #expect(
+                    compactCache.filter { !($0 is ArraysCache) }
+                        .allSatisfy { $0.offset == range.upperBound })
+            }
+        }
+    }
+
+    @Test("Last-loop mode refuses rewind caches")
+    func lastLoopRefusesRewind() throws {
+        let model = try makeInkling2(loop: true, cacheMode: .lastLoop)
+        var parameters = GenerateParameters()
+        parameters.kvCache = KVCacheConfiguration(rewind: try .init(maxTokens: 4))
+        #expect(throws: Inkling2Error.self) {
+            _ = try model.newCache(parameters: parameters)
+        }
+        let nonLooped = try makeInkling2(cacheMode: .lastLoop)
+        #expect(try nonLooped.newCache(parameters: parameters).count == 6 * 8)
+    }
+
+    @Test("DSpark refuses a last-loop target")
+    func lastLoopRefusesDSpark() throws {
+        var configuration = try #require(
+            JSONSerialization.jsonObject(with: Data(inkling2ConfigJSON(loop: true).utf8))
+                as? [String: Any])
+        configuration["mtp_config"] =
+            [
+                "hidden_size": 64, "num_hidden_layers": 3, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": 96,
+                "max_position_embeddings": 4096, "q_bias": false, "o_bias": false,
+                "rms_norm_eps": 1e-6, "rope_theta": 10_000.0, "local_layer_ids": [0, 2],
+                "sliding_window_size": 4, "block_size": 4, "markov_rank": 8,
+                "markov_head_type": "rnn_hidden", "target_layer_ids": [1, 4, 9, 14],
+            ] as [String: Any]
+        let draftConfiguration = try JSONDecoder().decode(
+            Inkling2DSparkConfiguration.self,
+            from: JSONSerialization.data(withJSONObject: configuration))
+        let draft = Inkling2DSparkDraftModel(draftConfiguration)
+        #expect(draft.isCompatible(with: try makeInkling2(loop: true)))
+        let target = try makeInkling2(loop: true, cacheMode: .lastLoop)
+        #expect(!draft.isCompatible(with: target))
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try draft.validateCompatibility(with: target)
+        }
+    }
+
+    @Test(
+        "Ragged prompts decoded together match each decoded alone",
+        arguments: [Inkling2RecurrentKVCacheMode.perLoop, .lastLoop])
+    func batchMatchesSingle(cacheMode: Inkling2RecurrentKVCacheMode) throws {
+        try onCPU {
+            let model = try makeInkling2(loop: true, cacheMode: cacheMode)
             let prompts = [[1, 2, 3], Array(5 ..< 30), Array(40 ..< 52)]
             let prefill = PrefillParameters(stepSize: 7)
             let alone = try prompts.map { prompt in
@@ -708,10 +855,12 @@ struct Inkling2Tests {
         }
     }
 
-    @Test("A prompt cache saves and restores")
-    func promptCacheRoundTrip() throws {
+    @Test(
+        "A prompt cache copies, saves and restores",
+        arguments: [Inkling2RecurrentKVCacheMode.perLoop, .lastLoop])
+    func promptCacheRoundTrip(cacheMode: Inkling2RecurrentKVCacheMode) throws {
         try onCPU {
-            let model = try makeInkling2(loop: true)
+            let model = try makeInkling2(loop: true, cacheMode: cacheMode)
             let input = tokens([1, 14])
             let cache = try model.newCache(parameters: nil)
             _ = model(input[0..., ..<12], cache: cache)
@@ -721,11 +870,17 @@ struct Inkling2Tests {
             defer { try? FileManager.default.removeItem(at: url) }
             try savePromptCache(url: url, cache: cache)
             let (restored, _) = try loadPromptCache(url: url)
-            #expect(
-                maxDifference(
-                    model(input[0..., 12...], cache: restored),
-                    model(input[0..., 12...], cache: cache))
-                    == 0)
+            let copied = cache.map { $0.copy() }
+            for index in 12 ..< 14 {
+                let next = input[0..., index ..< index + 1]
+                let expected = model(next, cache: restored)
+                eval(expected)
+                let fromCopy = model(next, cache: copied)
+                eval(fromCopy)
+                let original = model(next, cache: cache)
+                #expect(maxDifference(fromCopy, expected) == 0)
+                #expect(maxDifference(original, expected) == 0)
+            }
         }
     }
 
