@@ -218,4 +218,233 @@ final class Inkling2CheckpointTests: XCTestCase {
         XCTAssertTrue(text.lowercased().contains("red"))
         XCTAssertTrue(text.lowercased().contains("blue"))
     }
+
+    /// Greedy decoding through the bundled DSpark draft against the target alone, at several
+    /// block sizes: how many proposals the target accepts, decode speed, and how long the
+    /// two token streams agree.
+    func testDSparkSpeculativeDecoding() async throws {
+        let directory = try directory()
+        guard
+            FileManager.default.fileExists(
+                atPath: directory.appending(path: "mtp.safetensors").path)
+        else { throw XCTSkip("This checkpoint bundles no DSpark draft") }
+        let target = try await LLMModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        await Inkling2DSparkRegistration.register()
+        let draft = try await MTPDrafterModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        let maxTokens = 160
+
+        func decode(_ iterator: inout some TokenIteratorProtocol) -> (
+            tokens: [Int], seconds: Double
+        ) {
+            Stream.defaultStream(.gpu).synchronize()
+            let start = Date.timeIntervalSinceReferenceDate
+            var tokens = [Int]()
+            while let token = iterator.next(), token != Self.endSampling { tokens.append(token) }
+            Stream.defaultStream(.gpu).synchronize()
+            return (tokens, Date.timeIntervalSinceReferenceDate - start)
+        }
+        func speculative(_ input: LMInput, blockSize: Int, maxTokens: Int) throws
+            -> MTPSpeculativeTokenIterator
+        {
+            var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+            parameters.kvCache = KVCacheConfiguration(rewind: try .init(maxTokens: blockSize))
+            return try MTPSpeculativeTokenIterator(
+                input: input, mainModel: target.model, drafter: draft.model,
+                parameters: parameters, blockSize: blockSize)
+        }
+
+        // The third prompt, about 4,000 tokens, runs past the sliding window, so each verify
+        // reads a wrapped ring.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .appending(path: "../../Libraries/MLXLMCommon/Models/Inkling2Configuration.swift"),
+            encoding: .utf8)
+        let prompts = [
+            "Write a Python function that returns the n-th Fibonacci number, with a docstring.",
+            "Explain why the sky is blue in one short paragraph.",
+            "Write Swift Testing tests for the configuration decoding in this file.\n\n```swift\n\(source)\n```",
+        ]
+        for (index, text) in prompts.enumerated() {
+            let input = LMInput(tokens: MLXArray(try Self.prompt(text, context: target)))
+            // Warm up the kernels, and the draft's fold of the vocabulary head.
+            var warmup = try speculative(input, blockSize: 4, maxTokens: 8)
+            _ = decode(&warmup)
+            var plain = try TokenIterator(
+                input: input, model: target.model,
+                parameters: GenerateParameters(maxTokens: maxTokens, temperature: 0))
+            let baseline = decode(&plain)
+            print(
+                "Inkling2 dspark prompt=\(index) prompt_tokens=\(input.text.tokens.size) baseline tokens=\(baseline.tokens.count) decode_tok_s=\(Double(baseline.tokens.count) / baseline.seconds)"
+            )
+            for blockSize in [2, 3, 4, 6, 8] {
+                var iterator = try speculative(input, blockSize: blockSize, maxTokens: maxTokens)
+                let run = decode(&iterator)
+                let shared = zip(run.tokens, baseline.tokens).prefix { $0 == $1 }.count
+                let rate = Double(run.tokens.count) / run.seconds
+                print(
+                    "Inkling2 dspark prompt=\(index) block=\(blockSize) accepted=\(iterator.acceptedCount)/\(iterator.proposedCount) tokens=\(run.tokens.count) shared_prefix=\(shared) decode_tok_s=\(rate) speedup=\(rate * baseline.seconds / Double(baseline.tokens.count))"
+                )
+                XCTAssertNil(iterator.passthroughReason)
+                XCTAssertGreaterThan(iterator.acceptedCount, 0)
+                XCTAssertGreaterThanOrEqual(shared, min(16, baseline.tokens.count))
+            }
+        }
+    }
+
+    /// Sampling through the bundled draft: acceptance and speed at two temperatures, against
+    /// plain sampling from the same seed. The tokens follow the target's distribution, but GPU
+    /// logits of a verify differ in rounding from a decode step's, so the runs part ways.
+    func testDSparkSampledDecoding() async throws {
+        let directory = try directory()
+        guard
+            FileManager.default.fileExists(
+                atPath: directory.appending(path: "mtp.safetensors").path)
+        else { throw XCTSkip("This checkpoint bundles no DSpark draft") }
+        let target = try await LLMModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        await Inkling2DSparkRegistration.register()
+        let draft = try await MTPDrafterModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+
+        func decode(_ iterator: inout some TokenIteratorProtocol) -> (
+            tokens: [Int], seconds: Double
+        ) {
+            Stream.defaultStream(.gpu).synchronize()
+            let start = Date.timeIntervalSinceReferenceDate
+            var tokens = [Int]()
+            while let token = iterator.next(), token != Self.endSampling { tokens.append(token) }
+            Stream.defaultStream(.gpu).synchronize()
+            return (tokens, Date.timeIntervalSinceReferenceDate - start)
+        }
+
+        let prompts = [
+            "Write a Python function that returns the n-th Fibonacci number, with a docstring.",
+            "Explain why the sky is blue in one short paragraph.",
+        ]
+        for (index, text) in prompts.enumerated() {
+            let input = LMInput(tokens: MLXArray(try Self.prompt(text, context: target)))
+            for temperature: Float in [0.6, 1.0] {
+                var parameters = GenerateParameters(maxTokens: 160, temperature: temperature)
+                parameters.seed = 11
+                var warmup = try TokenIterator(
+                    input: input, model: target.model, parameters: parameters)
+                _ = decode(&warmup)
+                var plain = try TokenIterator(
+                    input: input, model: target.model, parameters: parameters)
+                let baseline = decode(&plain)
+                print(
+                    "Inkling2 dspark sampled prompt=\(index) temperature=\(temperature) baseline tokens=\(baseline.tokens.count) decode_tok_s=\(Double(baseline.tokens.count) / baseline.seconds)"
+                )
+                for blockSize in [3, 4, 6, 8] {
+                    var speculative = parameters
+                    speculative.kvCache = KVCacheConfiguration(
+                        rewind: try .init(maxTokens: blockSize))
+                    var iterator = try MTPSpeculativeTokenIterator(
+                        input: input, mainModel: target.model, drafter: draft.model,
+                        parameters: speculative, blockSize: blockSize)
+                    let run = decode(&iterator)
+                    let shared = zip(run.tokens, baseline.tokens).prefix { $0 == $1 }.count
+                    let rate = Double(run.tokens.count) / run.seconds
+                    print(
+                        "Inkling2 dspark sampled prompt=\(index) temperature=\(temperature) block=\(blockSize) accepted=\(iterator.acceptedCount)/\(iterator.proposedCount) tokens=\(run.tokens.count) shared_prefix=\(shared) decode_tok_s=\(rate) speedup=\(rate * baseline.seconds / Double(baseline.tokens.count))"
+                    )
+                    XCTAssertNil(iterator.passthroughReason)
+                    XCTAssertGreaterThan(iterator.acceptedCount, 0)
+                }
+            }
+        }
+    }
+
+    /// A tool declared, called, answered and used. The chat template renders the declaration,
+    /// an earlier call and its result in Inkling 2's framing, with compact JSON in key order;
+    /// the model calls the tool, `.inkling` parses the call, and the model answers from the
+    /// result.
+    func testToolCallRoundTrip() async throws {
+        let container = try await loadText()
+        let tool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "city": ["type": "string", "description": "City name"],
+                        "unit": ["type": "string", "enum": ["celsius", "fahrenheit"]],
+                    ] as [String: any Sendable],
+                    "required": ["city"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+        let question = "What's the weather in Paris right now?"
+        let result = #"{"temperature": 18, "condition": "sunny"}"#
+
+        let rendered = try await container.perform { context in
+            // Arguments out of key order, which the template sorts.
+            let call = ToolCall(
+                function: .init(
+                    name: "get_weather",
+                    arguments: ["unit": .string("celsius"), "city": .string("Paris")]))
+            let messages = DefaultMessageGenerator().generate(messages: [
+                .user(question), .assistant("", toolCalls: [call]),
+                .tool(result, name: "get_weather"),
+            ])
+            let tokens = try context.tokenizer.applyChatTemplate(
+                messages: messages, tools: [tool], additionalContext: ["reasoning_effort": "none"])
+            return context.tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+        }
+        print("Inkling2 tools rendered=\(rendered.debugDescription)")
+        XCTAssertTrue(
+            rendered.hasPrefix(
+                #"<|message_system|>tool_declare<|content_xml|>[{"description":"Get the current weather for a city.","name":"get_weather","parameters":{"properties":{"city":{"description":"City name","type":"string"},"unit":{"enum":["celsius","fahrenheit"],"type":"string"}},"required":["city"],"type":"object"},"type":"function"}]<|end_message|>"#
+            ))
+        XCTAssertTrue(
+            rendered.contains(
+                #"<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Paris","unit":"celsius"}}<|end_message|><|content_model_end_sampling|>"#
+            ))
+        XCTAssertTrue(
+            rendered.hasSuffix(
+                "<|message_tool|>get_weather<|content_text|>\(result)<|end_message|>"))
+
+        func answer(_ chat: [Chat.Message]) async throws -> (calls: [ToolCall], text: String) {
+            try await container.perform { context in
+                let input = try await context.processor.prepare(
+                    input: UserInput(
+                        chat: chat, tools: [tool], additionalContext: ["reasoning_effort": "none"]))
+                var calls = [ToolCall]()
+                var text = ""
+                for await event in try generate(
+                    input: input, parameters: GenerateParameters(maxTokens: 512, temperature: 0),
+                    context: context)
+                {
+                    switch event {
+                    case .toolCall(let call): calls.append(call)
+                    case .rejectedToolCall(let rejected):
+                        print("Inkling2 tools rejected=\(rejected)")
+                    case .chunk(let chunk): text += chunk
+                    default: break
+                    }
+                }
+                return (calls, text)
+            }
+        }
+        let first = try await answer([.user(question)])
+        print(
+            "Inkling2 tools call=\(first.calls.map { "\($0.function.name) \($0.function.arguments)" }) text=\(first.text.debugDescription)"
+        )
+        XCTAssertEqual(first.calls.count, 1)
+        XCTAssertEqual(first.calls.first?.function.name, "get_weather")
+        XCTAssertEqual(first.calls.first?.function.arguments["city"], .string("Paris"))
+
+        let second = try await answer([
+            .user(question), .assistant("", toolCalls: first.calls),
+            .tool(result, name: "get_weather"),
+        ])
+        print("Inkling2 tools answer=\(second.text.debugDescription)")
+        XCTAssertTrue(second.calls.isEmpty)
+        XCTAssertTrue(second.text.contains("18"))
+        XCTAssertFalse(second.text.contains("<|"))
+    }
 }
