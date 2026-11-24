@@ -311,8 +311,10 @@ extension KVCacheSimple {
                 values = grownValues
             }
         }
-        let rows = (position.asType(.int32) + MLXArray(Int32(0) ..< Int32(newKeys.dim(2))))
-            .reshaped([1, 1, -1, 1])
+        let rows =
+            (position.asType(.int32).reshaped(-1, 1)
+            + MLXArray(Int32(0) ..< Int32(newKeys.dim(2))).reshaped(1, -1))
+            .reshaped([newKeys.dim(0), 1, -1, 1])
         keys = putAlong(keys!, rows, values: newKeys, axis: 2)
         values = putAlong(values!, rows, values: newValues, axis: 2)
         return (

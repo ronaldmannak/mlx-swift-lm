@@ -16,6 +16,104 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+extension DFlash2DraftModel: BatchedDFlashDrafterModel {
+    public var supportsBatchedDFlashV1: Bool { !config.isDFlash2 }
+
+    public func makeBatchState(batchSize: Int) -> BatchedDFlashDrafterState {
+        .init(
+            contextCaches: layers.indices.map {
+                BatchedDFlashContextCache(
+                    window: config.contextWindow(forLayer: $0), batchSize: batchSize)
+            })
+    }
+
+    public func appendBatchContext(
+        hidden: MLXArray, positions: [Int], validCounts: [Int],
+        state: inout BatchedDFlashDrafterState
+    ) {
+        precondition(supportsBatchedDFlashV1 && state.contextCaches.count == layers.count)
+        guard hidden.dim(1) > 0 else { return }
+        let context = projectContext(hidden, position: MLXArray(positions.map(Int32.init)))
+        for (index, cache) in state.contextCaches.enumerated() {
+            cache.append(
+                keys: context[2 * index], values: context[2 * index + 1],
+                positions: positions, validCounts: validCounts)
+        }
+    }
+
+    /// Propose a DFlash v1 block at each request’s own rotary position.
+    public func proposeBatch(
+        _ request: BatchedDFlashProposalRequest, target: any DFlash2TargetModel,
+        state: inout BatchedDFlashDrafterState
+    ) -> MLXArray {
+        precondition(supportsBatchedDFlashV1, "Batched proposal requires a DFlash v1 drafter")
+        let batch = request.block.dim(0)
+        let width = request.block.dim(1)
+        precondition(request.contextPositions.count == batch && request.validCounts.count == batch)
+        precondition(state.contextCaches.count == layers.count)
+        let position = MLXArray(request.contextPositions.map(Int32.init))
+        let blockPosition = position + MLXArray(request.validCounts.map(Int32.init))
+        appendBatchContext(
+            hidden: request.targetHidden, positions: request.contextPositions,
+            validCounts: request.validCounts, state: &state)
+
+        var x = target.dflash2Embedding(request.block) * config.dflash.inputEmbeddingScale
+        var attention: MLXArray? = nil
+        for index in 0 ... layers.count {
+            var args = [x]
+            if let attention { args.append(attention) }
+            args.append(blockPosition)
+            let outputs =
+                compiledTracesEnabled
+                ? segmentTrace(index: index, width: width)(self, args)
+                : segmentBody(at: index, args)
+            x = outputs[0]
+            guard index < layers.count else { break }
+            let cache = state.contextCaches[index]
+            let positions = MLXArray(cache.rowPositions.flatMap { $0 }).reshaped(
+                batch, 1, cache.count)
+            let valid = MLXArray(cache.rowValid.flatMap { $0 }).reshaped(batch, 1, cache.count)
+            let queryPositions =
+                blockPosition.reshaped(batch, 1)
+                + MLXArray(Int32(0) ..< Int32(width)).reshaped(1, width)
+            let window = config.attentionWindow(forLayer: index)
+            let contextMask: MLXArray
+            if window >= Int(Int32.max) {
+                contextMask = broadcast(valid, to: [batch, width, cache.count])
+            } else {
+                contextMask =
+                    valid
+                    & ((queryPositions.expandedDimensions(axis: -1) - positions) .< Int32(window))
+            }
+            let offsets = MLXArray(Int32(0) ..< Int32(width))
+            let blockMask =
+                layers[index].causalBlock
+                ? offsets.reshaped(1, width) .<= offsets.reshaped(width, 1)
+                : MLXArray.ones([width, width], dtype: .bool)
+            let mask = concatenated(
+                [contextMask, broadcast(blockMask, to: [batch, width, width])], axis: -1
+            )
+            .expandedDimensions(axis: 1)
+            attention = MLXFast.scaledDotProductAttention(
+                queries: outputs[1], keys: concatenated([cache.keys!, outputs[2]], axis: 2),
+                values: concatenated([cache.values!, outputs[3]], axis: 2),
+                scale: layers[index].selfAttn.scale, mask: .array(mask))
+        }
+        let hidden = x[0..., 1..., 0...]
+        var logits = target.dflash2Head?(hidden) ?? target.dflash2Embedding.asLinear(hidden)
+        logits = logits * config.dflash.outputMultiplier
+        if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
+            logits = tanh(logits / cap) * cap
+        }
+        if let suppressor = request.suppressedTokens {
+            logits = suppressor.process(logits: logits.reshaped(-1, logits.dim(-1))).reshaped(
+                logits.shape)
+        }
+        if recordsIntermediates { lastLogits = logits }
+        return argMax(logits, axis: -1).asType(.int32)
+    }
+}
+
 // MARK: - Configuration
 
 /// The `dflash_config` object of a DFlash2 checkpoint.
