@@ -420,7 +420,7 @@ final class Inkling2Router: Module {
         }
         let scores = sigmoid(logits)
         let biased = scores + correctionBias.asType(.float32)
-        if usesGPU(), supportsFusedRouterTopK(biased, k: topK) {
+        if !training, usesGPU(), supportsFusedRouterTopK(biased, k: topK) {
             let (indices, weights) = fusedRouterTopK(
                 selection: biased, values: scores, k: topK, normalize: true,
                 order: .descending)
