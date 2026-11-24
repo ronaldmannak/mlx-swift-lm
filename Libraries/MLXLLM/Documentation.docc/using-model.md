@@ -150,6 +150,9 @@ Insertion prefills the new input synchronously. Request IDs stay stable when
 another row leaves. Each request has its own random state and token limit.
 One step may return several tokens per request.
 
+Both DFlash iterators reject `GenerateParameters.logProbabilities` before
+prefill. Use ordinary decoding when a request needs token log probabilities.
+
 To cache a conversation, call `snapshot(id:retainedTokens:)` with the exact
 tokens retained by the caller, including the prompt. A stop partway through a
 returned chunk can leave a shorter history, in which case the snapshot is

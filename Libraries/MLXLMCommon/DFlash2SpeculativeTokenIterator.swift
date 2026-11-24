@@ -11,6 +11,8 @@ public enum DFlash2SpeculationError: Error, Equatable {
     /// The cache or the requested KV cache configuration has entries the verify
     /// pass cannot write, such as quantized or rotating attention caches.
     case unsupportedCache
+    /// Per-token log-probability reporting is unsupported.
+    case unsupportedLogProbabilities
     /// The drafter was distilled for a target of another shape.
     case geometryMismatch(drafter: DFlash2Geometry, target: DFlash2Geometry)
     /// DFlash2 speculation covers text-only prompts.
@@ -95,7 +97,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     ///     the positions it already holds.
     ///   - prefilledPrefixTokens: leading positions of `input` that `mainCache`
     ///     already holds; only the rest is prefilled.
-    ///   - parameters: sampling and generation limits.
+    ///   - parameters: sampling and generation limits. Non-nil `logProbabilities` is rejected.
     ///   - blockSize: tokens per verify pass, 2 through the drafter's; `nil` uses the drafter's.
     ///   - components: generation hooks such as a custom logit processor.
     public init(
@@ -108,6 +110,9 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         blockSize: Int? = nil,
         components: GenerationComponents = .init()
     ) throws {
+        guard parameters.logProbabilities == nil else {
+            throw DFlash2SpeculationError.unsupportedLogProbabilities
+        }
         guard let target = mainModel as? DFlash2TargetModel else {
             throw DFlash2SpeculationError.unsupportedTarget
         }

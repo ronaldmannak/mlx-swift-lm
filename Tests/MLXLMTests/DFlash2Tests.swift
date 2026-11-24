@@ -644,6 +644,7 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
 
     var kvHeads: [Int] { [1] }
     let embedding = Embedding(embeddingCount: vocab, dimensions: hidden)
+    private(set) var prefillCalls = 0
     private(set) var verifyCalls = 0
     private(set) var verifyWidths: [Int] = []
 
@@ -735,6 +736,7 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
     func dflash2Prefill(
         _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
     ) -> (logits: MLXArray, hidden: [MLXArray]) {
+        prefillCalls += 1
         let positions = tokens.dim(-1)
         writeKV(cache, positions: positions)
         return (
@@ -1167,6 +1169,52 @@ func testDFlash2IteratorRejectsUnsupportedInputs() throws {
             _ = try DFlash2SpeculativeTokenIterator(
                 input: prompt, mainModel: target, drafter: drafter, parameters: unsupported)
         }
+    }
+}
+
+@Test(arguments: [0, 3])
+func testDFlash2IteratorRejectsLogProbabilitiesBeforePrefill(topK: Int) {
+    Device.withDefaultDevice(.cpu) {
+        let target = MockTarget()
+        let drafter = MockDrafter()
+        let cache = target.newCache(parameters: nil)
+        let parameters = GenerateParameters(maxTokens: 4, temperature: 0, logProbabilities: topK)
+        #expect(throws: DFlash2SpeculationError.unsupportedLogProbabilities) {
+            _ = try DFlash2SpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(1), 2, 3])), mainModel: target,
+                drafter: drafter, mainCache: cache, parameters: parameters)
+        }
+        #expect(target.prefillCalls == 0)
+        #expect(target.verifyCalls == 0)
+        #expect(drafter.proposeCalls == 0)
+        #expect(cache.allSatisfy { $0.offset == 0 })
+    }
+}
+
+@Test(arguments: [0, 3])
+func testDFlash2GenerateTokensRejectsLogProbabilitiesBeforePrefill(topK: Int) async {
+    await Device.withDefaultDevice(.cpu) {
+        let target = MockTarget()
+        let drafter = MockDrafter()
+        let cache = target.newCache(parameters: nil)
+        let context = ModelContext(
+            configuration: ModelConfiguration(id: "dflash2-log-probabilities"), model: target,
+            processor: NoInputProcessor(), tokenizer: FragmentTokenizer(decoding: [:]))
+        let parameters = GenerateParameters(maxTokens: 4, temperature: 0, logProbabilities: topK)
+        var unexpectedStream: AsyncStream<TokenGeneration>?
+        #expect(throws: DFlash2SpeculationError.unsupportedLogProbabilities) {
+            unexpectedStream = try generateTokens(
+                input: LMInput(tokens: MLXArray([Int32(1), 2, 3])), cache: cache,
+                parameters: parameters, context: context, dflash2Drafter: drafter)
+        }
+        // Drain a broken implementation's producer so the regression leaves no background task.
+        if let unexpectedStream {
+            for await _ in unexpectedStream {}
+        }
+        #expect(target.prefillCalls == 0)
+        #expect(target.verifyCalls == 0)
+        #expect(drafter.proposeCalls == 0)
+        #expect(cache.allSatisfy { $0.offset == 0 })
     }
 }
 
