@@ -282,6 +282,14 @@ public final class Inkling2VLM: Module, VLMModel {
         logits(model.languageModel(inputs, cache: cache))
     }
 
+    /// Also emits the hidden states a DSpark drafter asks for.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        inkling2Output(
+            embeddings: model.languageModel.embed(input.tokens), cache: cache, state: state)
+    }
+
     /// Token embeddings `[1, L, hidden]` with each image's rows at its image tokens.
     func inputEmbeddings(tokens: MLXArray, image: LMInput.ProcessedImage?) throws -> MLXArray {
         let tokens = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
@@ -318,17 +326,9 @@ public final class Inkling2VLM: Module, VLMModel {
         _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
         let embeddings = try inputEmbeddings(tokens: input.text.tokens, image: input.image)
-        // An image can add thousands of positions, so the prompt goes through in chunks.
-        let total = embeddings.dim(1)
-        let processed = try prefill.forEachChunk(total: total) { range in
-            _ = model.languageModel(embeddings: embeddings[0..., range, 0...], cache: cache)
-            asyncEval(cache)
-        }
-        if processed > 0 { eval(cache) }
-        let hidden = model.languageModel(
-            embeddings: embeddings[0..., processed..., 0...], cache: cache)
-        prefill.progress?(total, total)
-        return .logits(LMOutput(logits: logits(hidden)))
+        return try inkling2Prepare(
+            embeddings: embeddings, cache: cache, state: state, prefill: prefill,
+            chunkShortPrompts: true)
     }
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
@@ -347,6 +347,11 @@ public final class Inkling2VLM: Module, VLMModel {
 
 extension Inkling2VLM: LoRAModel {
     public var loraLayers: [Module] { model.languageModel.layers }
+}
+
+extension Inkling2VLM: Inkling2LanguageModel {
+    package var inkling2TextModel: Inkling2TextModel { model.languageModel }
+    package var inkling2Head: Linear { lmHead }
 }
 
 // MARK: - Processor

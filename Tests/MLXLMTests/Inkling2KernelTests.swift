@@ -105,6 +105,66 @@ struct Inkling2KernelTests {
         #expect(maxDifference(kernel, reference) < 2e-2)
     }
 
+    /// `L` queries over keys in ring order, as an `Inkling2RingCache` holds them: each
+    /// position at its slot, stale keys ahead of the queries, two empty slots and keys past
+    /// the window, then the zero slot, against the reference path, which needs no zero slot.
+    @Test("Ring attention matches the reference", arguments: [1, 2, 5, 8, 9])
+    func ringAttention(L: Int) throws {
+        MLXRandom.seed(13)
+        let (Hq, Hkv, D, R, window) = (8, 2, 128, 24, 16)
+        let capacity = window + 9
+        let args = try textConfiguration(Hq: Hq, Hkv: Hkv, D: D, R: R, window: window)
+        let attention = Inkling2Attention(args, sliding: true)
+        attention.train(false)
+        func clipped(_ shape: [Int]) -> MLXArray {
+            let x = MLXRandom.normal(shape)
+            return (x / sqrt((x * x).sum(axis: -1, keepDims: true)) * 3).asType(.bfloat16)
+        }
+        let zeroSlot = MLXArray.zeros([1, Hkv, 1, D], dtype: .bfloat16)
+        let queries = clipped([1, Hq, L, D])
+        let keys = concatenated([clipped([1, Hkv, capacity, D]), zeroSlot], axis: 2)
+        let values = concatenated(
+            [
+                inkling2UnitRMS(MLXRandom.normal([1, Hkv, capacity, D])).asType(.bfloat16),
+                zeroSlot,
+            ],
+            axis: 2)
+        let bias = (MLXRandom.normal([1, L, Hq, R]) * 0.5).asType(.bfloat16)
+        let sinks = (MLXRandom.normal([1, L, Hq]) * 0.5).asType(.bfloat16)
+        // Queries at 40 ..< 40 + L; the ring was last written three positions past them.
+        let queryPositions = (MLXArray(0 ..< L).asType(.float32) + 40).reshaped(1, L)
+        var stored = [Float](repeating: 0, count: capacity + 1)
+        let newest = 40 + L - 1 + 3
+        for position in (newest - capacity + 1) ... newest {
+            stored[position % capacity] = Float(position + 1)
+        }
+        stored[(newest - 4) % capacity] = 0
+        stored[(newest - 11) % capacity] = 0
+        let storedKeyPositions = MLXArray(stored).reshaped(1, -1)
+
+        let ring = attention.ringAttention(
+            queries: queries, keys: keys, values: values, positionBias: bias, sinks: sinks,
+            queryPositions: queryPositions, storedKeyPositions: storedKeyPositions)
+        let reference = Device.withDefaultDevice(.cpu) {
+            attention.attention(
+                queries: queries, keys: keys, values: values, positionBias: bias, sinks: sinks,
+                queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
+                keyOrder: .other, forceReference: true)
+        }
+        #expect(ring.shape == [1, L, Hq, D])
+        #expect(maxDifference(ring, reference) < 2e-2)
+        // Single-token dispatch uses separate sinks; verification uses the ring's zero slot.
+        let dispatched = attention.attention(
+            queries: queries, keys: keys, values: values, positionBias: bias, sinks: sinks,
+            queryPositions: queryPositions, storedKeyPositions: storedKeyPositions,
+            keyOrder: .ring)
+        #expect(dispatched.shape == ring.shape)
+        #expect(maxDifference(dispatched, reference) < 2e-2)
+        if L > 1 {
+            #expect(sameBits(dispatched, ring))
+        }
+    }
+
     /// A small bfloat16 Inkling 2 Mini whose looped layers complete depth blocks, with the
     /// router, depth queries and experts in float32 as the checkpoints keep them.
     private func bfloat16Model(experts: Int = 2, topK: Int = 2) throws -> Inkling2Model {
@@ -372,6 +432,36 @@ struct Inkling2KernelTests {
         for (a, b) in zip(compiled, general) {
             #expect(sameBits(a, b))
         }
+    }
+
+    /// A rewind window sends a few tokens of one row through the compiled traces, as a
+    /// speculative round's verify does. The same attention caches with plain convolution
+    /// states send them down the general path.
+    @Test("Compiled verify passes give the general path's bits")
+    func compiledVerify() throws {
+        MLXRandom.seed(0)
+        let model = try bfloat16Model(experts: 8, topK: 2)
+        model.train(false)
+        let tokens = MLXRandom.randInt(Int32(0) ..< 120, [1, 96])
+        var parameters = GenerateParameters(temperature: 0)
+        parameters.kvCache = KVCacheConfiguration(rewind: try .init(maxTokens: 16))
+        let rewindable = try model.newCache(parameters: parameters)
+        #expect(rewindable[2] is Inkling2ConvolutionCache)
+        let reference = try model.newCache(parameters: parameters)
+        let plain = stride(from: 0, to: reference.count, by: 6).flatMap {
+            [reference[$0], reference[$0 + 1], ArraysCache(size: 4)]
+        }
+        // Past the sliding window and the bias extent, through the loop.
+        var start = 0
+        for length in [20, 2, 9, 1, 3, 16, 5, 8, 1, 7, 4, 6, 9, 5] {
+            let chunk = tokens[0..., start ..< start + length]
+            let a = model(chunk, cache: rewindable)
+            let b = model(chunk, cache: plain)
+            eval(a, b)
+            #expect(sameBits(a, b), "\(length) tokens at \(start)")
+            start += length
+        }
+        #expect(start == tokens.dim(1))
     }
 
     @Test("Training takes the reference paths, so gradients flow through attention")
