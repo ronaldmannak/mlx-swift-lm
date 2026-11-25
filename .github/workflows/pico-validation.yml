@@ -1,0 +1,32 @@
+name: Pico integration validation
+
+on:
+  pull_request:
+  push:
+    branches: [pico/integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pico-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-build-for-testing:
+    if: github.repository == 'ronaldmannak/mlx-swift-lm' || github.repository == 'PicoMLX/mlx-swift-lm'
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6.1.0
+      - name: Verify the build toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          xcodebuild -showComponent MetalToolchain
+      - name: Build the package and test targets
+        run: |
+          xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/pico-lm-build" -jobs 3 \
+            -skipPackagePluginValidation -skipMacroValidation
