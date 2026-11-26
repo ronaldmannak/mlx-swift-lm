@@ -322,7 +322,7 @@ public struct BatchTokenIterator {
     }
 
     /// The ids of every row decoding or queued, in insertion order.
-    public var ids: [Int] { rows.map(\.id) + pending.map(\.row.id) }
+    public var ids: [Int] { rows.map(\.id).sorted() + pending.map(\.row.id) }
 
     /// The ids of the queued rows, in the order they are prefilled.
     public var pendingIDs: [Int] { pending.map(\.row.id) }
@@ -443,7 +443,7 @@ public struct BatchTokenIterator {
             processor?.finalizeGeneration()
         }
         pending.removeAll { removed.contains($0.row.id) }
-        for index in rows.indices where removed.contains(rows[index].id) {
+        for index in rowIndicesByID where removed.contains(rows[index].id) {
             if !invalidatedByModelState && captureIDs.contains(rows[index].id) {
                 snapshots.append(captureRow(at: index))
             }
@@ -698,7 +698,8 @@ public struct BatchTokenIterator {
         let tokens = try step()
         var events: [BatchEvent] = []
         var keep: [Int] = []
-        for (index, token) in tokens.enumerated() {
+        for index in rowIndicesByID {
+            let token = tokens[index]
             let id = rows[index].id
             rows[index].generated += 1
             if stopTokens.contains(token) {
@@ -717,9 +718,15 @@ public struct BatchTokenIterator {
             end(rows[index])
         }
         if keep.count < rows.count {
-            filter(keeping: keep)
+            filter(keeping: keep.sorted())
         }
         return events
+    }
+
+    /// The rows' indices in the order the rows joined. A row that leaves can hand its slot
+    /// to the batch's last row, so the rows themselves are not always in that order.
+    private var rowIndicesByID: [Int] {
+        rows.indices.sorted { rows[$0].id < rows[$1].id }
     }
 
     private func captureRow(at index: Int) -> BatchRowCacheSnapshot {
@@ -1038,17 +1045,40 @@ public struct BatchTokenIterator {
     }
 
     private mutating func filter(keeping keep: [Int]) {
-        rows = keep.map { rows[$0] }
         guard !keep.isEmpty else {
+            rows = []
             cache = []
             nextTokens = nil
             state = nil
             invalidatedByModelState = false
             return
         }
-        let indices = MLXArray(keep.map { Int32($0) })
-        for layer in cache {
-            layer.filter(batchIndices: indices)
+        // A plain attention layer can keep its buffers: the batch's last rows move into the
+        // slots of the rows that leave, and nothing else is copied. The other layers gather
+        // their rows into the same order.
+        let kept = Set(keep)
+        let compacted = BatchKVCache.orderAfterRemoving(
+            rows.indices.filter { !kept.contains($0) }, from: rows.count)
+        let movable = cache.map { layer -> BatchKVCache? in
+            guard let layer = layer as? BatchKVCache, layer.canMoveRows(to: compacted) else {
+                return nil
+            }
+            return layer
+        }
+        let order = movable.contains { $0 != nil } ? compacted : keep
+        let moving = movable.map { $0?.rowsMoving(to: order) ?? [] }
+        // Wait for the copies of the moving rows. Written back while the step that is in
+        // flight still reads the buffers, they would force a copy of every row.
+        let copies = moving.flatMap { $0 }
+        if !copies.isEmpty { eval(copies) }
+        rows = order.map { rows[$0] }
+        let indices = MLXArray(order.map { Int32($0) })
+        for (layer, (target, moved)) in zip(cache, zip(movable, moving)) {
+            if let target {
+                target.moveRows(to: order, moved: moved)
+            } else {
+                layer.filter(batchIndices: indices)
+            }
         }
         batchCacheNeedsTrim = shouldClearCacheAfterBatchResize != nil
         nextTokens = nextTokens?[indices]
