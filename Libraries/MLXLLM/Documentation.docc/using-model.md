@@ -116,6 +116,50 @@ DSpark currently requires greedy decoding (`temperature: 0`) so verification
 remains exact. Pair each draft with the target named in its model card; loading
 or running incompatible architecture dimensions fails closed.
 
+### Batched DFlash for Qwen3.5
+
+The text backend can decode independent requests with a Qwen3.5 target and a
+matching DFlash v1 drafter. Register the architecture before loading the
+drafter. For Qwen3.5-4B, the trained checkpoint is
+`z-lab/Qwen3.5-4B-DFlash`. The target and drafter stay resident for the life
+of the batch.
+
+```swift
+await DFlash2Registration.register()
+let target = try await LLMModelFactory.shared.load(from: targetDirectory, using: tokenizerLoader)
+let draft = try await DFlash2DrafterModelFactory.shared.load(
+    from: drafterDirectory, using: tokenizerLoader)
+guard let drafter = draft.model as? any BatchedDFlashDrafterModel else {
+    throw BatchedDFlashError.unsupportedDrafter
+}
+let batch = try BatchedDFlashTokenIterator(
+    inputs: prompts, mainModel: target.model, drafter: drafter,
+    parameters: GenerateParameters(maxTokens: 128, temperature: 0.8, topP: 0.9),
+    blockSize: 4, eosTokenIds: eosTokenIds)
+while let chunks = batch.next() {
+    for chunk in chunks {
+        deliver(chunk.tokens, to: chunk.id)
+    }
+}
+batch.synchronize()
+```
+
+Use one executor to own a batch. Between calls to `next()`, admit new
+requests with `insert(inputs:)` or cancel requests with `remove(_:)`.
+Insertion prefills the new input synchronously. Request IDs stay stable when
+another row leaves. Each request has its own random state and token limit.
+One step may return several tokens per request.
+
+Both DFlash iterators reject `GenerateParameters.logProbabilities` before
+prefill. Use ordinary decoding when a request needs token log probabilities.
+
+To cache a conversation, call `snapshot(id:retainedTokens:)` with the exact
+tokens retained by the caller, including the prompt. A stop partway through a
+returned chunk can leave a shorter history, in which case the snapshot is
+unavailable. Supply the returned prefix state alongside only the new suffix
+on the next request. A snapshot belongs to the target and drafter that
+created it. It contains both the target cache and projected drafter context.
+
 ## Evaluation Flow
 
 - Load the Model
