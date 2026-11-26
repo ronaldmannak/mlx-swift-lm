@@ -80,6 +80,9 @@ public struct ResolvedModelConfiguration: Sendable {
     public var messageGenerator: (any MessageGenerator)?
     public var generationConfig: GenerationConfigFile?
 
+    /// An in-memory Inkling 2 cache-mode override, or `nil` to preserve the checkpoint setting.
+    public var inkling2RecurrentKVCacheMode: Inkling2RecurrentKVCacheMode?
+
     /// How to choose the safetensors files holding the model's weights.
     ///
     /// ## See Also
@@ -112,7 +115,8 @@ public struct ResolvedModelConfiguration: Sendable {
         generationConfig: GenerationConfigFile? = nil,
         weightFileSelection: WeightFileSelection = .automatic,
         excludedComponents: Set<ModelComponent> = [],
-        tensorParallelGroup: MLXDistributed.Group? = nil
+        tensorParallelGroup: MLXDistributed.Group? = nil,
+        inkling2RecurrentKVCacheMode: Inkling2RecurrentKVCacheMode? = nil
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -128,6 +132,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.weightFileSelection = weightFileSelection
         self.excludedComponents = excludedComponents
         self.tensorParallelGroup = tensorParallelGroup
+        self.inkling2RecurrentKVCacheMode = inkling2RecurrentKVCacheMode
     }
 
     /// Refuses a ``tensorParallelGroup``, for a factory whose models cannot be sharded,
@@ -142,7 +147,9 @@ public struct ResolvedModelConfiguration: Sendable {
 
 extension ResolvedModelConfiguration {
     /// Convenience for loading everything from a single local directory.
-    public init(directory: URL) {
+    public init(
+        directory: URL, inkling2RecurrentKVCacheMode: Inkling2RecurrentKVCacheMode? = nil
+    ) {
         self.init(
             modelDirectory: directory,
             tokenizerDirectory: directory,
@@ -155,6 +162,7 @@ extension ResolvedModelConfiguration {
             toolCallFormat: nil,
             reasoningConfig: nil,
             messageGenerator: nil,
-            generationConfig: nil)
+            generationConfig: nil,
+            inkling2RecurrentKVCacheMode: inkling2RecurrentKVCacheMode)
     }
 }

@@ -779,8 +779,10 @@ public final class LLMModelFactory: GenericModelFactory {
 
         let model: LanguageModel
         do {
+            let modelConfigData = try configuration.applyingInkling2CacheMode(
+                to: configData, modelType: baseConfig.modelType)
             model = try await typeRegistry.createModel(
-                configuration: configData, modelType: baseConfig.modelType)
+                configuration: modelConfigData, modelType: baseConfig.modelType)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -878,7 +880,8 @@ public final class LLMModelFactory: GenericModelFactory {
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator,
-            generationConfig: mutableConfiguration.generationConfig)
+            generationConfig: mutableConfiguration.generationConfig,
+            inkling2RecurrentKVCacheMode: mutableConfiguration.inkling2RecurrentKVCacheMode)
         // Kept so a caller can tell the model holds a share.
         modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
 
